@@ -26,10 +26,18 @@
 ```bash
 git clone https://github.com/GenshinKings/mcd-butler.git
 cd mcd-butler
-python -m src.cli demo
+python -m src.cli demo        # 离线演示，无需 Token
+python -m src.cli selftest    # 离线自检，27 项，几秒跑完
 ```
 
 零第三方依赖（只用标准库），Python 3.10+。
+
+有 Token 之后，想吃什么自己点：
+
+```bash
+python -m src.cli menu --filter 堡                      # 先看菜单
+python -m src.cli optimize --items "板烧鸡腿堡三件套,薯条x2,脆薯饼"
+```
 
 ---
 
@@ -76,6 +84,17 @@ python -m src.cli demo
 export MCD_MCP_TOKEN=<你的 Token>
 python -m src.cli optimize --city 上海 --keyword 人民广场
 ```
+
+不加 `--items` 时会自动挑一张购物车（优先纳入券覆盖到的商品，
+否则随机挑的话大概率一张券都用不上，引擎就退化成"啥也没优化"）。
+想指定吃什么就用 `--items`，支持数量：
+
+```bash
+python -m src.cli optimize --items "板烧鸡腿堡三件套,薯条x2,脆薯饼"
+```
+
+品名对不上会明确告诉你哪几个没匹配到，并提示用 `menu --filter` 查准确品名，
+不会拿一个不相干的商品凑数。
 
 ```
 定位门店：上海 / 人民广场 → 1450713（华旭国际大厦餐厅）
@@ -244,7 +263,10 @@ src/
   assets.py          资产巡检：卡包到期预警 + 积分过期（默认只读）
   snapshot.py        本地订单快照（~/.mcd-butler/，不进仓库）
   nutrition.py       热量预算搭配（解析类 CSV 营养表）
+  selftest.py        离线自检（真实报文 fixture，无需 Token）
   cli.py             命令行入口
+
+命令：demo / selftest / tools / menu / optimize / assets / nutrition / replay
 
 FINDINGS.md          35 个工具实测避坑笔记 ← 调麦当劳 MCP 前建议先看
 MCP_INTEGRATION.md   使用的 MCP Server、Tool、调用流程与业务价值
@@ -270,6 +292,8 @@ MCP_INTEGRATION.md   使用的 MCP Server、Tool、调用流程与业务价值
 - [x] 历史订单 replay（真实 `order-list` + 本地快照双数据源）
 - [x] 随单购（早餐卡 / 麦金卡）自动选档
 - [x] 减脂模式：`list-nutrition-foods` 热量预算搭配
+- [x] 自选购物车（`--items`，支持数量）与菜单浏览（`menu`）
+- [x] 离线自检 `selftest`（27 项，覆盖三种返回体格式）
 - [ ] 定时领券（配合系统 cron / 计划任务）
 - [ ] 多门店比价：同一单在不同门店的最优价对比
 - [ ] 麦金卡权益雷达：活动规则变动解读

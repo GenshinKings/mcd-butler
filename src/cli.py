@@ -9,10 +9,11 @@
 from __future__ import annotations
 
 import argparse
-import os
+import re
 import sys
 
 from .coupon_engine import Assignment, CartItem, Coupon, CouponOptimizer, PriceResult
+from .mcd_client import McpError
 from . import demo_data as demo
 
 
@@ -144,30 +145,80 @@ def run_assets(claim: bool) -> int:
     return 0
 
 
-def run_optimize(city: str, keyword: str, budget: int, save: bool = True) -> int:
+def _locate(client, city: str, keyword: str):
+    """定位门店 + 载入菜单 + 拉券池。三个真实命令都要用这一段。"""
+    stores = client.data(
+        "query-nearby-stores", {"beType": 1, "searchType": 2, "city": city, "keyword": keyword}
+    )
+    if not stores:
+        return None
+    store = stores[0]
+    store_code = store["storeCode"]
+    meals = client.data("query-meals", {"storeCode": store_code, "orderType": 1, "beType": 1})
+    menu = _parse_menu(meals)
+    coupons = _parse_coupons(
+        client.data("query-store-coupons", {"storeCode": store_code, "orderType": 1, "beType": 1})
+    )
+    return store, store_code, menu, coupons
+
+
+def run_menu(city: str, keyword: str, filter_kw: str, limit: int) -> int:
+    """列出门店菜单。带券的商品会被标出来——那是真正值得点的。"""
+    from .mcd_client import McdMcpClient
+
+    client = McdMcpClient()
+    client.initialize()
+    ctx = _locate(client, city, keyword)
+    if ctx is None:
+        print("未找到门店，请换一个关键词。")
+        return 1
+    store, store_code, menu, coupons = ctx
+
+    covered: set[str] = set()
+    for c in coupons:
+        covered |= set(c.product_codes)
+
+    print(f"门店：{store['storeName']}（storeCode={store_code}）")
+    print(f"共 {len(menu)} 个品类，{len(coupons)} 张可用券\n")
+
+    shown = 0
+    for item in menu:
+        if filter_kw and filter_kw not in (item.name or ""):
+            continue
+        if shown >= limit:
+            print(f"\n（只显示前 {limit} 条，用 --limit 调整或加 --filter 缩小范围）")
+            break
+        price = item.effective_price_fen()
+        note = f"  ← {item.condition_note()}" if item.needs_with_order else ""
+        mark = " [有券]" if item.product_code in covered else ""
+        print(f"  ¥{FEN(price):>6}  {item.name or item.product_code}{mark}{note}")
+        shown += 1
+    if shown == 0:
+        print(f"没有匹配「{filter_kw}」的餐品。")
+    return 0
+
+
+def run_optimize(
+    city: str,
+    keyword: str,
+    budget: int,
+    save: bool = True,
+    items: list[str] | None = None,
+) -> int:
     from .mcd_client import McdMcpClient
 
     client = McdMcpClient()
     client.initialize()
 
     print(f"定位门店：{city} / {keyword}")
-    stores = client.data(
-        "query-nearby-stores", {"beType": 1, "searchType": 2, "city": city, "keyword": keyword}
-    )
-    if not stores:
+    ctx = _locate(client, city, keyword)
+    if ctx is None:
         print("未找到门店，请换一个关键词。")
         return 1
-    store = stores[0]
-    store_code = store["storeCode"]
+    store, store_code, menu, coupons = ctx
     print(f"命中：{store['storeName']}（{store['address']}）storeCode={store_code}")
-
-    meals = client.data("query-meals", {"storeCode": store_code, "orderType": 1, "beType": 1})
-    menu = _parse_menu(meals)
     print(f"菜单载入 {len(menu)} 个品类")
 
-    coupons = _parse_coupons(
-        client.data("query-store-coupons", {"storeCode": store_code, "orderType": 1, "beType": 1})
-    )
     print(f"门店可用券 {len(coupons)} 张")
     if not coupons:
         print("提示：卡包为空时先执行领券，或改用 --demo 查看离线演示。")
@@ -198,17 +249,27 @@ def run_optimize(city: str, keyword: str, budget: int, save: bool = True) -> int
             packing_fen=int(data.get("packingPrice", 0)),
         )
 
-    cart = _build_cart(menu, coupons)
+    if items:
+        cart, missed = _pick_cart(menu, items)
+        if missed:
+            print("\n⚠️ 下列餐品在菜单里没找到，已跳过：")
+            for m in missed:
+                print(f"  - {m}")
+            print("  用 `python -m src.cli menu --filter 关键词` 看看准确的品名。")
+    else:
+        cart = _build_cart(menu, coupons)
+
     if not cart:
-        print("菜单解析为空，暂无法寻优。")
+        print("购物车为空，无法寻优。")
         return 1
 
-    print("\n购物车（优先纳入券覆盖到的商品）：")
+    print("\n购物车：")
     for item in cart:
         note = item.condition_note()
         price = item.effective_price_fen()
         suffix = f"   ← {note}" if note else ""
-        print(f"  - {item.name or item.product_code:<16} ¥{FEN(price)}{suffix}")
+        qty = f"×{item.quantity} " if item.quantity > 1 else ""
+        print(f"  - {item.name or item.product_code:<16} {qty}¥{FEN(price)}{suffix}")
 
     optimizer = CouponOptimizer(oracle, max_calls=budget)
     best = optimizer.optimize(cart, coupons, _with_order_options(cart))
@@ -528,6 +589,56 @@ def _build_cart(menu: list[CartItem], coupons: list[Coupon], size: int = 4) -> l
     return picked
 
 
+def _pick_cart(menu: list[CartItem], wants: list[str]) -> tuple[list[CartItem], list[str]]:
+    """按用户给的餐品名挑购物车。
+
+    支持两种写法：
+        --items 巨无霸,中份薯条
+        --items "巨无霸x2,中份薯条"      （数量）
+
+    匹配规则：先按商品编码精确匹配，再按名称精确匹配，最后退化成子串包含。
+    匹配不上就原样报回来，绝不拿一个不相干的商品凑数。
+    """
+    by_code = {i.product_code: i for i in menu}
+    by_name = {(i.name or "").strip(): i for i in menu}
+
+    cart: list[CartItem] = []
+    missed: list[str] = []
+    # 先收集「要什么、各要几份」，最后再一次性构造 ——
+    # CartItem 是 frozen dataclass，创建之后改不动 quantity。
+    qty_by_code: dict[str, int] = {}
+    proto: dict[str, CartItem] = {}
+
+    for raw in wants:
+        token = (raw or "").strip()
+        if not token:
+            continue
+        qty = 1
+        m = re.search(r"[xX*×]\s*(\d+)\s*$", token)
+        if m:
+            qty = max(int(m.group(1)), 1)
+            token = token[: m.start()].strip()
+        if not token:
+            continue
+
+        item = by_code.get(token) or by_name.get(token)
+        if item is None:
+            hits = [i for i in menu if token and token in (i.name or "")]
+            item = hits[0] if hits else None
+        if item is None:
+            missed.append(raw)
+            continue
+
+        # 同一个商品写了两次就合并数量，而不是加两行
+        qty_by_code[item.product_code] = qty_by_code.get(item.product_code, 0) + qty
+        proto[item.product_code] = item
+
+    for code, qty in qty_by_code.items():
+        base = proto[code]
+        cart.append(CartItem(**{**base.__dict__, "quantity": qty}))
+    return cart, missed
+
+
 def _with_order_options(cart: list[CartItem]) -> list:
     """随单购候选档位。
 
@@ -579,16 +690,28 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("demo", help="离线演示，无需 Token")
     sub.add_parser("tools", help="列出 MCP 工具")
+    sub.add_parser("selftest", help="离线自检解析器与引擎，无需 Token")
 
     p_assets = sub.add_parser("assets", help="麦门资产周报（默认只读）")
     p_assets.add_argument(
         "--claim", action="store_true", help="真的去领券（会写入你的真实会员账号）"
     )
 
+    p_menu = sub.add_parser("menu", help="列出门店菜单")
+    p_menu.add_argument("--city", default="上海")
+    p_menu.add_argument("--keyword", default="人民广场")
+    p_menu.add_argument("--filter", default="", help="只显示名称包含该关键词的餐品")
+    p_menu.add_argument("--limit", type=int, default=40, help="最多显示多少条")
+
     p_opt = sub.add_parser("optimize", help="真实账号券价寻优")
     p_opt.add_argument("--city", default="上海")
     p_opt.add_argument("--keyword", default="人民广场")
     p_opt.add_argument("--budget", type=int, default=40, help="算价接口调用上限")
+    p_opt.add_argument(
+        "--items",
+        default="",
+        help="指定想吃什么，逗号分隔，可带数量：\"巨无霸x2,中份薯条\"；留空则自动挑选",
+    )
     p_opt.add_argument(
         "--no-save", action="store_true", help="不存本地快照（默认会存）"
     )
@@ -605,10 +728,33 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
+    try:
+        return _dispatch(args)
+    except KeyboardInterrupt:
+        print("\n已取消。")
+        return 130
+    except McpError as exc:
+        # Token 失效、限流、网络错误都走这里。
+        # 直接抛 traceback 对使用者毫无帮助，给一句能照着做的提示。
+        print(f"\n接口调用失败：{exc}")
+        print("常见原因：Token 失效（到 https://open.mcd.cn/mcp 重新激活）、")
+        print("          网络不通（本机需要代理时请设置 https_proxy）、")
+        print("          或触发限流（每 Token 600 次/分钟）。")
+        return 2
+
+
+def _dispatch(args) -> int:
     if args.cmd == "demo":
         return run_demo()
     if args.cmd == "tools":
         return run_tools()
+    if args.cmd == "selftest":
+        from .selftest import run as run_selftest
+
+        print("离线自检（无需 Token）\n")
+        return run_selftest()
+    if args.cmd == "menu":
+        return run_menu(args.city, args.keyword, args.filter, args.limit)
     if args.cmd == "assets":
         return run_assets(args.claim)
     if args.cmd == "replay":
@@ -616,7 +762,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "nutrition":
         return run_nutrition(args.city, args.keyword, args.kcal, args.size)
     if args.cmd == "optimize":
-        return run_optimize(args.city, args.keyword, args.budget, save=not args.no_save)
+        picked = [s for s in (args.items or "").split(",") if s.strip()]
+        return run_optimize(
+            args.city, args.keyword, args.budget, save=not args.no_save, items=picked
+        )
     return 1
 
 

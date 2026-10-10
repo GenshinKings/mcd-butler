@@ -109,7 +109,16 @@ class PriceResult:
 
     @property
     def saved_fen(self) -> int:
-        return max(self.original_fen - self.price_fen, self.discount_fen)
+        """按接口 `originalPrice` 口径算的节省额。
+
+        注意：随单购会把卡费计入 originalPrice，所以这个值可能是虚高的。
+        想知道「真实省了多少」，请用 `saved_vs(裸买价)`。
+        """
+        return self.original_fen - self.price_fen
+
+    def saved_vs(self, baseline_fen: int) -> int:
+        """相对裸买价的真实节省。这才是用户关心的数字。"""
+        return baseline_fen - self.price_fen
 
     def yuan(self, fen: int) -> str:
         return f"{fen / 100:.2f}"
@@ -161,23 +170,40 @@ class CouponOptimizer:
         self.max_calls = max_calls
         self.verbose = verbose
         self.calls = 0
-        self.trace: list[tuple[str, int]] = []
+        self.trace: list[int] = []
+        # 同一个方案会被不同的邻域动作重复生成（例如先删后加绕回原点），
+        # 缓存命中就不消耗调用次数 —— 预算是按次计的，省一次是一次。
+        self._cache: dict[tuple, PriceResult] = {}
 
     # ---------- 求值 ----------
 
+    @property
+    def remaining(self) -> int:
+        return max(self.max_calls - self.calls, 0)
+
     def evaluate(self, cart: Sequence[CartItem], assignment: Assignment) -> PriceResult:
+        """求值一次；相同方案直接命中缓存，不计入调用次数。"""
+        sig = assignment.signature()
+        if sig in self._cache:
+            assignment.price = self._cache[sig]
+            return assignment.price
         if self.calls >= self.max_calls:
             raise BudgetExhausted(f"算价调用已达上限 {self.max_calls}")
         self.calls += 1
-        # 构造带券的购物车副本
-        staged = self._stage(cart, assignment)
-        result = self.oracle(staged, assignment)
+        result = self.oracle(list(cart), assignment)
         assignment.price = result
+        self._cache[sig] = result
+        self.trace.append(result.price_fen)
         return result
 
-    @staticmethod
-    def _stage(cart: Sequence[CartItem], assignment: Assignment) -> list[CartItem]:
-        return list(cart)
+    def _try_eval(
+        self, cart: Sequence[CartItem], candidate: Assignment
+    ) -> PriceResult | None:
+        """预算耗尽时返回 None，让调用方优雅退出而不是崩掉。"""
+        try:
+            return self.evaluate(cart, candidate)
+        except BudgetExhausted:
+            return None
 
     # ---------- 构造 ----------
 
@@ -223,15 +249,21 @@ class CouponOptimizer:
         for with_order in with_order_options:
             current = self.greedy(cart, coupons)
             current.with_order = with_order
-            current.price = self.evaluate(cart, current)
+            if self._try_eval(cart, current) is None:
+                break  # 预算耗尽，后面档位也别试了
             if best is None or current.price.price_fen < best.price.price_fen:
                 best = current
 
             current = self._hill_climb(cart, coupons, table, current)
-            if current.price.price_fen < best.price.price_fen:
+            if current.price is not None and (
+                best is None or current.price.price_fen < best.price.price_fen
+            ):
                 best = current
 
-        assert best is not None
+        if best is None or best.price is None:
+            # 预算连一次贪心都没跑成：退化成裸买方案，至少返回可用结果而不是崩掉
+            best = Assignment(mapping={}, with_order=None)
+            best.price = self.oracle(list(cart), best)
         return best
 
     def _hill_climb(
@@ -242,21 +274,25 @@ class CouponOptimizer:
         start: Assignment,
     ) -> Assignment:
         current = start
+        if current.price is None:
+            if self._try_eval(cart, current) is None:
+                return current
         current_price = current.price.price_fen
 
         improved = True
         while improved and self.calls < self.max_calls:
             improved = False
 
-            # 邻域 1：删掉一张已挂的券（有时挂券反而更贵）
+            # 邻域 1：删掉一张已挂的券
+            # 这不是多余的 —— 实测券会被随单购作废，挂着反而占坑。
             for item_idx in list(current.mapping):
-                if self.calls >= self.max_calls:
-                    break
                 candidate = Assignment(
                     mapping={k: v for k, v in current.mapping.items() if k != item_idx},
                     with_order=current.with_order,
                 )
-                price = self.evaluate(cart, candidate)
+                price = self._try_eval(cart, candidate)
+                if price is None:
+                    return current
                 if price.price_fen < current_price:
                     current, current_price = candidate, price.price_fen
                     improved = True
@@ -266,19 +302,20 @@ class CouponOptimizer:
                 continue
 
             # 邻域 2：给空闲商品补一张未用的券
-            free_items = [i for i in range(len(cart)) if i not in current.mapping]
             used_coupons = set(current.mapping.values())
             for ci, hits in table.items():
                 if ci in used_coupons:
                     continue
                 for item_idx in hits:
-                    if item_idx not in free_items or self.calls >= self.max_calls:
+                    if item_idx in current.mapping:
                         continue
                     candidate = Assignment(
                         mapping={**current.mapping, item_idx: ci},
                         with_order=current.with_order,
                     )
-                    price = self.evaluate(cart, candidate)
+                    price = self._try_eval(cart, candidate)
+                    if price is None:
+                        return current
                     if price.price_fen < current_price:
                         current, current_price = candidate, price.price_fen
                         improved = True
@@ -289,19 +326,42 @@ class CouponOptimizer:
             if improved:
                 continue
 
-            # 邻域 3：两张已挂券对调，或把券挪到别的商品上
-            pairs = list(itertools.combinations(current.mapping.items(), 2))
-            for (i1, c1), (i2, c2) in pairs:
-                if self.calls >= self.max_calls:
+            # 邻域 3：把已挂的券挪到另一个它还适用的空闲商品上
+            # 只有「删」和「加」的话，单步都不一定变便宜，会卡在局部最优出不来。
+            for item_idx, ci in list(current.mapping.items()):
+                for target in table.get(ci, []):
+                    if target == item_idx or target in current.mapping:
+                        continue
+                    moved = dict(current.mapping)
+                    del moved[item_idx]
+                    moved[target] = ci
+                    candidate = Assignment(mapping=moved, with_order=current.with_order)
+                    price = self._try_eval(cart, candidate)
+                    if price is None:
+                        return current
+                    if price.price_fen < current_price:
+                        current, current_price = candidate, price.price_fen
+                        improved = True
+                        break
+                if improved:
                     break
+
+            if improved:
+                continue
+
+            # 邻域 4：两张已挂的券对调
+            # 对调之后是「商品 i1 挂券 c2、商品 i2 挂券 c1」，
+            # 所以要校验的是 c2 适用于 i1、c1 适用于 i2。
+            # table 的 key 是券下标、value 是商品下标列表 —— 千万别把两者弄反。
+            for (i1, c1), (i2, c2) in itertools.combinations(list(current.mapping.items()), 2):
+                if i1 not in table.get(c2, []) or i2 not in table.get(c1, []):
+                    continue
                 swapped = dict(current.mapping)
                 swapped[i1], swapped[i2] = c2, c1
-                if c2 not in table.get(c1, []) or c1 not in table.get(c2, []):
-                    # 对调后仍需满足适用性约束
-                    if i1 not in table.get(c2, []) or i2 not in table.get(c1, []):
-                        continue
                 candidate = Assignment(mapping=swapped, with_order=current.with_order)
-                price = self.evaluate(cart, candidate)
+                price = self._try_eval(cart, candidate)
+                if price is None:
+                    return current
                 if price.price_fen < current_price:
                     current, current_price = candidate, price.price_fen
                     improved = True
