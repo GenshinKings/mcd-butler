@@ -14,3 +14,6 @@ venv/
 # 演示产物
 out/
 screenshots/
+
+# WorkBuddy 工作区内部笔记，不公开
+.workbuddy/
