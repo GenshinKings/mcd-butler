@@ -133,7 +133,18 @@ def run_tools() -> int:
     return 0
 
 
-def run_optimize(city: str, keyword: str, budget: int) -> int:
+def run_assets(claim: bool) -> int:
+    """资产周报。默认只读；--claim 才领券。"""
+    from .assets import build_report
+    from .mcd_client import McdMcpClient
+
+    client = McdMcpClient()
+    client.initialize()
+    print(build_report(client, claim=claim))
+    return 0
+
+
+def run_optimize(city: str, keyword: str, budget: int, save: bool = True) -> int:
     from .mcd_client import McdMcpClient
 
     client = McdMcpClient()
@@ -214,6 +225,191 @@ def run_optimize(city: str, keyword: str, budget: int) -> int:
     print(f"\n裸买价 ¥{FEN(baseline.price_fen)}  →  到手 ¥{FEN(best.price.price_fen)}")
     print(f"真实省下 ¥{FEN(saved)}（接口 discount 报 ¥{FEN(best.price.discount_fen)}，含卡费口径）")
     print(f"算价接口共调用 {optimizer.calls} 次")
+
+    if save:
+        from .snapshot import entry_from_cart, save as save_snapshot
+
+        label = ""
+        if isinstance(best.with_order, dict):
+            label = str(best.with_order.get("_label", ""))
+        path = save_snapshot(
+            entry_from_cart(
+                cart=cart,
+                paid_fen=best.price.price_fen,
+                baseline_fen=baseline.price_fen,
+                discount_fen=best.price.discount_fen,
+                store_code=store_code,
+                store_name=store.get("storeName", ""),
+                city=city,
+                keyword=keyword,
+                coupon_titles=[coupons[ci].title for ci in best.mapping.values()],
+                with_order_label=label,
+            )
+        )
+        print(f"\n已存快照 → {path}（下次可用 `replay` 对比这单的价格变动）")
+    return 0
+
+
+def run_replay(store_code: str | None, list_only: bool) -> int:
+    """历史订单复刻：把这单按今天的菜单和券重算一遍，报价格变动。
+
+    数据源有两条，按优先级：
+    1. 真实历史订单（order-list）—— 账号下过单才有，很多账号是空的；
+    2. 本地快照 —— optimize 跑完自动存的「上次算过的那单」。
+
+    比较口径统一为「上次实付」vs「今天同款购物车的最优实付」。
+    不能直接比今天菜单的标价：那等于拿「用券后的价」比「不用的价」，
+    是在骗自己。
+    """
+    from .mcd_client import McdMcpClient
+    from . import snapshot as snap
+
+    if list_only:
+        entries = snap.load_all()
+        if not entries:
+            print("还没有快照。先跑一次 `python -m src.cli optimize` 生成。")
+            return 1
+        print(f"本地快照 {len(entries)} 条：")
+        for i, e in enumerate(entries, 1):
+            print(f"  {i}. {snap.describe(e)}")
+        return 0
+
+    client = McdMcpClient()
+    client.initialize()
+
+    source = ""
+    paid_fen: int | None = None
+    want: list[tuple[str, int]] = []  # (productCode, quantity)
+    target_store = store_code
+
+    # ---- 1. 真实历史订单
+    try:
+        data = client.data("order-list", {}) or {}
+        orders = (data or {}).get("list") or []
+    except Exception:
+        orders = []
+
+    if orders:
+        order = orders[0]
+        target_store = target_store or str(order.get("storeCode", ""))
+        try:
+            paid_fen = int(float(order.get("realTotalAmount") or 0) * 100)
+        except (TypeError, ValueError):
+            paid_fen = None
+        for p in order.get("orderProductList") or []:
+            code = str(p.get("productCode", ""))
+            if code:
+                want.append((code, int(p.get("quantity") or 1)))
+        source = f"历史订单 {order.get('orderId', '')} @ {order.get('createTime', '')}"
+
+    # ---- 2. 退回本地快照
+    if not want:
+        entry = snap.latest(target_store)
+        if entry is None:
+            print("既没有历史订单，也没有本地快照。")
+            print("先跑 `python -m src.cli optimize --city 上海 --keyword 人民广场` 生成一单。")
+            print("（离线演示：`python -m src.cli demo`）")
+            return 1
+        target_store = entry.get("store_code", "")
+        paid_fen = entry.get("paid_fen")
+        want = [(i["code"], int(i.get("qty") or 1)) for i in entry.get("items") or []]
+        source = f"本地快照 {entry.get('saved_at', '')}"
+
+    print(f"复刻来源：{source}")
+    print(f"目标门店：{target_store}")
+
+    meals = client.data("query-meals", {"storeCode": target_store, "orderType": 1, "beType": 1})
+    menu = _parse_menu(meals)
+    by_code = {i.product_code: i for i in menu}
+    print(f"今日菜单 {len(menu)} 个品类")
+
+    cart: list[CartItem] = []
+    missing: list[str] = []
+    for code, qty in want:
+        item = by_code.get(code)
+        if item is None:
+            missing.append(code)
+            continue
+        cart.append(CartItem(**{**item.__dict__, "quantity": qty}))
+    if not cart:
+        print("这单里的商品今天一个都点不到了，无法对比。")
+        return 1
+    if missing:
+        print(f"⚠️ {len(missing)} 个商品已从今日菜单下架：{', '.join(missing)}")
+
+    print("\n复刻购物车：")
+    for item in cart:
+        print(f"  - {item.name or item.product_code:<16} ×{item.quantity}  ¥{FEN(item.effective_price_fen())}")
+
+    coupons = _parse_coupons(
+        client.data("query-store-coupons", {"storeCode": target_store, "orderType": 1, "beType": 1})
+    )
+    print(f"\n今日可用券 {len(coupons)} 张")
+
+    def oracle(items: list[CartItem], assignment: Assignment) -> PriceResult:
+        payload_items = []
+        for idx, item in enumerate(items):
+            entry = {"productCode": item.product_code, "quantity": item.quantity}
+            ci = assignment.mapping.get(idx)
+            if ci is not None:
+                entry["couponId"] = coupons[ci].coupon_id
+                entry["couponCode"] = coupons[ci].coupon_code
+            payload_items.append(entry)
+        payload: dict = {
+            "storeCode": target_store,
+            "orderType": 1,
+            "beType": 1,
+            "items": payload_items,
+        }
+        if isinstance(assignment.with_order, dict):
+            payload["withOrder"] = assignment.with_order
+        d = client.data("calculate-price", payload)
+        return PriceResult(
+            price_fen=int(d.get("price", 0)),
+            original_fen=int(d.get("originalPrice", 0)),
+            discount_fen=int(d.get("discount", 0)),
+            delivery_fen=int(d.get("deliveryPrice", 0)),
+            packing_fen=int(d.get("packingPrice", 0)),
+        )
+
+    optimizer = CouponOptimizer(oracle, max_calls=40)
+    best = optimizer.optimize(cart, coupons, _with_order_options(cart))
+    assert best.price is not None
+    print("\n今日最优组合：")
+    for line in best.describe(cart, coupons):
+        print(f"  {line}")
+
+    print("\n" + "-" * 62)
+    if paid_fen is None:
+        print(f"上次实付金额未知，今日最优价 ¥{FEN(best.price.price_fen)}")
+    else:
+        diff = best.price.price_fen - paid_fen
+        verdict = "涨了" if diff > 0 else ("降了" if diff < 0 else "持平")
+        mark = " 🔺" if diff > 0 else (" 🔻" if diff < 0 else "")
+        print(f"上次实付 ¥{FEN(paid_fen)}  →  今日最优 ¥{FEN(best.price.price_fen)}")
+        print(f"同样的单，{verdict} ¥{FEN(abs(diff))}{mark}")
+    print("-" * 62)
+
+    # 存一份今天的快照，下次就能比
+    from .snapshot import entry_from_cart, save as save_snapshot
+
+    label = ""
+    if isinstance(best.with_order, dict):
+        label = str(best.with_order.get("_label", ""))
+    save_snapshot(
+        entry_from_cart(
+            cart=cart,
+            paid_fen=best.price.price_fen,
+            baseline_fen=best.price.original_fen,
+            discount_fen=best.price.discount_fen,
+            store_code=target_store,
+            store_name="",
+            city="",
+            keyword="",
+            coupon_titles=[coupons[ci].title for ci in best.mapping.values()],
+            with_order_label=label,
+        )
+    )
     return 0
 
 
@@ -332,12 +528,22 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("demo", help="离线演示，无需 Token")
     sub.add_parser("tools", help="列出 MCP 工具")
 
+    p_assets = sub.add_parser("assets", help="麦门资产周报（默认只读）")
+    p_assets.add_argument(
+        "--claim", action="store_true", help="真的去领券（会写入你的真实会员账号）"
+    )
+
     p_opt = sub.add_parser("optimize", help="真实账号券价寻优")
     p_opt.add_argument("--city", default="上海")
     p_opt.add_argument("--keyword", default="人民广场")
     p_opt.add_argument("--budget", type=int, default=40, help="算价接口调用上限")
+    p_opt.add_argument(
+        "--no-save", action="store_true", help="不存本地快照（默认会存）"
+    )
 
-    sub.add_parser("replay", help="历史订单复刻与价格变动")
+    p_rep = sub.add_parser("replay", help="历史订单复刻与价格变动")
+    p_rep.add_argument("--store", default=None, help="指定门店编码，默认用最近快照")
+    p_rep.add_argument("--list", action="store_true", help="只列出本地快照")
 
     args = parser.parse_args(argv)
 
@@ -345,12 +551,12 @@ def main(argv: list[str] | None = None) -> int:
         return run_demo()
     if args.cmd == "tools":
         return run_tools()
+    if args.cmd == "assets":
+        return run_assets(args.claim)
     if args.cmd == "replay":
-        print("（replay 真实模式开发中，先看离线演示）\n")
-        _demo_replay()
-        return 0
+        return run_replay(args.store, args.list)
     if args.cmd == "optimize":
-        return run_optimize(args.city, args.keyword, args.budget)
+        return run_optimize(args.city, args.keyword, args.budget, save=not args.no_save)
     return 1
 
 
