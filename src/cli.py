@@ -162,6 +162,102 @@ def _locate(client, city: str, keyword: str):
     return store, store_code, menu, coupons
 
 
+def run_advise(city: str, keyword: str, budget: int) -> int:
+    """一键顾问：今天该怎么点。
+
+    把几件事合成一条命令 —— 大多数人不会去记八个子命令，
+    他们只想问一句「我现在该怎么点最划算」。
+    """
+    from .assets import fetch_my_coupons
+    from .mcd_client import McdMcpClient
+    from datetime import datetime
+
+    client = McdMcpClient()
+    client.initialize()
+
+    # 1. 先看有没有今天就要作废的券 —— 这个比省几块钱更急
+    try:
+        mine = fetch_my_coupons(client, now=datetime.now())
+    except Exception:
+        mine = []
+    due = [c for c in mine if c.get("due_today")]
+    if due:
+        print("🚨 今天内到期，不用就作废：")
+        for c in due:
+            print(f"   - {c['title']}　{c['valid_text']}")
+        print()
+    elif mine:
+        print(f"卡包 {len(mine)} 张，没有今天到期的。\n")
+
+    # 2. 再算最优一单
+    ctx = _locate(client, city, keyword)
+    if ctx is None:
+        print("未找到门店，请换一个关键词。")
+        return 1
+    store, store_code, menu, coupons = ctx
+    print(f"门店：{store['storeName']}　可用券 {len(coupons)} 张")
+
+    if not coupons:
+        print("\n当前时段这张门店没有可用券。")
+        print("提示：很多券是时段券（早餐/夜宵），换个时间再试；")
+        print("      或先跑 `python -m src.cli assets --claim` 把能领的领了。")
+        return 0
+
+    def oracle(items: list[CartItem], assignment: Assignment) -> PriceResult:
+        payload_items = []
+        for idx, item in enumerate(items):
+            entry = {"productCode": item.product_code, "quantity": item.quantity}
+            ci = assignment.mapping.get(idx)
+            if ci is not None:
+                entry["couponId"] = coupons[ci].coupon_id
+                entry["couponCode"] = coupons[ci].coupon_code
+            payload_items.append(entry)
+        payload: dict = {
+            "storeCode": store_code,
+            "orderType": 1,
+            "beType": 1,
+            "items": payload_items,
+        }
+        if isinstance(assignment.with_order, dict):
+            payload["withOrder"] = assignment.with_order
+        d = client.data("calculate-price", payload)
+        return PriceResult(
+            price_fen=int(d.get("price", 0)),
+            original_fen=int(d.get("originalPrice", 0)),
+            discount_fen=int(d.get("discount", 0)),
+            delivery_fen=int(d.get("deliveryPrice", 0)),
+            packing_fen=int(d.get("packingPrice", 0)),
+        )
+
+    cart = _build_cart(menu, coupons)
+    if not cart:
+        print("菜单解析为空。")
+        return 1
+
+    print("\n推荐这一单：")
+    for item in cart:
+        note = item.condition_note()
+        suffix = f"   ← {note}" if note else ""
+        print(f"   - {item.name or item.product_code:<16} ¥{FEN(item.effective_price_fen())}{suffix}")
+
+    optimizer = CouponOptimizer(oracle, max_calls=budget)
+    best = optimizer.optimize(cart, coupons, _with_order_options(cart))
+    assert best.price is not None
+
+    baseline = optimizer.oracle(cart, Assignment(mapping={}, with_order=None))
+    print("\n最优组合：")
+    for line in best.describe(cart, coupons):
+        print(f"   {line}")
+    print(f"\n裸买 ¥{FEN(baseline.price_fen)}  →  到手 ¥{FEN(best.price.price_fen)}")
+    print(f"真实省下 ¥{FEN(best.price.saved_vs(baseline.price_fen))}")
+
+    extra = _print_insights(oracle, cart, coupons, best, budget)
+    print(f"\n算价接口共调用 {optimizer.calls + extra} 次")
+    print("\n想换成自己爱吃的：")
+    print('  python -m src.cli optimize --items "板烧鸡腿堡三件套,薯条x2"')
+    return 0
+
+
 def run_menu(city: str, keyword: str, filter_kw: str, limit: int) -> int:
     """列出门店菜单。带券的商品会被标出来——那是真正值得点的。"""
     from .mcd_client import McdMcpClient
@@ -204,6 +300,7 @@ def run_optimize(
     budget: int,
     save: bool = True,
     items: list[str] | None = None,
+    insights: bool = True,
 ) -> int:
     from .mcd_client import McdMcpClient
 
@@ -285,7 +382,11 @@ def run_optimize(
     saved = baseline.price_fen - best.price.price_fen
     print(f"\n裸买价 ¥{FEN(baseline.price_fen)}  →  到手 ¥{FEN(best.price.price_fen)}")
     print(f"真实省下 ¥{FEN(saved)}（接口 discount 报 ¥{FEN(best.price.discount_fen)}，含卡费口径）")
-    print(f"算价接口共调用 {optimizer.calls} 次")
+
+    extra = 0
+    if insights:
+        extra = _print_insights(oracle, cart, coupons, best, budget)
+    print(f"\n算价接口共调用 {optimizer.calls + extra} 次")
 
     if save:
         from .snapshot import entry_from_cart, save as save_snapshot
@@ -526,6 +627,81 @@ def run_nutrition(city: str, keyword: str, kcal: int, size: int) -> int:
     return 0
 
 
+def _print_insights(oracle, cart, coupons, best, budget: int) -> None:
+    """把「钱是怎么省下来的」讲明白。
+
+    只给一个到手价，跟 App 的结算页没区别。真正值钱的是这三件事：
+    每件东西实际花了我多少、哪张券是摆设、分开买会不会更便宜。
+    """
+    from . import insights as ins
+
+    if best.price is None:
+        return 0
+    whole = best.price.price_fen
+    counter = [0]  # 洞察用的是独立求解器，调用次数要单独累计
+
+    print("\n" + "-" * 62)
+    print("省钱洞察")
+    print("-" * 62)
+
+    # --- 1. 每件的真实成本
+    marginals = ins.marginal_costs(
+        oracle,
+        cart,
+        coupons,
+        _with_order_options,
+        baseline_fen=whole,
+        per_call_budget=max(budget // max(len(cart), 1), 4),
+        call_counter=counter,
+    )
+    if marginals:
+        print("\n  这一单里，每件东西实际花了你多少：")
+        for m in marginals:
+            name = m.item.name or m.item.product_code
+            qty = f"×{m.item.quantity}" if m.item.quantity > 1 else ""
+            if m.delta_fen > 0:
+                tag = f"  省 ¥{FEN(m.delta_fen)}"
+            elif m.delta_fen < 0:
+                tag = "  ⚠️ 反而更贵"
+            else:
+                tag = "  没享受到优惠"
+            print(
+                f"    {name:<18}{qty:<4} 标价 ¥{FEN(m.list_fen):>6}"
+                f"  →  实际 ¥{FEN(m.marginal_fen):>6}{tag}"
+            )
+
+    # --- 2. 挂了等于没挂的券
+    redundant = ins.redundant_coupons(oracle, cart, coupons, best)
+    counter[0] += len(best.mapping)
+    if redundant:
+        print("\n  ⚠️ 以下券挂了等于没挂（摘掉它总价一分不变）：")
+        for item, coupon in redundant:
+            print(f"    - {coupon.title}  ← 挂在「{item.name or item.product_code}」")
+        print("    常见成因：随单购已经把这件降到券面价了。")
+
+    # --- 3. 拆单建议
+    splits = ins.split_suggestions(
+        oracle,
+        cart,
+        coupons,
+        _with_order_options,
+        whole_fen=whole,
+        per_call_budget=max(budget // max(len(cart), 1), 4),
+        call_counter=counter,
+    )
+    if splits:
+        print("\n  💡 分开下单更便宜：")
+        for item, total, gain in splits:
+            print(
+                f"    - 把「{item.name or item.product_code}」单独下一单"
+                f"  →  两单合计 ¥{FEN(total)}，省 ¥{FEN(gain)}"
+            )
+
+    if not marginals and not redundant and not splits:
+        print("\n  （这张单的券结构简单，没有额外的省钱空间）")
+    return counter[0]
+
+
 def _parse_menu(raw: dict):
     """把 query-meals 的 meals 映射摊平成 CartItem 列表。
 
@@ -692,6 +868,11 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("tools", help="列出 MCP 工具")
     sub.add_parser("selftest", help="离线自检解析器与引擎，无需 Token")
 
+    p_adv = sub.add_parser("advise", help="一键顾问：今天该怎么点最划算")
+    p_adv.add_argument("--city", default="上海")
+    p_adv.add_argument("--keyword", default="人民广场")
+    p_adv.add_argument("--budget", type=int, default=40, help="算价接口调用上限")
+
     p_assets = sub.add_parser("assets", help="麦门资产周报（默认只读）")
     p_assets.add_argument(
         "--claim", action="store_true", help="真的去领券（会写入你的真实会员账号）"
@@ -714,6 +895,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_opt.add_argument(
         "--no-save", action="store_true", help="不存本地快照（默认会存）"
+    )
+    p_opt.add_argument(
+        "--no-insights",
+        action="store_true",
+        help="跳过省钱洞察（会少算若干次价，快一些）",
     )
 
     p_rep = sub.add_parser("replay", help="历史订单复刻与价格变动")
@@ -753,6 +939,8 @@ def _dispatch(args) -> int:
 
         print("离线自检（无需 Token）\n")
         return run_selftest()
+    if args.cmd == "advise":
+        return run_advise(args.city, args.keyword, args.budget)
     if args.cmd == "menu":
         return run_menu(args.city, args.keyword, args.filter, args.limit)
     if args.cmd == "assets":
@@ -764,7 +952,12 @@ def _dispatch(args) -> int:
     if args.cmd == "optimize":
         picked = [s for s in (args.items or "").split(",") if s.strip()]
         return run_optimize(
-            args.city, args.keyword, args.budget, save=not args.no_save, items=picked
+            args.city,
+            args.keyword,
+            args.budget,
+            save=not args.no_save,
+            items=picked,
+            insights=not args.no_insights,
         )
     return 1
 

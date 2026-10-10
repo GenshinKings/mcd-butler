@@ -203,6 +203,45 @@ def run() -> int:
         f"{pr.saved_fen} vs {pr.saved_vs(9750)}",
     )
 
+    # 10. 省钱洞察
+    from . import insights as ins
+
+    marg = ins.marginal_costs(
+        demo.demo_oracle,
+        cart,
+        demo.DEMO_COUPONS,
+        lambda c: demo.DEMO_WITH_ORDER_OPTIONS,
+        baseline_fen=best.price.price_fen,
+        per_call_budget=20,
+    )
+    check("洞察-边际成本覆盖每件", len(marg) == len(cart), f"{len(marg)} vs {len(cart)}")
+    check(
+        "洞察-边际成本非负",
+        all(m.marginal_fen >= 0 for m in marg),
+        str([m.marginal_fen for m in marg]),
+    )
+    check(
+        "洞察-确实有商品享受到优惠",
+        any(m.delta_fen > 0 for m in marg),
+    )
+
+    red = ins.redundant_coupons(demo.demo_oracle, cart, demo.DEMO_COUPONS, best)
+    check("洞察-冗余券检测不报错", isinstance(red, list))
+
+    splits = ins.split_suggestions(
+        demo.demo_oracle,
+        cart,
+        demo.DEMO_COUPONS,
+        lambda c: demo.DEMO_WITH_ORDER_OPTIONS,
+        whole_fen=best.price.price_fen,
+        per_call_budget=20,
+    )
+    check("洞察-拆单检测不报错", isinstance(splits, list))
+
+    # 11. 演示数据里那张「陷阱券」（C5，挂上反而加价）不该被选进最优解
+    used_ids = {demo.DEMO_COUPONS[ci].coupon_id for ci in best.mapping.values()}
+    check("引擎-不选中陷阱券C5", "C5" not in used_ids, str(sorted(used_ids)))
+
     # ---------------------------------------------------------------- 输出
     passed = sum(1 for _, ok, _ in _RESULTS if ok)
     total = len(_RESULTS)
