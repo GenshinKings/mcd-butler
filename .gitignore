@@ -1,0 +1,16 @@
+# Token 绝不入库
+.env
+*.token
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+.DS_Store
+.idea/
+.vscode/
+
+# 演示产物
+out/
+screenshots/
