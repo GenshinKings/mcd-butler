@@ -413,6 +413,58 @@ def run_replay(store_code: str | None, list_only: bool) -> int:
     return 0
 
 
+def run_nutrition(city: str, keyword: str, kcal: int, size: int) -> int:
+    """热量预算搭配：给定热量上限，挑出蛋白质最高的合法组合。"""
+    from .mcd_client import McdMcpClient, extract_payload
+    from . import nutrition as nut
+
+    client = McdMcpClient()
+    client.initialize()
+
+    stores = client.data(
+        "query-nearby-stores", {"beType": 1, "searchType": 2, "city": city, "keyword": keyword}
+    )
+    if not stores:
+        print("未找到门店，请换一个关键词。")
+        return 1
+    store = stores[0]
+    store_code = store["storeCode"]
+    print(f"门店：{store['storeName']}（storeCode={store_code}）")
+
+    menu = _parse_menu(
+        client.data("query-meals", {"storeCode": store_code, "orderType": 1, "beType": 1})
+    )
+    print(f"菜单 {len(menu)} 个品类")
+
+    raw = extract_payload(client.call("list-nutrition-foods", {}))
+    table = nut.parse_nutrition((raw or {}).get("data"))
+    print(f"营养表 {len(table)} 条（接口返回的是字符串，需自行解析）")
+
+    pairs = nut.match_menu(menu, table)
+    print(f"能对上营养数据的餐品 {len(pairs)} 个")
+
+    if not pairs:
+        print("菜单与营养表一个都对不上，无法给出建议。")
+        return 1
+
+    combos = nut.plan(pairs, kcal_budget=kcal, size=size)
+    if not combos:
+        print(f"在 {kcal} kcal 预算内凑不出任何组合，试试提高预算。")
+        return 1
+
+    print(f"\n热量预算 {kcal} kcal 内的最优搭配（按蛋白质降序）：")
+    for i, combo in enumerate(combos, 1):
+        s = nut.summarize(combo)
+        names = " + ".join(p[0].name or p[0].product_code for p in combo)
+        print(f"\n  {i}. {names}")
+        print(
+            f"     {s['kcal']} kcal　蛋白 {s['protein']}g　脂肪 {s['fat']}g　"
+            f"碳水 {s['carb']}g　钠 {s['sodium']}mg"
+        )
+        print(f"     合计 ¥{FEN(s['price_fen'])}")
+    return 0
+
+
 def _parse_menu(raw: dict):
     """把 query-meals 的 meals 映射摊平成 CartItem 列表。
 
@@ -545,6 +597,12 @@ def main(argv: list[str] | None = None) -> int:
     p_rep.add_argument("--store", default=None, help="指定门店编码，默认用最近快照")
     p_rep.add_argument("--list", action="store_true", help="只列出本地快照")
 
+    p_nut = sub.add_parser("nutrition", help="热量预算搭配")
+    p_nut.add_argument("--city", default="上海")
+    p_nut.add_argument("--keyword", default="人民广场")
+    p_nut.add_argument("--kcal", type=int, default=600, help="热量上限（千卡）")
+    p_nut.add_argument("--size", type=int, default=3, help="最多几件")
+
     args = parser.parse_args(argv)
 
     if args.cmd == "demo":
@@ -555,6 +613,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_assets(args.claim)
     if args.cmd == "replay":
         return run_replay(args.store, args.list)
+    if args.cmd == "nutrition":
+        return run_nutrition(args.city, args.keyword, args.kcal, args.size)
     if args.cmd == "optimize":
         return run_optimize(args.city, args.keyword, args.budget, save=not args.no_save)
     return 1
