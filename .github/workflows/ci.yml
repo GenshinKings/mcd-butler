@@ -1,0 +1,62 @@
+name: CI
+
+# 为什么要有这个
+# --------------
+# 这个项目的绝大部分复杂度在**解析**，而解析的正确性依赖麦当劳返回体的
+# 具体格式。对面改一次格式，解析器会静默失效 —— 本地跑得通，clone 的人跑不通。
+#
+# 所以 CI 只做四件事，都是「不联网也能验」的：
+#   1. 离线自检（真实报文 fixture）
+#   2. 自检本身可重入（连跑两轮比断言总数 —— 只跑一轮发现不了结果列表没清空）
+#   3. 离线演示能跑完（这是路人的第一印象，挂了等于仓库是坏的）
+#   4. 语法编译
+#
+# 刻意**不**在 CI 里调麦当劳接口：Token 走 secret 会把真实账号暴露给每一个
+# PR（fork 的 PR 也能读到），那是合规红线。端到端验证由维护者手动跑。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.13"]
+
+    # 必须显式钉死输出编码：本项目的输出全是 `═ │ ¥ ░ ⏳ 🆕`，
+    # windows-latest 的 runner 默认代码页（en-US 是 cp1252）打不出来，
+    # `selftest` 第一行中文就会 UnicodeEncodeError 退出 1。
+    # PYTHONUTF8=1 不够 —— PYTHONIOENCODING 优先级更高，实测仍会崩。
+    env:
+      PYTHONIOENCODING: utf-8
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # 零第三方依赖是硬原则，所以不装 requirements.txt ——
+      # 装了反而验不出「clone 下来就能跑」这件事。
+      - name: 语法编译
+        run: python -m compileall -q src
+
+      - name: 离线自检
+        run: python -m src.cli selftest
+
+      # 自检跑两轮并比对断言总数。单跑一轮是发现不了「结果列表没清空」的 ——
+      # 污染会同时放大分子和分母，打印出来的还是「N/N 通过」且全绿。
+      - name: 自检可重入
+        run: python -m src.cli selftest --twice
+
+      - name: 离线演示
+        run: python -m src.cli demo
+
+      - name: 帮助信息不报错
+        run: python -m src.cli --help
