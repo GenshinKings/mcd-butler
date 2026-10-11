@@ -1,5 +1,7 @@
 # 麦门管家 · mcd-butler
 
+[![CI](https://github.com/GenshinKings/mcd-butler/actions/workflows/ci.yml/badge.svg)](https://github.com/GenshinKings/mcd-butler/actions/workflows/ci.yml)
+
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)
 
 ![零依赖](https://img.shields.io/badge/依赖-仅标准库-2ea44f)
@@ -752,12 +754,34 @@ MCP_INTEGRATION.md   使用的 MCP Server、Tool、调用流程与业务价值
 
 ## 校验与开发
 
+每次 push 都会自动跑一遍下面的前三项 —— 徽章是绿的，说明**在你 clone 的这一刻**，
+这几件事在 3.10 / 3.13 × Linux / Windows 四种组合下都被真跑过一遍了。
+
 ```bash
 python -m src.cli selftest            # 231 项离线自检，几秒
 python -m src.cli selftest --twice    # 连跑两轮并比对断言总数（证明自检本身可重入）
+python -m src.cli demo                # 离线演示，这是路人的第一印象
 python scripts/smoke.py               # 编译 / 3.10 兼容 / 自检 / 演示 / 16 个命令 --help / 四种代码页
 python scripts/mutate.py              # 变异测试：改坏 76 处核心逻辑，自检必须翻红
 ```
+
+<details>
+
+<summary><b>CI 具体验什么、为什么跑这几样</b></summary>
+
+CI **刻意不调麦当劳接口**：Token 走 secret 会把真实账号暴露给每一个 fork 的 PR，
+那是合规红线。所以 CI 验的全是「不联网也能验」的事 —— 而恰好这几件事，
+才是决定一个陌生人 clone 下来能不能跑通的东西。
+
+| 步骤 | 在防什么 |
+|---|---|
+| `compileall` | 有人写了 3.11+ 语法，本地 3.13 跑得欢，别人 3.10 直接 SyntaxError |
+| `selftest` | 麦当劳改一次返回体格式，解析器**静默失效** —— 本地跑得通，clone 的人跑不通 |
+| `selftest --twice` | 结果列表没清空时污染会同时放大分子分母，打印出来仍是「N/N 全绿」 |
+| `demo` | 这是 README 叫人跑的第一条命令，它挂了等于仓库是坏的 |
+| 矩阵 4 组合 | Windowsrunner 默认代码页是 cp1252，`¥ ═ ❌` 这类字符会直接崩。**这一行是专为 Windows 中文用户留的** |
+
+</details>
 
 `mutate.py` 是这个项目最不一样的一条约束：**自检全绿不能证明自检有效。**
   
