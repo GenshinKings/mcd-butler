@@ -2119,11 +2119,21 @@ def run() -> int:
 
     from .cli import run_demo
 
+    # 跑两遍：默认版（路人看到的第一印象）和 --all 版（README 贴的数字契约）。
+    # 只跑一遍的话，"默认演示被塞进了六段"这种退化根本没人拦得住。
     _buf = _io4.StringIO()
     with _ctx2.redirect_stdout(_buf):
-        _demo_rc = run_demo()
-    _demo_out = _buf.getvalue()
-    check("演示-离线演示能跑完且正常退出", _demo_rc == 0, f"rc={_demo_rc}")
+        _core_rc = run_demo()
+    _core_out = _buf.getvalue()
+    _buf2 = _io4.StringIO()
+    with _ctx2.redirect_stdout(_buf2):
+        _demo_rc = run_demo(show_all=True)
+    _demo_out = _buf2.getvalue()
+    check(
+        "演示-离线演示能跑完且正常退出（默认 / --all 都要）",
+        _core_rc == 0 and _demo_rc == 0,
+        f"默认 rc={_core_rc}，--all rc={_demo_rc}",
+    )
 
     _readme = (_Path(__file__).resolve().parent.parent / "README.md").read_text(
         encoding="utf-8"
@@ -2432,9 +2442,26 @@ def run() -> int:
         f"demo {len(_hit)} 段 / README 写的是六段吗：{'一共**六段**' in _readme}",
     )
     check(
-        "文档-README 要把六段都提到（不能只说「还有好几段」）",
-        all(s in _readme for s in _SECTIONS),
-        f"README 没提：{[s for s in _SECTIONS if s not in _readme]}",
+        "演示-默认演示只跑人人用得到的链路（玩法向四段不许挤占第一印象）",
+        # demo 是路人的第一印象：黄历/体检/日历/段位堆上去，主线就没了。
+        # 但它们不能凭空消失 —— 所以同时要求给出 `--all` 这个出口。
+        #
+        # 不能只查段名字符串：默认演示的收尾提示里也会写「黄历 / 券包体检…」，
+        # 那是**告诉用户去哪儿找**，不是把段落跑出来了。所以查的是段落标题
+        # （带命令名括号的那一行）和分隔线条数——每段两道分隔线，两段就是四道。
+        all(
+            s not in _core_out
+            for s in (
+                "麦门黄历（almanac）",
+                "券包体检（audit）",
+                "麦门活动日历（campaign）",
+                "麦门段位（brag）",
+            )
+        )
+        and len([ln for ln in _core_out.splitlines() if ln.startswith("=" * 62)]) == 4
+        and "--all" in _core_out,
+        f"默认演示段数不对或混进了玩法向段落："
+        f"{len([ln for ln in _core_out.splitlines() if ln.startswith('=' * 62)])} 道分隔线",
     )
 
     # ================================================================ README 版式

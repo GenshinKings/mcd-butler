@@ -76,7 +76,16 @@ def _meal_payload(store_code: str, code: str) -> dict:
 
 # ==================================================================== demo
 
-def run_demo() -> int:
+def run_demo(show_all: bool = False) -> int:
+    """离线演示：默认只跑**人人都用得到**的那条链路。
+
+    为什么默认是两段而不是六段：
+        demo 是路人的第一印象。早先它一口气喷六段（黄历、券包体检、
+        活动日历、麦门段位……），读者还没看懂「券挂到哪件商品」这条主线，
+        就被一堆玩法冲散了 —— 演示堆料等于没演示。
+        所以默认只跑「购物车 + 券 → 逐张试出真实价值 → 挂上去 → 省了多少」
+        和「复刻上一单」，玩法向的四段留给 `demo --all`。
+    """
     print("=" * 62)
     print("麦门管家 · 离线演示（无需 Token）")
     print("=" * 62)
@@ -153,6 +162,13 @@ def run_demo() -> int:
     print("历史订单复刻（replay）")
     print("=" * 62)
     _demo_replay()
+
+    if not show_all:
+        print("\n  上面两段就是演示的全部 —— 人人都用得到的那条链路：")
+        print("  购物车 + 券 → 逐张试出真实价值 → 挂到最合适的那件 → 省了多少。")
+        print("  黄历 / 券包体检 / 活动日历 / 段位这四段是玩法向的，`--all` 才跑：")
+        print("    python -m src.cli demo --all")
+        return 0
 
     print("\n" + "=" * 62)
     print("麦门黄历（almanac）")
@@ -1761,7 +1777,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="mcd-butler", description="麦门管家")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("demo", help="离线演示，无需 Token")
+    p_demo = sub.add_parser("demo", help="离线演示，无需 Token")
+    p_demo.add_argument(
+        "--all",
+        action="store_true",
+        help="连玩法向的四段一起演示（黄历 / 券包体检 / 活动日历 / 段位）",
+    )
     sub.add_parser("tools", help="列出 MCP 工具")
     p_self = sub.add_parser("selftest", help="离线自检解析器与引擎，无需 Token")
     p_self.add_argument(
@@ -1924,7 +1945,7 @@ def _error_hint(exc: Exception) -> tuple[int, list[str]]:
 
 def _dispatch(args) -> int:
     if args.cmd == "demo":
-        return run_demo()
+        return run_demo(show_all=getattr(args, "all", False))
     if args.cmd == "tools":
         return run_tools()
     if args.cmd == "selftest":
