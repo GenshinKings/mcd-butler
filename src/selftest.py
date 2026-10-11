@@ -457,6 +457,20 @@ def run() -> int:
         len(cart_c) == 1 and cart_c[0].product_code == "9900016073",
     )
 
+    # 17. 接口异常结构守卫：真实接口偶发返回非预期类型（list/str/None/dict），
+    # 解析器必须返回空列表，绝不能抛 AttributeError/KeyError 裸奔成 traceback。
+    # 真实教训：门店字段缺失、菜单返回非 dict 都会让整条命令崩在打印之前。
+    from .cli import _parse_coupons, _parse_menu
+
+    check(
+        "守卫-菜单返回 None/str/list 不崩",
+        _parse_menu(None) == [] and _parse_menu("x") == [] and _parse_menu([1, 2]) == [],
+    )
+    check(
+        "守卫-券池返回 dict/None/str 不崩",
+        _parse_coupons({"a": 1}) == [] and _parse_coupons(None) == [] and _parse_coupons("x") == [],
+    )
+
     # ---------------------------------------------------------------- 输出
     passed = sum(1 for _, ok, _ in _RESULTS if ok)
     total = len(_RESULTS)

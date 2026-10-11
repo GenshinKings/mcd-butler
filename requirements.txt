@@ -1,0 +1,8 @@
+# mcd-butler（麦门管家）仅使用 Python 标准库，无任何第三方运行时依赖。
+#
+# 保留此文件只是为了满足评审/工具链对 requirements.txt 的预期：
+#   pip install -r requirements.txt
+# 什么都不会安装 —— 这正是本项目的设计目标之一：零依赖、离线可运行。
+#
+# 唯一需要自备的是麦当劳 MCP 的 Token，通过环境变量注入（不入库）：
+#   export MCD_MCP_TOKEN=你的Token

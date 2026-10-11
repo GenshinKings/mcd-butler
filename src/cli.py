@@ -164,10 +164,17 @@ def _locate(client, city: str, keyword: str):
     stores = client.data(
         "query-nearby-stores", {"beType": 1, "searchType": 2, "city": city, "keyword": keyword}
     )
-    if not stores:
+    if not isinstance(stores, list) or not stores:
+        print("未找到门店，请换一个城市/关键词。")
         return None
     store = stores[0]
-    store_code = store["storeCode"]
+    if not isinstance(store, dict):
+        print("门店数据格式异常。")
+        return None
+    store_code = store.get("storeCode")
+    if not store_code:
+        print("门店缺少 storeCode，无法继续。")
+        return None
     meals = client.data("query-meals", {"storeCode": store_code, "orderType": 1, "beType": 1})
     menu = _parse_menu(meals)
     coupons = _parse_coupons(
@@ -209,7 +216,7 @@ def run_advise(city: str, keyword: str, budget: int) -> int:
         print("未找到门店，请换一个关键词。")
         return 1
     store, store_code, menu, coupons = ctx
-    print(f"门店：{store['storeName']}　可用券 {len(coupons)} 张")
+    print(f"门店：{store.get('storeName', '未知门店')}　可用券 {len(coupons)} 张")
 
     if not coupons:
         print("\n当前时段这张门店没有可用券。")
@@ -256,10 +263,9 @@ def run_advise(city: str, keyword: str, budget: int) -> int:
 
     shared = Budget(budget)
     optimizer = CouponOptimizer(oracle, max_calls=budget, budget=shared)
-    # 裸买基准必须先算：optimize 会把预算吃光，若放后面 try_evaluate 拿到 None 会崩溃
-    baseline = optimizer.try_evaluate(cart, Assignment(mapping={}, with_order=None))
-    if baseline is None:
-        raise BudgetExhausted("预算不足以计算裸买基准，请调大 --budget")
+    # 裸买基准用 evaluate 直接算：预算耗尽抛 BudgetExhausted、网络错抛 McpError，
+    # 绝不被 try_evaluate 把瞬时抖动误当成「预算不足」而误导用户调大 --budget。
+    baseline = optimizer.evaluate(cart, Assignment(mapping={}, with_order=None))
     best = optimizer.optimize(cart, coupons, _with_order_options(cart))
     if best.price is None:
         raise BudgetExhausted("没能算出任何价格")
@@ -293,7 +299,7 @@ def run_menu(city: str, keyword: str, filter_kw: str, limit: int) -> int:
     for c in coupons:
         covered |= set(c.product_codes)
 
-    print(f"门店：{store['storeName']}（storeCode={store_code}）")
+    print(f"门店：{store.get('storeName', '未知门店')}（storeCode={store_code}）")
     print(f"共 {len(menu)} 个品类，{len(coupons)} 张可用券\n")
 
     shown = 0
@@ -332,7 +338,7 @@ def run_optimize(
         print("未找到门店，请换一个关键词。")
         return 1
     store, store_code, menu, coupons = ctx
-    print(f"命中：{store['storeName']}（{store['address']}）storeCode={store_code}")
+    print(f"命中：{store.get('storeName', '未知门店')}（{store.get('address', '未知地址')}）storeCode={store_code}")
     print(f"菜单载入 {len(menu)} 个品类")
 
     print(f"门店可用券 {len(coupons)} 张")
@@ -414,24 +420,26 @@ def run_optimize(
     if save:
         from .snapshot import entry_from_cart, save as save_snapshot
 
-        label = ""
-        if isinstance(best.with_order, dict):
-            label = best.with_order.label
-        path = save_snapshot(
-            entry_from_cart(
-                cart=cart,
-                paid_fen=best.price.price_fen,
-                baseline_fen=baseline.price_fen,
-                discount_fen=best.price.discount_fen,
-                store_code=store_code,
-                store_name=store.get("storeName", ""),
-                city=city,
-                keyword=keyword,
-                coupon_titles=[coupons[ci].title for ci in best.mapping.values()],
-                with_order_label=label,
+        label = best.with_order.label if best.with_order is not None else ""
+        try:
+            path = save_snapshot(
+                entry_from_cart(
+                    cart=cart,
+                    paid_fen=best.price.price_fen,
+                    baseline_fen=baseline.price_fen,
+                    discount_fen=best.price.discount_fen,
+                    store_code=store_code,
+                    store_name=store.get("storeName", ""),
+                    city=city,
+                    keyword=keyword,
+                    coupon_titles=[coupons[ci].title for ci in best.mapping.values()],
+                    with_order_label=label,
+                )
             )
-        )
-        print(f"\n已存快照 → {path}（下次可用 `replay` 对比这单的价格变动）")
+            print(f"\n已存快照 → {path}（下次可用 `replay` 对比这单的价格变动）")
+        except OSError as exc:
+            # 快照只是锦上添花：写盘失败（权限/磁盘满）绝不该让已算完的结果崩掉。
+            print(f"\n（快照保存失败，不影响本次结果：{exc}）")
     return 0
 
 
@@ -610,12 +618,18 @@ def run_nutrition(city: str, keyword: str, kcal: int, size: int) -> int:
     stores = client.data(
         "query-nearby-stores", {"beType": 1, "searchType": 2, "city": city, "keyword": keyword}
     )
-    if not stores:
+    if not isinstance(stores, list) or not stores:
         print("未找到门店，请换一个关键词。")
         return 1
     store = stores[0]
-    store_code = store["storeCode"]
-    print(f"门店：{store['storeName']}（storeCode={store_code}）")
+    if not isinstance(store, dict):
+        print("门店数据格式异常。")
+        return 1
+    store_code = store.get("storeCode")
+    if not store_code:
+        print("门店缺少 storeCode，无法继续。")
+        return 1
+    print(f"门店：{store.get('storeName', '未知门店')}（storeCode={store_code}）")
 
     menu = _parse_menu(
         client.data("query-meals", {"storeCode": store_code, "orderType": 1, "beType": 1})
@@ -635,7 +649,11 @@ def run_nutrition(city: str, keyword: str, kcal: int, size: int) -> int:
 
     combos = nut.plan(pairs, kcal_budget=kcal, size=size)
     if not combos:
-        print(f"在 {kcal} kcal 预算内凑不出任何组合，试试提高预算。")
+        if pairs and all(p[1]["kcal"] == 0 for p in pairs):
+            # 对上了名字但热量全读成 0：基本是接口字段变动导致解析失败，别假装「没有搭配」。
+            print("营养表解析异常：所有餐品热量都读成了 0，可能是接口字段变动，无法搭配。")
+        else:
+            print(f"在 {kcal} kcal 预算内凑不出任何组合，试试提高预算。")
         return 1
 
     print(f"\n热量预算 {kcal} kcal 内推荐搭配（按蛋白质降序）：")
@@ -738,6 +756,9 @@ def _parse_menu(raw: dict):
     关键：`currentPrice` 可能是「随单购麦金卡优惠」这类条件价，
     必须把 originalPrice 一起留下来，否则展示会骗人。
     """
+    if not isinstance(raw, dict):
+        # 接口偶发返回 list/str/None（而非预期 dict），直接当空菜单，别抛 AttributeError。
+        return []
     items: list[CartItem] = []
     detail = raw.get("meals", {}) or {}
 
@@ -907,7 +928,8 @@ def _with_order_options(cart: list[CartItem]) -> list:
 
 
 def _parse_coupons(raw) -> list[Coupon]:
-    if not raw:
+    if not isinstance(raw, (list, tuple)):
+        # 接口偶发返回 dict/str/None，迭代会炸；直接当无券。
         return []
     out: list[Coupon] = []
     for entry in raw:

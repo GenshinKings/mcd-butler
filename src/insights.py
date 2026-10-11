@@ -121,13 +121,14 @@ def redundant_coupons(
         reduced = {k: v for k, v in best.mapping.items() if k != item_idx}
         cand = Assignment(mapping=reduced, with_order=best.with_order)
         try:
-            if budget is not None:
-                budget.spend()
             price = oracle(cart, cand)
         except (TypeError, ValueError, KeyError):
             # 只吞「解析不出价格」这类数据问题；
             # 网络/鉴权故障必须往上抛，否则会把故障伪装成「没有冗余券」。
             continue
+        # 先算价、成功后才扣预算：失败时不会白白吃掉一次调用额度。
+        if budget is not None:
+            budget.spend()
         if price.price_fen == best.price.price_fen:
             out.append((cart[item_idx], coupons[ci]))
     return out
