@@ -644,7 +644,22 @@ def run() -> int:
         travel_cost(1000, "walk", yuan_per_km=3).money_fen == 600,  # 往返 2km × ¥3
     )
     check("路程-未知方式回退到步行", travel_cost(1000, "飞船").minutes == travel_cost(1000, "walk").minutes)
-    check("路程-固定开销存在", OVERHEAD_MIN > 0 and MODES["bus"].base_fen == 200)
+    # 早先这条叫「路程-固定开销存在」，断言的却是 `OVERHEAD_MIN > 0`
+    # 和 `MODES["bus"].base_fen == 200` —— 两句都是把被测模块里的常量原样抄回来，
+    # 抄的是数据不是行为：谁改了这两个数会红，可谁改了**换算逻辑**一条都不红。
+    # 换成「固定开销必须真的落进耗时」「起步价必须真的落进路费」两件真事。
+    check(
+        "路程-固定开销计入耗时（0 米也要算进出店那几分钟）",
+        travel_cost(0, "walk").minutes == OVERHEAD_MIN > 0,
+        f"0 米往返 {travel_cost(0, 'walk').minutes} 分钟",
+    )
+    check(
+        "路程-起步价计入路费且与距离无关（公交每公里价为 0）",
+        travel_cost(0, "bus").money_fen == 200
+        and travel_cost(5000, "bus").money_fen == 200
+        and travel_cost(0, "walk").money_fen == 0,
+        f"公交 0 米 {travel_cost(0, 'bus').money_fen} 分 / 5000 米 {travel_cost(5000, 'bus').money_fen} 分",
+    )
 
     # 缺货的店不能跟齐全的比 —— 必须沉到最后，否则是拿不同的东西比价
     # 关键场景：远店东西更便宜（¥35 < ¥36.80），但打车路费高得多。
@@ -682,19 +697,10 @@ def run() -> int:
         f"路费¥{q_taxi.travel.money_fen / 100:.2f} vs 省¥{q_taxi.saved_fen / 100:.2f}",
     )
 
-    # 打烊门店必须被排除（businessStatus 实测为布尔值，True=营业中）
-    open_stores = [
-        s for s in (
-            {"storeName": "A", "businessStatus": True},
-            {"storeName": "B", "businessStatus": False},
-            {"storeName": "C"},  # 字段缺失：不敢乱猜，按营业处理
-        )
-        if s.get("businessStatus") is not False
-    ]
-    check(
-        "营业-打烊门店被排除而字段缺失不误杀",
-        [s["storeName"] for s in open_stores] == ["A", "C"],
-    )
+    # 打烊门店必须被排除（businessStatus 实测为布尔值，True=营业中）。
+    # 这一条的断言在文末「24.」里 —— 早先它在这里自己又写了一遍同样的列表推导式、
+    # 再断言自己算出来的结果：cli.run_compare 那行改坏自检一条都不红。
+    # 守不清哪怕一行 Tailor-made 的实现，等于没有这条自检。
 
     # 19. 券范围解释：卡包接口只有 Markdown、没有券码，必须向用户说清楚
     # 「我明明有 4 张券为什么只用 1 张」，否则用户会以为引擎算漏了。
@@ -2428,6 +2434,168 @@ def run() -> int:
         "文档-README 要把六段都提到（不能只说「还有好几段」）",
         all(s in _readme for s in _SECTIONS),
         f"README 没提：{[s for s in _SECTIONS if s not in _readme]}",
+    )
+
+    # ================================================================ 24.
+    # 变异猎手（第六轮）补的断言：下面每一条都对应一处「改坏后自检全绿」的变异。
+    # 这一轮专门挑前五轮没点名过的模块（route / insights / audit 候选采样 /
+    # persona 段位 / snapshot 截断 / assets 截止时刻 / campaign 正文取价 /
+    # nutrition 配对 / cli 的数量与打烊过滤），8 处里 8 处都是零覆盖。
+
+    # ── R3：拆单建议的收益必须严格为正
+    # 为什么单列：原来的断言只查返回值的**形状**（是不是三元组），
+    # 于是「把 < 放宽成 <=」让推荐列表里混进「省 ¥0」的建议，自检依旧全绿 ——
+    # 用户看到"分开下单更便宜"照着做，一分钱省不到。
+    from . import insights as _ins6
+
+    _sp_cart = [CartItem("SP1", "甲A", 1, 2000), CartItem("SP2", "乙B", 1, 2000)]
+    _sp_flat = lambda items, a: PriceResult(  # 完全不打折：拆不拆一个价
+        price_fen=sum(i.unit_price_fen * i.quantity for i in items), original_fen=0
+    )
+    _sp_got = _ins6.split_suggestions(
+        _sp_flat, _sp_cart, [], lambda c: [None], whole_fen=4000, per_call_budget=8
+    )
+    check(
+        "洞察-拆单建议不许报零收益（省 ¥0 也算建议是谎报）",
+        _sp_got == [],
+        str([(x[0].product_code, x[2]) for x in _sp_got]),
+    )
+
+    # ── R5：体检候选的去重键必须带价格
+    # 同一个 productCode 有不同规格/不同价时，只按 code 去重会少试一件，
+    # 而那件恰好可能够到门槛 —— 一张好券被静默判成废券。
+    from .audit import _candidates
+
+    _dup_menu = [
+        CartItem("SAME", "同码便宜", 1, 1000),
+        CartItem("SAME", "同码昂贵", 1, 3000),
+    ]
+    _dup_cands = _candidates(_dup_menu, Coupon("K", "KK", "通用券"), probe=3)
+    check(
+        "体检-候选去重键必须带价格（同码不同规格要各试一件）",
+        len(_dup_cands) == 2,
+        str([(c.name, c.effective_price_fen()) for c in _dup_cands]),
+    )
+
+    # ── R7：快照超上限时留的是**最近**的 N 条
+    # entries[:N] 会把用户攒了半年的账本换成他最早那几十次「随手一跑」——
+    # brag 晒出去的数字直接变假。而没有这条断言时，改方向一条都不红。
+    _tmpdir3 = _tf.mkdtemp(prefix="mcdbutler-selftest-3-")
+    _old_snap3 = _snap.SNAPSHOT_FILE
+    _snap.SNAPSHOT_FILE = _Path(_tmpdir3) / "snapshots.json"
+    try:
+        for _i in range(_snap.MAX_ENTRIES + 1):
+            _snap.save(
+                _snap.entry_from_cart(
+                    cart=[CartItem("Z", f"第{_i}单", 1, 2000)],
+                    paid_fen=1500,
+                    baseline_fen=2000,
+                    discount_fen=500,
+                    store_code="S1",
+                    store_name="测试店",
+                    city="",
+                    keyword="",
+                    coupon_titles=[],
+                    with_order_label="",
+                )
+            )
+        _kept = _snap.load_all()
+        check(
+            "账本-超出上限时留最新的 N 条（不是最早的 N 条）",
+            len(_kept) == _snap.MAX_ENTRIES
+            and (_kept[-1].get("items") or [{}])[0].get("name") == f"第{_snap.MAX_ENTRIES}单",
+            f"留了 {len(_kept)} 条，最后一条是 {(_kept[-1].get('items') or [{}])[0].get('name')}",
+        )
+    finally:
+        _snap.SNAPSHOT_FILE = _old_snap3
+
+    # ── R8：卡包「有效期」取的是区间**结束**时刻
+    # 取成 group(1) 时，今天才开始、晚上才失效的券会被报成「今天到期/已过期」，
+    # 用户被吓得当天跑去消费；而原先这条只断了 `end is not None`。
+    _md_coupons = parse_coupon_markdown(COUPON_MD)
+    check(
+        "卡包-有效期取的是结束时刻而不是开始时刻",
+        len(_md_coupons) > 1 and _md_coupons[1]["end"] == datetime(2026, 10, 11, 10, 29),
+        str(_md_coupons[1]["end"] if len(_md_coupons) > 1 else None),
+    )
+
+    # ── R9：标题里没有价格时，正文兜底取的是**最低**价
+    # 报告里那句「最低 ¥X」就是这个返回值；取 max 会把承诺的最低价印成最贵的那个。
+    from .campaign import _first_price
+
+    _bp = _first_price("超值套餐大放送", "限时 9.9 元起，另有 14.9 元可选")
+    check("日历-正文兜底取价取最低价（报告里写的是「最低」）", _bp == 9.9, str(_bp))
+
+    # ── R10：一条营养数据只能配一个菜
+    # 营养表没有 productCode，只能按名字模糊配对；若允许同一条数据被多个菜串用，
+    # 「巨无霸套餐」会拿「巨无霸」的营养数据再算一遍，热量/蛋白全是假的。
+    from .nutrition import match_menu
+
+    _mm_nut = {"巨无霸": {"kcal": 500, "protein": 25.0, "fat": 20.0,
+                          "carb": 40.0, "sodium": 800, "calcium": 100}}
+    _mm_got = match_menu(
+        [CartItem("M1", "巨无霸", 1, 2500), CartItem("M2", "巨无霸套餐", 1, 3500)],
+        _mm_nut,
+    )
+    check(
+        "营养-一条营养数据只能配一个菜（不能串味重复计数）",
+        len(_mm_got) == 1 and _mm_got[0][0].product_code == "M1",
+        str([p[0].product_code for p in _mm_got]),
+    )
+
+    # ── R11：`薯条x2` 的数量必须真的进购物车
+    # 数量丢了的话，optimize 按 1 件算价，用户照着屏幕上的数去点会少一份。
+    _cart_q, _missed_q = _pick_cart(menu_match, ["龙焰鸡腿堡三件套x2"], cp_match)
+    check(
+        "匹配-数量写法必须真的进购物车（x2 不能只算 1 件）",
+        len(_cart_q) == 1 and _cart_q[0].quantity == 2,
+        str([(c.product_code, c.quantity) for c in _cart_q]),
+    )
+
+    # ── R16：打烊门店的判定不能放宽成 falsy
+    # 原来这条是**自实现**的：自己在自检里再写一遍同样的列表推导式、
+    # 再断言自己算出来的结果 —— 改 cli.run_compare 那一行完全不会红。
+    # 换成真跑 compare（把假的 client 塞进 mcd_client），让它自己把过滤结果
+    # 打印出来再断言。这里没法抽纯函数：过滤逻辑内联在 run_compare 里，
+    # 抽一个「跟实现长得一样的副本」等于把注水换个写法。
+    from . import mcd_client as _mc6
+    from .cli import run_compare
+
+    class _StoreClient6:
+        """只回答 query-nearby-stores，其余返回空 —— 够走到「 Shopping 车为空」为止，
+        而上一层要断言的那两句恰好在那之前就打印了。"""
+
+        def __init__(self, stores):
+            self.stores = stores
+
+        def initialize(self):
+            return None
+
+        def data(self, tool, payload):
+            return list(self.stores) if tool == "query-nearby-stores" else {}
+
+    _real_client6 = _mc6.McdMcpClient
+    _mc6.McdMcpClient = lambda *a, **k: _StoreClient6(
+        [
+            {"storeCode": "A", "storeName": "营业店", "distance": 100, "businessStatus": True},
+            {"storeCode": "B", "storeName": "打烊店", "distance": 200, "businessStatus": False},
+            {"storeCode": "C", "storeName": "缺字段店", "distance": 300},  # 字段缺失按营业
+        ]
+    )
+    try:
+        import contextlib as _ctx6
+        import io as _io6
+
+        _buf6 = _io6.StringIO()
+        with _ctx6.redirect_stdout(_buf6):
+            run_compare("", "", "", 40, "walk", None, None, 5)
+        _out6 = _buf6.getvalue()
+    finally:
+        _mc6.McdMcpClient = _real_client6
+    check(
+        "营业-打烊门店被排除而字段缺失不误杀（跑真的 compare）",
+        "1 家门店当前打烊" in _out6 and "取附近 2 家门店参与比价" in _out6,
+        (_out6 or "")[:160],
     )
 
     # ---------------------------------------------------------------- 输出

@@ -18,13 +18,47 @@
 
 from __future__ import annotations
 
+import atexit
 import io
 import pathlib
+import signal
 import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
+
+# ---------------------------------------------------------------- 安全网
+# 这个脚本的工作方式是「把源码改坏 → 跑自检 → 还原」。
+# 一旦它在改坏之后、还原之前被打断（Ctrl-C、超时被 SIGTERM、IDE 杀进程），
+# **源码就停在改坏的状态**，而且 git diff 看起来只是普通的一行改动 ——
+# 用户会带着一个坏掉的仓库继续干活，还以为是自己的改动。
+#
+# 所以除了 try/finally，还要挂 atexit + 信号处理器：
+# Ctrl-C 走 KeyboardInterrupt、SIGTERM 默认直接终止进程，两者都不跑 finally。
+_BACKUPS: dict[pathlib.Path, str] = {}
+
+
+def _restore_all() -> None:
+    for path, text in list(_BACKUPS.items()):
+        try:
+            path.write_text(text, encoding="utf-8")
+        except OSError:
+            pass
+    _BACKUPS.clear()
+
+
+def _on_signal(signum, _frame):  # noqa: ANN001
+    _restore_all()
+    sys.exit(130 if signum == signal.SIGINT else 143)
+
+
+atexit.register(_restore_all)
+for _sig in (signal.SIGINT, signal.SIGTERM):
+    try:
+        signal.signal(_sig, _on_signal)
+    except (ValueError, OSError):
+        pass  # 非主线程里装不了信号处理器，atexit 仍然兜底
 
 # (名字, 文件, 原文, 改坏成, 是否快速档)
 MUTATIONS: list[tuple[str, str, str, str, bool]] = [
@@ -455,6 +489,123 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
         "    return []",
         False,
     ),
+    # ---- 以下 16 处是第六轮（变异猎手）自造的 ----
+    # 专打前五轮一次都没点名过的代码：route 的路程换算、insights 的判据、
+    # audit 的候选采样、persona 的段位边界、snapshot 的截断方向、
+    # assets 的截止时刻、campaign 正文取价、nutrition 的菜单配对、
+    # cli 的数量装配、oracle 的拆行挂券、coupon_engine 的到期日与主循环。
+    (
+        "R1-路程忘了往返（round_m 只算单程，耗时与路费统统一半）",
+        "route.py",
+        "    round_m = meters * 2",
+        "    round_m = meters",
+        True,
+    ),
+    (
+        "R2-rank_stores 让缺货的店参与排序（缺货店 paid=0 会稳居第一）",
+        "route.py",
+        "        key=lambda q: (not q.comparable, q.total_fen, q.distance_m),",
+        "        key=lambda q: (q.total_fen, q.distance_m),",
+        True,
+    ),
+    (
+        "R3-拆单建议放宽成「不更贵就推荐」（省 ¥0 也当省钱建议吐出来）",
+        "insights.py",
+        "        if total < whole_fen:",
+        "        if total <= whole_fen:",
+        True,
+    ),
+    (
+        "R4-候选采样不再补最贵那件（满减券被系统性地判成废券）",
+        "audit.py",
+        "    if uniq[-1] not in picks:\n        picks[-1] = uniq[-1]",
+        "    picks = picks[:probe]",
+        True,
+    ),
+    (
+        "R5-候选去重键丢了价格（同码不同规格只试一件，报告少试品）",
+        "audit.py",
+        "        k = (it.product_code, it.effective_price_fen())",
+        "        k = it.product_code",
+        True,
+    ),
+    (
+        "R6-段位门槛改成严格大于（正好攒到 ¥10.00 反倒降一级）",
+        "persona.py",
+        "        if saved_fen >= need:",
+        "        if saved_fen > need:",
+        True,
+    ),
+    (
+        "R7-快照截断方向写反（留最早的 50 条，最新的记录被丢掉）",
+        "snapshot.py",
+        "    entries = entries[-MAX_ENTRIES:]",
+        "    entries = entries[:MAX_ENTRIES]",
+        True,
+    ),
+    (
+        "R8-卡包截止时刻取成开始时刻（今天才开始的券被报成今天到期）",
+        "assets.py",
+        '        return datetime.strptime(m.group(2), "%Y-%m-%d %H:%M")',
+        '        return datetime.strptime(m.group(1), "%Y-%m-%d %H:%M")',
+        True,
+    ),
+    (
+        "R9-正文兜底取价取成 max（「最低 ¥X」印的是最贵那个）",
+        "campaign.py",
+        "    return min(vals) if vals else None",
+        "    return max(vals) if vals else None",
+        True,
+    ),
+    (
+        "R10-营养配对允许一条数据被多个菜串用（营养值重复计数）",
+        "nutrition.py",
+        "            if nname in used:\n                continue",
+        "            pass",
+        True,
+    ),
+    (
+        "R11-装配购物车时把数量丢了（薯条x2 只按 1 件算价）",
+        "cli.py",
+        '        cart.append(CartItem(**{**base.__dict__, "quantity": qty}))',
+        '        cart.append(CartItem(**{**base.__dict__}))',
+        True,
+    ),
+    (
+        "R12-拆行后每行都挂券（一张券只用一次，接口会按两行收）",
+        "oracle.py",
+        "            if ci is not None and k == 0:",
+        "            if ci is not None:",
+        True,
+    ),
+    (
+        "R13-贪心占坑后不再 break（一张券被挂到多个商品上）",
+        "coupon_engine.py",
+        "                    mapping[ii] = ci\n                    used_items.add(ii)\n                    break",
+        "                    mapping[ii] = ci\n                    used_items.add(ii)",
+        True,
+    ),
+    (
+        "R14-券有效期取成开始日（还有 6 天的券被报成今天到期）",
+        "coupon_engine.py",
+        '    return hits[-1] if hits else ""',
+        '    return hits[0] if hits else ""',
+        True,
+    ),
+    (
+        "R15-最贵换项判据写反（问「最多加多少」答了个最便宜的）",
+        "meal_detail.py",
+        "                if best is None or c.diff_fen > best[1].diff_fen:",
+        "                if best is None or c.diff_fen < best[1].diff_fen:",
+        True,
+    ),
+    (
+        "R16-打烊判定放宽成 falsy（字段缺失的门店被误杀）",
+        "cli.py",
+        '    closed = [s for s in stores if s.get("businessStatus") is False]',
+        '    closed = [s for s in stores if not s.get("businessStatus")]',
+        True,
+    ),
 ]
 
 
@@ -513,11 +664,13 @@ def main() -> int:
             print(f"{name:<40} {'?':>4}  跳过（原文已变，需更新 mutate.py）")
             failures.append(name)
             continue
+        _BACKUPS[path] = original
         try:
             path.write_text(original.replace(old, new, 1), encoding="utf-8")
             passed, total, rc = run_selftest()
         finally:
             path.write_text(original, encoding="utf-8")
+            _BACKUPS.pop(path, None)
 
         if total <= 0:
             # 自检整个崩了：改动确实被发现了，但方式是「一整屏 traceback」，
