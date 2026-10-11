@@ -50,11 +50,35 @@ def load_dotenv() -> None:
             os.environ[key] = value
 
 class McpError(RuntimeError):
-    """MCP 调用失败。"""
+    """MCP 调用失败。
+
+    **这是业务性失败**：工具调通了、对面也回答了，只是答案是否定的
+    （「促销规则不支持该商品」「该券不适用于此门店」……）。
+    调用方遇到它可以换一件商品/换一张券继续。
+    """
 
     def __init__(self, message: str, payload: Any = None):
         super().__init__(message)
         self.payload = payload
+
+
+class McpFatalError(McpError):
+    """环境问题：Token 失效、断网、限流打满、返回体变了、协议握手失败。
+
+    为什么必须单独一类，而不是让调用方去正则匹配错误消息：
+    早先在 `audit.py` 里写过一个 `_FATAL_RE`，拿「401 / token / 鉴权 /
+    授权 / 超时 / 限流」这些关键词去猜错误的性质。实测 15 条真实文案里
+    错 12 条，而且两个方向都致命：
+
+      · 「该优惠券仅限**授权**门店使用」「订单**超时**未支付」是**业务性**
+        拒绝，被误判成环境故障 → 一件商品报错，整份券包体检全部作废；
+      · 「502 Bad Gateway」「Connection reset」「SSL: CERTIFICATE_VERIFY_FAILED」
+        「登录已失效」是**环境**故障，关键词没命中 → 被当业务拒绝放过，
+        输出一份「健康度 20%，三张没查出来」的报告，用户会以为自己的券是废纸。
+
+    错误的性质只有**抛错的地方**知道。所以在 raise 处就分好类，
+    调用方 `isinstance(exc, McpFatalError)` 一句话判完，不猜。
+    """
 
 
 def _iter_json_objects(text: str):
@@ -172,22 +196,22 @@ class McdMcpClient:
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", "ignore")
                 if exc.code == 401:
-                    raise McpError("Token 无效或已过期（HTTP 401）。", detail) from exc
+                    raise McpFatalError("Token 无效或已过期（HTTP 401）。", detail) from exc
                 retryable = exc.code == 429 or 500 <= exc.code < 600
-                last_exc = McpError(
+                last_exc = McpFatalError(
                     "触发限流（每 Token 每分钟 600 次）。" if exc.code == 429 else f"HTTP {exc.code}: {detail}",
                     detail,
                 )
                 if not retryable or attempt >= self.max_retries:
                     raise last_exc from exc
             except urllib.error.URLError as exc:
-                last_exc = McpError(f"网络错误: {exc.reason}")
+                last_exc = McpFatalError(f"网络错误: {exc.reason}")
                 if attempt >= self.max_retries:
                     raise last_exc from exc
 
             time.sleep(self.backoff_base * (2**attempt))
 
-        raise last_exc if last_exc else McpError("请求失败")
+        raise last_exc if last_exc else McpFatalError("请求失败")
 
     @staticmethod
     def _parse(raw: str) -> dict:
@@ -206,7 +230,7 @@ class McdMcpClient:
         try:
             return json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise McpError(f"无法解析 MCP 响应: {raw[:200]}") from exc
+            raise McpFatalError(f"无法解析 MCP 响应: {raw[:200]}") from exc
 
     # ---------- 协议层 ----------
 
@@ -228,7 +252,7 @@ class McdMcpClient:
             }
         )
         if "error" in resp:
-            raise McpError(f"initialize 失败: {resp['error']}", resp)
+            raise McpFatalError(f"initialize 失败: {resp['error']}", resp)
         self._initialized = True
         return resp["result"]
 

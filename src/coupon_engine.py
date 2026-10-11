@@ -33,6 +33,7 @@ from __future__ import annotations
 import itertools
 import json
 import random
+import re
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Callable, Iterable, Sequence
@@ -123,6 +124,29 @@ class CartItem:
 
 def discount_label(discount_type: str) -> str:
     return discount_type or "无条件优惠"
+
+
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def valid_until_end(text: Any) -> str:
+    """从有效期区间里取**结束日**。
+
+    `query-store-coupons` 的 `tradeDateTime` 给的是一整串区间：
+
+        "2026-10-11 00:00:00-2026-10-17 23:59:59"
+
+    早先版本把这个字符串整个塞进 `Coupon.valid_until`，下游再截前 10 位，
+    拿到的是**开始日** —— 于是「还有 6 天才过期」的券被报成「今天到期」，
+    用户被吓得当天就跑去消费，还可能白跑一趟。
+
+    取不到任何日期就返回空串，让下游按「不知道到期日」处理；
+    绝不能拿开始日冒充到期日。
+    """
+    if not text:
+        return ""
+    hits = _DATE_RE.findall(str(text))
+    return hits[-1] if hits else ""
 
 
 @dataclass(frozen=True)

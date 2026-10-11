@@ -16,6 +16,13 @@ from __future__ import annotations
 from .coupon_engine import CartItem, Coupon, PriceResult, WithOrderOption
 
 
+def _days(n: int) -> str:
+    """相对今天的到期日 —— 演示里必须能稳定出现「明天到期」这类提示。"""
+    from datetime import date, timedelta
+
+    return (date.today() + timedelta(days=n)).isoformat()
+
+
 # ---------------------------------------------------------------- 演示门店
 
 DEMO_STORE = {
@@ -61,28 +68,28 @@ DEMO_COUPONS: list[Coupon] = [
         coupon_code="DEMO-C1",
         title="巨无霸立减 5 元",
         product_codes=frozenset({"D001"}),
-        valid_until="2026-10-31",
+        valid_until=_days(20),
     ),
     Coupon(
         coupon_id="C2",
         coupon_code="DEMO-C2",
         title="汉堡类任选 -4 元",
         product_codes=frozenset({"D001", "D002"}),
-        valid_until="2026-10-31",
+        valid_until=_days(20),
     ),
     Coupon(
         coupon_id="C3",
         coupon_code="DEMO-C3",
         title="小食买一送一（薯条）",
         product_codes=frozenset({"D003"}),
-        valid_until="2026-10-31",
+        valid_until=_days(20),
     ),
     Coupon(
         coupon_id="C4",
         coupon_code="DEMO-C4",
         title="饮料免费升杯",
         product_codes=frozenset({"D005"}),
-        valid_until="2026-10-31",
+        valid_until=_days(20),
     ),
     # 陷阱券：挂上后反而占用商品、挡掉更优组合
     Coupon(
@@ -90,7 +97,7 @@ DEMO_COUPONS: list[Coupon] = [
         coupon_code="DEMO-C5",
         title="麦旋风满 20 减 1 元",
         product_codes=frozenset({"D006"}),
-        valid_until="2026-10-31",
+        valid_until=_days(20),
     ),
 ]
 
@@ -200,18 +207,13 @@ DEMO_PRICE_SNAPSHOT = {
 #   门槛券（便宜的挂不上）、废券（挂着一分不减）、死券（这家店没得挂）。
 # 所以这里单独配一套小菜单 + 小券池，规则明确、可离线复现。
 
-def _days(n: int) -> str:
-    """相对今天的到期日 —— 演示里必须能稳定出现「明天到期」这类提示。"""
-    from datetime import date, timedelta
-
-    return (date.today() + timedelta(days=n)).isoformat()
-
-
 AUDIT_MENU: list[CartItem] = [
     CartItem("A1", "麦香鱼", 1, 1000),
     CartItem("A2", "麦旋风", 1, 1000),
     CartItem("A3", "板烧鸡腿堡", 1, 1800),
-    CartItem("A4", "巨无霸", 1, 2500),
+    # 故意不复用 DEMO_MENU 的商品名：两段演示用同一家店名、同一件「巨无霸」、
+    # 却一个是「立减 5 元」一个是「立减 8 元」，读者会以为首页在编数据。
+    CartItem("A4", "安格斯厚牛堡", 1, 2500),
 ]
 
 AUDIT_COUPONS: list[Coupon] = [
@@ -219,7 +221,7 @@ AUDIT_COUPONS: list[Coupon] = [
     Coupon("K2", "KA2", "满 20 减 3 元", frozenset({"A2", "A4"}), valid_until=_days(30)),
     Coupon("K3", "KA3", "小食满 15 减 3 元", frozenset({"A1", "A2"}), valid_until=_days(2)),
     # 面额 8 元、实测只减 5 元 —— 券印多少和真减多少从来不是一回事
-    Coupon("K4", "KA4", "巨无霸立减 8 元", frozenset({"A4"}), valid_until=_days(7)),
+    Coupon("K4", "KA4", "安格斯厚牛堡立减 8 元", frozenset({"A4"}), valid_until=_days(7)),
     # 这家店不卖咖啡：一张看着好好的死券
     Coupon("K5", "KA5", "麦咖啡新品立减 3 元", frozenset({"X9"}), valid_until=_days(5)),
 ]
@@ -256,4 +258,38 @@ def audit_oracle(items: list[CartItem], assignment) -> PriceResult:
         price_fen=max(subtotal - discount, 0),
         original_fen=subtotal,
         discount_fen=discount,
+    )
+
+
+# ------------------------------------------------------- 活动日历演示报文
+#
+# `campaign` 是唯一一个**只能联网才能看到**的功能 —— 没这条离线演示，
+# 路人 clone 下来跑 `demo` 根本不知道还有择日这回事。
+#
+# 构造器复用 `campaign.build_markdown`（不在这里另写一份）：
+# 曾经自检和演示各写了一份，一个月内就漂了（一份「+3 天」一份「+4 天」），
+# 而演示那份坏了，129 条自检一条都不会红 —— 因为没人测它。
+
+def campaign_demo_markdown() -> str:
+    """活动日历的离线演示报文（结构真实，内容是演示）。"""
+    from datetime import date, timedelta
+
+    from .campaign import build_markdown
+
+    t0 = date.today()
+    breakfast = ("超值\U0001d7e1.\U0001d7e1元早餐两件套陪你开工啦", "早八的快乐，一堡一咖已就位")
+    return build_markdown(
+        [
+            (
+                t0,
+                " 今日",
+                [
+                    breakfast,
+                    ("学生专属！49元150天麦金学期卡", "每天低至 0.33 元，一卡在手"),
+                ],
+            ),
+            # 明天跟今天完全重复 —— 用来演示「重复的活动不算值得等」
+            (t0 + timedelta(days=1), "", [breakfast]),
+            (t0 + timedelta(days=3), "", [("麦麦夜市回归", "限时 12.9 元起，售完即止")]),
+        ]
     )

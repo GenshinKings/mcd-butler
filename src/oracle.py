@@ -50,14 +50,7 @@ def make_price_oracle(
     """
 
     def oracle(items: list[CartItem], assignment: Assignment) -> PriceResult:
-        payload_items = []
-        for idx, item in enumerate(items):
-            entry = {"productCode": item.product_code, "quantity": item.quantity}
-            ci = assignment.mapping.get(idx)
-            if ci is not None:
-                entry["couponId"] = coupons[ci].coupon_id
-                entry["couponCode"] = coupons[ci].coupon_code
-            payload_items.append(entry)
+        payload_items = _expand(items, assignment, coupons)
 
         payload: dict = {
             "storeCode": store_code,
@@ -79,6 +72,8 @@ def make_price_oracle(
         if data.get("price") is None or data.get("price") == "":
             raise McpError("算价接口未返回 price 字段，无法判断这一单的价格")
 
+        _assert_quantity_kept(payload_items, data)
+
         return PriceResult(
             price_fen=as_fen(data.get("price")),
             original_fen=as_fen(data.get("originalPrice")),
@@ -88,3 +83,73 @@ def make_price_oracle(
         )
 
     return oracle
+
+
+def _expand(
+    items: list[CartItem], assignment: Assignment, coupons: Sequence[Coupon]
+) -> list[dict]:
+    """把 quantity>1 的商品**拆成 quantity 行、每行 quantity=1**。
+
+    这不是洁癖，是实测出来的真金白银的坑（麦咖啡冰美式中杯 507411 +
+    券「9.9元中杯冰美式」，门店 1450713）：
+
+        单行 quantity=2 挂券 → price=990，productList.quantity=[1]
+        单行 quantity=2 无券 → price=2380，productList.quantity=[2]
+        拆两行各 1 件、首行挂券 → price=2180，productList.quantity=[1,1]
+
+    也就是说：**一旦挂券，接口会把这一行的数量静默重置成 1**，
+    于是「买 2 杯挂 1 张券」被算成只收 1 杯的钱 ——
+    引擎会非常自信地报「省了 ¥13.90」，而真实只省 ¥2.00。
+    `optimize --items "薯条x2"` 正好踩在这条线上。
+
+    拆行之后，券只挂在**第一行**上：一张券只能用一次，
+    买两件时真实结算就是「一件用券 + 一件原价」。
+    """
+    payload_items: list[dict] = []
+    for idx, item in enumerate(items):
+        ci = assignment.mapping.get(idx)
+        if ci is not None and not (0 <= ci < len(coupons)):
+            # mapping 的值越界说明上游装配错了券下标。静默跳过会让这一行
+            # 「假装挂了券却没挂」，算出一个比真实更贵的价，
+            # 优化器还会把它当成「挂券方案」采纳 —— 必须报错。
+            raise McpError(
+                f"券下标越界：mapping[{idx}]={ci}，但券池只有 {len(coupons)} 张"
+            )
+        qty = max(1, int(item.quantity or 1))
+        for k in range(qty):
+            entry: dict = {"productCode": item.product_code, "quantity": 1}
+            # 券只挂第一行：一张券只能用一次，买两件时真实结算就是
+            # 「一件用券 + 一件原价」。
+            if ci is not None and k == 0:
+                entry["couponId"] = coupons[ci].coupon_id
+                entry["couponCode"] = coupons[ci].coupon_code
+            payload_items.append(entry)
+    return payload_items
+
+
+def _assert_quantity_kept(payload_items: list[dict], data: dict) -> None:
+    """核对接口有没有真的按我们要的数量算。
+
+    这套代码里几乎每个字段都做了防御（脏数据、缺字段、换形态），
+    唯独「我发了 quantity，接口是不是照做了」从来没人验过。
+    而实测证明它就是不照做。所以这里必须断言：
+    数量对不上就报错，绝不能让优化器采信一个凭空便宜的价格。
+    """
+    returned = data.get("productList")
+    if not isinstance(returned, list) or not returned:
+        return  # 没有明细就没法核对，不强求
+    rows = [r for r in returned if isinstance(r, dict)]
+    # 明细里根本没有 quantity 字段就没得核对 —— 报「返回 0 件」是冤枉接口，
+    # 而且 engine 累计 3 次异常就会让整条链路崩掉，代价太大。
+    if not any("quantity" in r for r in rows):
+        return
+    got = sum(as_fen(r.get("quantity")) for r in rows)
+    want = len(payload_items)
+    # 只拦「算少了」。算多了**不拦**：套餐会被接口拆成若干子件返回
+    # （实测点一个双人餐返回 5 行），那是正常的展开，不是吞数量。
+    # 吞数量只会让价格凭空便宜，所以真正的风险是单向的。
+    if got < want:
+        raise McpError(
+            f"算价接口没有按请求的数量结算：要了 {want} 件，只返回 {got} 件。"
+            "这种情况常见于「挂券后数量被重置」，继续算下去会报出虚假的优惠额。"
+        )

@@ -28,6 +28,7 @@ from .coupon_engine import (
     WithOrderOption,
     as_fen,
     to_fen,
+    valid_until_end,
 )
 from .mcd_client import extract_payload
 from .nutrition import parse_nutrition
@@ -755,6 +756,73 @@ def run() -> int:
         raised = True
     check("oracle-price缺失时报错而非当成0元", raised)
 
+    # quantity>1 挂券：接口会把整行数量静默重置成 1（实测麦咖啡冰美式中杯），
+    # 于是「买 2 杯挂 1 张券」被算成只收 1 杯的钱，引擎会凭空报出大额优惠。
+    # 修法是拆成 quantity 行 quantity=1，券只挂第一行（一张券只能用一次）。
+    two = CartItem(product_code="P2", name="双份", quantity=2)
+    rc4 = _RecClient(
+        {"price": 2180, "productList": [{"quantity": 1}, {"quantity": 1}]}
+    )
+    make_price_oracle(rc4, "S1", [coupon])([two], Assignment(mapping={0: 0}))
+    sent4 = rc4.payloads[-1]["items"]
+    check(
+        "oracle-多件挂券要拆行，不能让接口吞掉数量",
+        len(sent4) == 2
+        and all(e["quantity"] == 1 for e in sent4)
+        and sent4[0].get("couponCode") == "k1"
+        and "couponCode" not in sent4[1],
+        str(sent4),
+    )
+    rc5 = _RecClient({"price": 2380, "productList": [{"quantity": 1}, {"quantity": 1}]})
+    make_price_oracle(rc5, "S1", [coupon])([two], Assignment(mapping={}))
+    sent5 = rc5.payloads[-1]["items"]
+    check(
+        "oracle-多件不挂券：拆行且两行都不带券码",
+        len(sent5) == 2
+        and all("couponCode" not in e for e in sent5),
+        str(sent5),
+    )
+
+    # 接口返回的数量与请求不符时必须报错，不能让优化器采信虚假的便宜
+    rc6 = _RecClient({"price": 990, "productList": [{"quantity": 1}]})
+    qty_raised = False
+    try:
+        make_price_oracle(rc6, "S1", [coupon])([two], Assignment(mapping={0: 0}))
+    except Exception:
+        qty_raised = True
+    check("oracle-接口少算件数时报错而非采信", qty_raised)
+
+    # 反向的两个坑：套餐会被接口拆成子件返回，明细里也可能压根没有
+    # quantity 字段。这两种都不是「吞数量」，报错是冤枉接口 ——
+    # 而 engine 累计 3 次异常就会让整条链路崩掉，代价太大。
+    def _qty_ok(payload_data):
+        try:
+            rc = _RecClient(payload_data)
+            make_price_oracle(rc, "S1", [coupon])([two], Assignment(mapping={0: 0}))
+        except Exception:
+            return False
+        return True
+
+    check(
+        "oracle-套餐被拆成子件返回时不能误报「件数被吞」",
+        _qty_ok({"price": 6290, "productList": [{"quantity": 1} for _ in range(5)]}),
+        "套餐展开被当成数量异常了",
+    )
+    check(
+        "oracle-明细里没有 quantity 字段时不报错（没得核对就不核对）",
+        _qty_ok({"price": 6290, "productList": [{"productCode": "D008"}] * 3}),
+        "缺字段被当成返回 0 件了",
+    )
+    # mapping 的值越界：静默跳过会让这一行「假装挂了券却没挂」，
+    # 算出一个比真实更贵的价，优化器还会当成挂券方案采纳。
+    bad_idx_raised = False
+    try:
+        rc7 = _RecClient({"price": 2500})
+        make_price_oracle(rc7, "S1", [coupon])([one], Assignment(mapping={0: 7}))
+    except Exception:
+        bad_idx_raised = True
+    check("oracle-券下标越界必须报错，不能静默不挂券", bad_idx_raised)
+
     # 金额换算两套口径不能混：菜单是元字符串、算价是分整数
     check(
         "金额-两套口径不混用",
@@ -801,6 +869,7 @@ def run() -> int:
 
     # ---------------------------------------------------------- 券包体检
     from .audit import (
+        _is_fatal,
         audit_coupons,
         face_value_fen,
         render,
@@ -808,6 +877,7 @@ def run() -> int:
         DUD,
         WORTH,
     )
+    from .mcd_client import McpError, McpFatalError
 
     def _audit(limit: int = 10, budget: Budget | None = None, oracle=None):
         return audit_coupons(
@@ -898,57 +968,231 @@ def run() -> int:
         "鉴权失效被吞掉了",
     )
 
+    # ── 部分失败：线上真实形态。三种必须分得清，混淆任何两种都会出事。
+
+    def _reject_some(items, assignment):
+        """业务性拒绝：券跟这件商品不匹配（实测「促销规则不支持该商品」）。
+
+        这是**正常答案**，不是故障 —— 换一件商品照样能查。
+        为它放弃整张券，等于把「麦咖啡券挂不上汉堡」说成「接口坏了」。
+        """
+        # 只拒绝巨无霸（A4）。它是「满 20 减 3」唯一够得到门槛的那件，
+        # 拒绝它最能暴露问题：剩下的样本算出来一分不减，
+        # 若还敢报成「废券」，就是把接口报错当成了券没用。
+        if items and items[0].product_code == "A4":
+            raise RuntimeError("促销规则不支持该商品")
+        return demo.audit_oracle(items, assignment)
+
+    try:
+        partial_vs = {v.coupon.coupon_id: v for v in _audit(oracle=_reject_some)}
+        partial_ok = True
+    except Exception as exc:  # noqa: BLE001
+        partial_ok = False
+        partial_vs = {}
+        partial_err = f"{type(exc).__name__}: {exc}"
+    check(
+        "体检-业务性拒绝（促销规则不支持该商品）不能让整份报告崩掉",
+        partial_ok,
+        partial_err if not partial_ok else "",
+    )
+    check(
+        "体检-有商品报错时要明说结论可能偏保守，不能假装样本完整",
+        partial_ok
+        and partial_vs.get("K2") is not None
+        and partial_vs["K2"].partial
+        and "偏保守" in partial_vs["K2"].note,
+        f"K2={partial_vs.get('K2')}",
+    )
+    check(
+        "体检-样本不全时不能直接判「废券」（报错不等于这张券没用）",
+        partial_ok
+        and partial_vs.get("K2") is not None
+        and "一分没减" not in partial_vs["K2"].note,
+        f"K2.note={getattr(partial_vs.get('K2'), 'note', '')}",
+    )
+
+    def _dies_after(
+        ok_calls: int, exc: BaseException | None = None
+    ):  # noqa: B008 - 刻意默认构造，见下
+        """造一个「成功 ok_calls 次之后开始报错」的 oracle。
+
+        用工厂函数而不是函数属性计数器：函数属性会跨调用残留，
+        第一次跑完 n=7，任何复用它的用例第一条调用就抛；
+        而且 `n > 2` 这种写法把 audit 的内部调用次数硬编码进了断言，
+        一旦预算/采样逻辑改动，用例会莫名其妙地变绿或变红。
+        """
+        state = {"n": 0}
+        boom = exc if exc is not None else McpFatalError(
+            "Token 无效或已过期（HTTP 401）。"
+        )
+
+        def oracle(items, assignment):
+            state["n"] += 1
+            if state["n"] > ok_calls:
+                raise boom
+            return demo.audit_oracle(items, assignment)
+
+        return oracle
+
+    try:
+        _audit(oracle=_dies_after(2))
+    except McpFatalError as exc:
+        halfway_blew = "Token" in str(exc)
+    except Exception:  # noqa: BLE001
+        halfway_blew = False
+    else:
+        halfway_blew = False
+    check(
+        "体检-跑到一半 Token 失效也必须报错（不能只防「一次都没成功」）",
+        halfway_blew,
+        "半程鉴权失效被吞掉了",
+    )
+
+    # 错误性质的判定**只能看类型，不能看文案**。早先这里用正则匹配
+    # 「401 / token / 鉴权 / 授权 / 超时 / 限流」，实测 15 条真实文案错 12 条。
+    # 下面两组用例把两个方向的误判都钉死：
+    check(
+        "体检-文案里带「授权/超时/401」的业务性拒绝不能被当成环境故障",
+        not _is_fatal(McpError("该优惠券仅限授权门店使用"))
+        and not _is_fatal(McpError("订单超时未支付，请重新下单"))
+        and not _is_fatal(McpError("门店 4010233 暂不支持该券"))
+        and not _is_fatal(McpError("促销规则不支持该商品")),
+        "业务性拒绝被误判成环境故障",
+    )
+    check(
+        "体检-真正的环境故障必须被认出来（哪怕文案里没有关键词）",
+        _is_fatal(McpFatalError("502 Bad Gateway"))
+        and _is_fatal(McpFatalError("Connection reset by peer"))
+        and _is_fatal(McpFatalError("登录已失效，请重新登录"))
+        and _is_fatal(McpFatalError("网络错误: timed out")),
+        "环境故障被漏掉了",
+    )
+
+    try:
+        _audit(oracle=_dies_after(2, McpError("门店 4010233 暂不支持该券")))
+        biz_ok = True
+    except Exception:  # noqa: BLE001
+        biz_ok = False
+    check(
+        "体检-业务性拒绝绝不能让整份报告崩掉（哪怕它长得像错误码）",
+        biz_ok,
+        "一条业务性拒绝把整份券包体检作废了",
+    )
+
+    # ── 两条「改坏了不会有任何用例变红」的核心逻辑，必须单独钉死。
+    #    验证时把它们退回旧实现，138 条自检全绿 —— 等于没有任何回归防护。
+
+    from .audit import _candidates, _probe
+
+    class _Opt:
+        """随单购档位替身：`_probe` 只用到 `signature()` 做缓存键。"""
+
+        def __init__(self, label: str):
+            self.label = label
+
+        def signature(self) -> str:
+            return self.label
+
+    def _mutex_oracle(items, assignment):
+        """麦金卡那一档更便宜，但**挂券不再额外减**（券与随单购互斥）。"""
+        if getattr(assignment.with_order, "label", "") == "麦金卡":
+            return PriceResult(price_fen=1500, original_fen=2000, discount_fen=0)
+        off = 400 if assignment.mapping else 0
+        return PriceResult(price_fen=2000 - off, original_fen=2000, discount_fen=0)
+
+    _gap, _trunc = _probe(
+        _mutex_oracle,
+        [demo.AUDIT_MENU[3]],
+        [None, _Opt("麦金卡")],
+        0,
+        None,
+        [0],
+        {},
+        ("A4", 2500),
+        [],
+    )
+    check(
+        "体检-券与随单购互斥时仍要判出券自身的价值（必须同档位比）",
+        _gap is not None and _gap[0] == 400,
+        f"gap={_gap[0] if _gap else None}"
+        "（旧实现两边各自取最优档，券被作废 → gap=0 → 好券判成废券）",
+    )
+
+    _big_menu = [CartItem(f"B{i}", f"商品{i}", 1, 200 + i * 100) for i in range(10)]
+    _uni = Coupon("U1", "U1", "通用立减", frozenset())
+    _p3 = _candidates(_big_menu, _uni, 3)
+    _p1 = _candidates(_big_menu, _uni, 1)
+    check(
+        "体检-probe 决定试几件，且最贵那件必须在样本里",
+        len(_p3) == 3
+        and _p3[-1].effective_price_fen() == 1100
+        and len(_p1) == 1
+        and _p1[0].effective_price_fen() == 1100
+        and len(_candidates(_big_menu, _uni, 100)) == 10
+        and _candidates(_big_menu, _uni, 0) == [],
+        f"probe3={[i.effective_price_fen() for i in _p3]} "
+        f"probe1={[i.effective_price_fen() for i in _p1]}",
+    )
+
+    # 券有效期是「起-止」区间，取错一头会把"还有 6 天"报成"今天到期"
+    check(
+        "券-有效期取结束日而不是开始日",
+        valid_until_end("2026-10-11 00:00:00-2026-10-17 23:59:59") == "2026-10-17"
+        and valid_until_end("2026-10-17") == "2026-10-17"
+        and valid_until_end("") == ""
+        and valid_until_end(None) == ""
+        and valid_until_end("没有日期") == "",
+        valid_until_end("2026-10-11 00:00:00-2026-10-17 23:59:59"),
+    )
+
     # ---------------------------------------------------------- 活动日历
+    from datetime import date as _date
+    from datetime import timedelta as _td
+
     from .campaign import (
+        Campaign,
+        CampaignDay,
         advise_line,
+        build_markdown,
         fresh_campaigns,
         parse_campaign_markdown,
         render,
         today_campaigns,
         upcoming,
+        _first_price,
     )
 
     # 报文节选：结构照搬真实返回（#### 日期 / 活动标题 / 活动内容介绍 / 活动图片介绍）
-    CAMPAIGN_FIXTURE = """### 当前时间：2026-10-11 14:25:13
+    #
+    # 日期**必须相对今天生成，不能写死**。写死过一次（fixture 里刻着
+    # 2026年10月11日/12日/15日），于是本机时钟越过那几天之后
+    # `upcoming()` 直接返回空、三条用例集体变红，而代码一行没错。
+    # 自检里写死时间 = 在测日历而不是测代码，是个定时炸弹。
+    _T0 = _date.today()
+    _BREAKFAST = "超值\U0001d7e1.\U0001d7e1元早餐两件套陪你开工啦"
+    _CARD = "学生专属！49元150天麦金学期卡"
+    _NIGHT = "麦麦夜市回归"
 
-### 活动列表：
-
-
-#### 2026年10月11日 今日
-
-
--   **活动标题**：超值\U0001d7e1.\U0001d7e1元早餐两件套陪你开工啦
-    **活动内容介绍**：早八的快乐，一堡一咖已就位
-    **活动图片介绍**：
-    <img src="https://example.com/a.jpg" alt="" height="300" width="auto">
-
-
-
--   **活动标题**：学生专属！49元150天麦金学期卡
-    **活动内容介绍**：每天低至 0.33 元，一卡在手
-    **活动图片介绍**：
-    <img src="https://example.com/b.jpg" alt="" height="300" width="auto">
-
-
-
-#### 2026年10月12日
-
-
--   **活动标题**：超值\U0001d7e1.\U0001d7e1元早餐两件套陪你开工啦
-    **活动内容介绍**：早八的快乐，一堡一咖已就位
-    **活动图片介绍**：
-    <img src="https://example.com/a.jpg" alt="" height="300" width="auto">
-
-
-
-#### 2026年10月15日
-
-
--   **活动标题**：麦麦夜市回归
-    **活动内容介绍**：限时 12.9 元起，售完即止
-    **活动图片介绍**：
-    <img src="https://example.com/c.jpg" alt="" height="300" width="auto">
-"""
+    # 构造器复用 `campaign.build_markdown`，跟演示报文**同一个**：
+    # 两份拷贝已经漂过一次（一份「+3 天」一份「+4 天」），
+    # 而演示那份坏了 129 条自检一条都不会红。
+    CAMPAIGN_FIXTURE = build_markdown(
+        [
+            # 今天：两个活动，其中一个只出现在今天（用来验「今天吃不到的才算新」）
+            (
+                _T0,
+                " 今日",
+                [
+                    (_BREAKFAST, "早八的快乐，一堡一咖已就位"),
+                    (_CARD, "每天低至 0.33 元，一卡在手"),
+                ],
+            ),
+            # 明天：跟今天完全重复 —— 不该被当成「值得等」
+            (_T0 + _td(days=1), "", [(_BREAKFAST, "早八的快乐，一堡一咖已就位")]),
+            # 四天后：新品，这才是真正该等的那天
+            (_T0 + _td(days=4), "", [(_NIGHT, "限时 12.9 元起，售完即止")]),
+        ]
+    )
 
     cdays = parse_campaign_markdown(CAMPAIGN_FIXTURE)
     check(
@@ -967,8 +1211,8 @@ def run() -> int:
         f"price={cdays[0].campaigns[1].price_yuan}",
     )
 
-    tdy = today_campaigns(cdays)
-    fut = upcoming(cdays, within=7)
+    tdy = today_campaigns(cdays, _T0)
+    fut = upcoming(cdays, _T0, within=7)
     check(
         "活动日历-只把「今天吃不到」的算作值得等的新活动",
         len(fut) == 2
@@ -977,17 +1221,182 @@ def run() -> int:
         f"fut={[ (d.day.isoformat(), len(fresh_campaigns(d, tdy))) for d in fut ]}",
     )
 
-    ctext = render(cdays, within=7)
-    check("活动日历-报告要点出新品那天", "麦麦夜市回归" in ctext)
-    check("活动日历-建议里不能劝人为已在跑的活动干等", "今天也在跑" not in ctext)
+    ctext = render(cdays, _T0, within=7)
+    # 只看「接下来」那一段：今天已在跑的活动本来就列在报告上半部分，
+    # 要防的是它混进「值得等」的名单里。
+    fresh_part = ctext.split("接下来", 1)[1] if "接下来" in ctext else ""
+    check("活动日历-报告要点出新品那天", _NIGHT in fresh_part, fresh_part.strip()[:90])
+    check(
+        "活动日历-今天已在跑的活动不能出现在「值得等」名单里",
+        _BREAKFAST not in fresh_part,
+        fresh_part.strip()[:90],
+    )
     check("活动日历-空报文不崩", parse_campaign_markdown("") == [])
+    check(
+        "活动日历-解析不出内容要说清楚，不能伪装成「今天没有活动」",
+        "没返回内容" in render([], _T0),
+        (render([], _T0).strip().splitlines() or [""])[-1],
+    )
+    check(
+        "活动日历-「今日」标记不能盖过真实日期（时钟不在那天就是没有活动）",
+        today_campaigns(cdays, _T0 + _td(days=30)) == [],
+        f"{[c.title for c in today_campaigns(cdays, _T0 + _td(days=30))]}",
+    )
 
-    advise_lines = advise_line(cdays)
+    advise_lines = advise_line(cdays, _T0)
     check(
         "活动日历-advise 只提今天没有的新活动",
         any("今天没有" in x for x in advise_lines)
-        and not any("干等" in x for x in advise_lines),
+        and not any(_BREAKFAST in x for x in advise_lines[1:]),
         f"{advise_lines}",
+    )
+
+    # 演示报文必须能解析出来 —— 它跟 fixture 用的是同一个构造器，
+    # 但**从来没人测过**。坏掉时 demo 会打印一屏空话，而自检全绿。
+    ddays = parse_campaign_markdown(demo.campaign_demo_markdown())
+    check(
+        "活动日历-离线演示报文必须解析得出内容（它坏过，且没人发现）",
+        len(ddays) == 3
+        and len(today_campaigns(ddays, _T0)) == 2
+        and "麦麦夜市回归" in render(ddays, _T0),
+        f"解析出 {len(ddays)} 天",
+    )
+
+    # 卖价 vs 优惠额/门槛：`min()` 偏爱小数字，不把优惠额先挖掉就会稳定取错
+    check(
+        "活动日历-「满 20 减 3 元」里的 3 是优惠额不是卖价",
+        _first_price("满 20 减 3 元，仅需 9.9 元") == 9.9
+        and _first_price("买一送一（省 12 元）") is None
+        and _first_price("任意消费满 6 元即可换购 9.9 元麦旋风") == 9.9
+        and _first_price("超值\U0001d7e1.\U0001d7e1元早餐两件套") == 9.9,
+        f"满20减3→{_first_price('满 20 减 3 元，仅需 9.9 元')} "
+        f"省12→{_first_price('买一送一（省 12 元）')}",
+    )
+
+    # 同名活动**更便宜**也算新：只看标题会把「今天 12.9 / 三天后 9.9」判成今天已有
+    _cheaper_day = CampaignDay(
+        day=_T0 + _td(days=2),
+        campaigns=(
+            Campaign(title=_NIGHT, summary="更便宜了", price_yuan=9.9),
+        ),
+    )
+    check(
+        "活动日历-同名但更便宜的活动也算「值得等」",
+        len(fresh_campaigns(_cheaper_day, [_c for _c in tdy if _c.title != _NIGHT] + [
+            Campaign(title=_NIGHT, summary="今天", price_yuan=12.9)
+        ])) == 1,
+        "更便宜的同名活动被当成今天已有而漏掉了",
+    )
+
+    # ---------------------------------------------------------- 餐品详情
+    # 报文是 `query-meal-detail` 的真实返回（门店 1450713，2026-10-11 实测）。
+    # 这一层唯一能变成钱的东西是 `diffPrice` 里的**负号** —— 带负号的换项是白捡的钱。
+    from .meal_detail import (
+        diff_price_fen,
+        parse_meal_detail,
+        render as render_meal,
+    )
+
+    check(
+        "餐品详情-diffPrice 的符号不能搞反（「- ¥4」是便宜 4 块）",
+        diff_price_fen("+ ¥1.5") == 150
+        and diff_price_fen("- ¥4") == -400
+        and diff_price_fen("+ ¥0") == 0
+        and diff_price_fen("") == 0
+        and diff_price_fen(None) == 0
+        and diff_price_fen("+￥2.50") == 250,
+        f"+1.5→{diff_price_fen('+ ¥1.5')} -4→{diff_price_fen('- ¥4')}",
+    )
+    check(
+        "餐品详情-脏报文不崩（None / 空 / 不是 dict 都返回 None）",
+        parse_meal_detail(None) is None
+        and parse_meal_detail({}) is None
+        and parse_meal_detail("坏了") is None,
+    )
+
+    MEAL_FIXTURE = {
+        "code": "9900005456",
+        "name": "麦辣鸡腿汉堡三件套",
+        "rounds": [
+            {
+                "id": 1,
+                "name": "麦辣鸡腿汉堡",
+                "choices": [
+                    {
+                        "code": "521900",
+                        "name": "麦辣鸡腿汉堡",
+                        "isDefault": 1,
+                        "diffPrice": "+ ¥0",
+                        "supportModify": True,
+                    }
+                ],
+            },
+            {
+                "id": 2,
+                "name": "选择套餐内小食",
+                "choices": [
+                    {
+                        "code": "4810",
+                        "name": "中薯条",
+                        "isDefault": 1,
+                        "diffPrice": "+ ¥0",
+                        "supportModify": False,
+                    },
+                    {
+                        "code": "521901",
+                        "name": "月下相思扭扭薯",
+                        "isDefault": 0,
+                        "diffPrice": "+ ¥1.5",
+                        "supportModify": False,
+                    },
+                    {
+                        "code": "4821",
+                        "name": "小杯玉米杯",
+                        "isDefault": 0,
+                        "diffPrice": "- ¥0.5",
+                        "supportModify": False,
+                    },
+                ],
+            },
+        ],
+        "supportModify": False,
+    }
+    md = parse_meal_detail(MEAL_FIXTURE)
+    check(
+        "餐品详情-套餐组成与默认项要认出来",
+        md is not None
+        and md.is_combo
+        and len(md.rounds) == 2
+        and md.rounds[1].default_choice() is not None
+        and md.rounds[1].default_choice().name == "中薯条",
+        f"rounds={len(md.rounds) if md else 0}",
+    )
+    check(
+        "餐品详情-换项里「反而更便宜」的那几个必须单独挑出来",
+        md is not None
+        and [(c.name, c.diff_fen) for _b, c in md.cheaper_swaps()]
+        == [("小杯玉米杯", -50)],
+        f"{[(c.name, c.diff_fen) for _b, c in md.cheaper_swaps()] if md else None}",
+    )
+    check(
+        "餐品详情-最贵的换项要说出来（换错最多加多少）",
+        md is not None
+        and md.priciest_swap() is not None
+        and md.priciest_swap()[1].diff_fen == 150,
+        f"{md.priciest_swap() if md else None}",
+    )
+    mtext = render_meal(md)
+    check(
+        "餐品详情-报告里要说清差价来自接口字段",
+        "换成这些反而更便宜" in mtext and "diffPrice" in mtext,
+        mtext[-60:],
+    )
+    single = parse_meal_detail(
+        {"code": "521954", "name": "麦当劳联名复古棒球帽", "rounds": [], "supportModify": False}
+    )
+    check(
+        "餐品详情-非套餐（rounds 为空）要明说，不能渲染出一片空白",
+        single is not None and not single.is_combo and "没有可换的组成部分" in render_meal(single),
     )
 
     # ---------------------------------------------------------------- 输出

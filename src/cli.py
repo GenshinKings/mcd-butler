@@ -24,6 +24,7 @@ from .coupon_engine import (
     PriceResult,
     WithOrderOption,
     to_fen,
+    valid_until_end,
 )
 from .mcd_client import McpError, load_dotenv
 from .oracle import make_price_oracle
@@ -94,14 +95,42 @@ def run_demo() -> int:
     _demo_audit()
 
     print("\n" + "=" * 62)
+    print("麦门活动日历（campaign）")
+    print("=" * 62)
+    _demo_campaign()
+
+    print("\n" + "=" * 62)
     print("麦门段位（brag）")
     print("=" * 62)
     _demo_ranks()
     return 0
 
 
+def _demo_campaign() -> None:
+    """活动日历的离线演示。
+
+    这个功能是唯一一个**必须联网才看得到**的 —— 没这条演示，
+    路人 clone 下来跑 `demo` 根本不知道还有「择日」这回事。
+    """
+    from datetime import date
+
+    from .campaign import advise_line, parse_campaign_markdown, render
+
+    days = parse_campaign_markdown(demo.campaign_demo_markdown())
+    print(render(days, today=date.today(), within=7, max_per_day=3))
+    for line in advise_line(days, date.today()):
+        print(f"  {line}")
+    print("\n  （演示报文，结构照搬真实返回；真实门店跑 `python -m src.cli campaign`）")
+
+
 def _demo_almanac() -> None:
-    """黄历的离线演示：每一条宜忌都来自 demo_oracle 的真实算价。"""
+    """黄历的离线演示：每一条宜忌都来自 demo_oracle 的真实算价。
+
+    `now` 必须跟着真时钟走（只把时段钉在午市，让输出可复现）。
+    早先这里整个写死 `datetime(2026, 10, 11, 12)`，后果是**从第二天起
+    demo 的黄历永远印 2026-10-11**，而同一屏里的活动日历用的是真今天
+    —— 两块直接对不上。
+    """
 
     from .almanac import build as build_almanac
     from .almanac import render as render_almanac
@@ -112,7 +141,7 @@ def _demo_almanac() -> None:
         demo.DEMO_COUPONS,
         demo.demo_oracle,
         Budget(40),
-        now=datetime(2026, 10, 11, 12),
+        now=datetime.now().replace(hour=12, minute=0, second=0, microsecond=0),
     )
     best = max((r.saved_fen for r in day["readings"]), default=0)
     print(render_almanac(day, butler_almanac(best, len(day["expiry"]))))
@@ -137,7 +166,11 @@ def _demo_audit() -> None:
     print(
         render(
             verdicts,
-            store_name=demo.DEMO_STORE["storeName"],
+            # 必须换一个店名：这一段的菜单和券池是**另一套演示数据**
+            # （带门槛规则，用来演「够不到门槛一分不减」）。
+            # 沿用上面那家店的名字，读者会以为同一家店的巨无霸券
+            # 一会儿立减 5 元一会儿立减 8 元 —— 那是首页在编数据的观感。
+            store_name="演示餐厅·二号店（另一套券池）",
             menu_count=len(demo.AUDIT_MENU),
             calls=sum(v.calls for v in verdicts),
             total_coupons=len(demo.AUDIT_COUPONS),
@@ -242,11 +275,12 @@ def run_campaign(days: int) -> int:
 
     client = McdMcpClient()
     client.initialize()
+    today = server_now(client).date()
     parsed = fetch(client)
     if not parsed:
         print("活动日历这次没返回可解析的内容（不影响其它功能）。")
         return 0
-    print(render(parsed, within=days, max_per_day=4))
+    print(render(parsed, today=today, within=days, max_per_day=4))
     return 0
 
 
@@ -298,6 +332,19 @@ def run_audit(
     if audited < len(coupons):
         print(f"  （券池共 {len(coupons)} 张，本次只体检了 {audited} 张；"
               f"想多查几张：`--limit {len(coupons)} --budget {max(budget, audited * 12 + 40)}`）")
+
+    unknown = sum(1 for v in verdicts if v.status == "unknown")
+    if unknown:
+        print(f"  ⚠️ 有 {unknown} 张没查出来 —— 通常是算价接口限流或 Token 失效，不是这些券没用。")
+
+    # 券池小不是算漏：门店券接口本来就只给这么多，卡包里的券拿不到券码。
+    # 不点破，用户会以为「我明明有 6 张券，怎么只看到 1 张」。
+    if len(coupons) <= 2:
+        print()
+        print("提示：这家店当前可挂载的券只有这几张，不代表你卡包里只有这几张。")
+        print("      卡包接口（`query-my-coupons`）只回 Markdown、不含券码，挂不进算价；")
+        print("      另有部分券受时段限制（如早餐券）。想看全部券和到期日，用 `assets`。")
+
     print("  门槛和「废券」都不是接口告诉我们的，是拿不同价位的商品一件件试出来的。")
     return 0
 
@@ -409,7 +456,13 @@ def _explain_coupon_scope(n: int) -> None:
     )
 
 
-def run_advise(city: str, keyword: str, budget: int, store_code: str | None = None) -> int:
+def run_advise(
+    city: str,
+    keyword: str,
+    budget: int,
+    store_code: str | None = None,
+    days: int = 7,
+) -> int:
     """一键顾问：今天该怎么点。
 
     把几件事合成一条命令 —— 大多数人不会去记八个子命令，
@@ -422,9 +475,13 @@ def run_advise(city: str, keyword: str, budget: int, store_code: str | None = No
     client.initialize()
 
     # 0. 先看活动日历：不急的话，改天可能更划算 —— 这比省几块钱更值钱
+    # 时间基准必须用服务端时间：黄历已经这么做了，活动日历若用本机时间，
+    # 时区一错就会把明天的活动说成今天（server_now 的注释里写过这个坑）。
     from .campaign import advise_line, fetch as fetch_campaign
 
-    for line in advise_line(fetch_campaign(client)):
+    for line in advise_line(
+        fetch_campaign(client), today=server_now(client).date(), within=max(1, days)
+    ):
         print(line)
     print()
 
@@ -553,6 +610,69 @@ def run_almanac(city: str, keyword: str, budget: int, store_code: str | None = N
     print(render_almanac(day, butler_almanac(best_saved, len(day["expiry"]))))
     print(f"\n算价接口共调用 {shared.used} 次（上限 {budget}）")
     print("\n想直接照着点：`python -m src.cli advise`")
+    return 0
+
+
+def run_meal(
+    city: str,
+    keyword: str,
+    name_kw: str,
+    code: str | None,
+    store_code: str | None = None,
+) -> int:
+    """餐品详情：这个套餐由什么组成、换一样要加（或减）多少钱。
+
+    换项差价是**唯一一个用户自己能决定、而且方向可能是省钱**的操作：
+    `diffPrice` 里带负号的那些，是白捡的钱。
+    """
+    from .mcd_client import McdMcpClient
+    from .meal_detail import parse_meal_detail, render as render_meal
+
+    client = McdMcpClient()
+    client.initialize()
+    ctx = _locate(client, city, keyword, store_code)
+    if ctx is None:
+        print("未找到门店，请换一个关键词。")
+        return 1
+    store, store_code, menu, _coupons = ctx
+
+    if code:
+        target = next((i for i in menu if i.product_code == code), None)
+        if target is None:
+            print(f"菜单里没有 code={code} 的餐品；不加 --code 可以按名字搜。")
+            return 1
+    else:
+        hits = [i for i in menu if name_kw in (i.name or "")]
+        if not hits:
+            print(f"没有名字里带「{name_kw}」的餐品。用 `menu` 先看有哪些。")
+            return 1
+        # 有套餐优先看套餐 —— 单品的详情永远是空的，看了也白看。
+        combo = [
+            i for i in hits if "件套" in (i.name or "") or "套餐" in (i.name or "")
+        ]
+        target = (combo or hits)[0]
+        if len(hits) > 1:
+            print(
+                f"（匹配到 {len(hits)} 件，取「{target.name}」；"
+                f"要看别的加 --code {target.product_code}）"
+            )
+            print()
+
+    # 入参是 `code` 不是 `productCode`；到店自取不传 beCode（传了会报错）。
+    data = client.data(
+        "query-meal-detail",
+        {
+            "storeCode": store_code,
+            "orderType": 1,
+            "beType": 1,
+            "code": target.product_code,
+        },
+    )
+    detail = parse_meal_detail(data)
+    if detail is None:
+        print(f"「{target.name}」没返回详情（可能是不支持拆分的单品）。")
+        return 1
+    print(render_meal(detail, store_name=store.get("storeName", "")))
     return 0
 
 
@@ -1474,7 +1594,9 @@ def _parse_coupons(raw) -> list[Coupon]:
                 title=entry.get("title", ""),
                 product_codes=frozenset(codes),
                 product_names=frozenset(names),
-                valid_until=str(entry.get("tradeDateTime", "")),
+                # tradeDateTime 是「起-止」区间字符串，必须取结束日；
+                # 直接塞整串会让下游把开始日当成到期日（券明明还有 6 天却被报成今天到期）。
+                valid_until=valid_until_end(entry.get("tradeDateTime")),
             )
         )
     return out
@@ -1482,7 +1604,27 @@ def _parse_coupons(raw) -> list[Coupon]:
 
 # ==================================================================== main
 
+def _force_utf8_stdout() -> None:
+    """把 stdout/stderr 强制成 UTF-8。
+
+    这不是洁癖，是**Windows 上必然会崩**的问题：本项目的输出满是
+    `═ │ ¥ ░ ⏳ 🆕` 这类字符。在 en-US 代码页（cp1252）下 `selftest`
+    第一行中文就 `UnicodeEncodeError`；在中国区默认代码页（cp936）下
+    连人民币符号 `¥`（U+00A5）都打不出来 —— 实测 `demo` 第 4 行直接退出 1。
+
+    本函数只做一件事：让「输出什么样的字」不再取决于用户机器的区域设置。
+    `errors="replace"` 是刻意的 —— 遇到真打不出的字符退化成 `?`，
+    也比整条命令崩掉强。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+        except (AttributeError, ValueError, OSError):
+            pass  # 不是 TextIOWrapper（被重定向/被测试捕获）就不管
+
+
 def main(argv: list[str] | None = None) -> int:
+    _force_utf8_stdout()
     # 先把 .env 读进来，默认门店才能用得上（也避免"照着 README 做却报缺 Token"）
     load_dotenv()
     city_default = os.environ.get("MCD_DEFAULT_CITY", "上海")
@@ -1500,6 +1642,7 @@ def main(argv: list[str] | None = None) -> int:
     p_adv.add_argument("--keyword", default=kw_default)
     p_adv.add_argument("--budget", type=int, default=40, help="算价接口调用上限")
     p_adv.add_argument("--store", default=None, help="直接指定 storeCode，跳过关键词搜索")
+    p_adv.add_argument("--days", type=int, default=7, help="活动日历往后看几天")
 
     p_camp = sub.add_parser("campaign", help="麦门活动日历：今天有什么活动、哪天有新品")
     p_camp.add_argument("--days", type=int, default=7, help="往后看几天")
@@ -1515,6 +1658,15 @@ def main(argv: list[str] | None = None) -> int:
     p_assets.add_argument(
         "--claim", action="store_true", help="真的去领券（会写入你的真实会员账号）"
     )
+
+    p_meal = sub.add_parser(
+        "meal", help="餐品详情：这个套餐由什么组成、换一样要加/减多少钱"
+    )
+    p_meal.add_argument("--city", default=city_default)
+    p_meal.add_argument("--keyword", default=kw_default)
+    p_meal.add_argument("--name", default="", help="餐品名字关键词，如「三件套」")
+    p_meal.add_argument("--code", default=None, help="餐品 code（在 menu 里查得到）")
+    p_meal.add_argument("--store", default=None, help="直接指定 storeCode")
 
     p_menu = sub.add_parser("menu", help="列出门店菜单")
     p_menu.add_argument("--city", default=city_default)
@@ -1620,11 +1772,13 @@ def _dispatch(args) -> int:
         print("离线自检（无需 Token）\n")
         return run_selftest()
     if args.cmd == "advise":
-        return run_advise(args.city, args.keyword, args.budget, args.store)
+        return run_advise(args.city, args.keyword, args.budget, args.store, args.days)
     if args.cmd == "campaign":
-        return run_campaign(args.days)
+        return run_campaign(max(1, args.days))
     if args.cmd == "audit":
         return run_audit(args.city, args.keyword, args.budget, args.limit, args.store)
+    if args.cmd == "meal":
+        return run_meal(args.city, args.keyword, args.name, args.code, args.store)
     if args.cmd == "menu":
         return run_menu(args.city, args.keyword, args.filter, args.limit, args.store)
     if args.cmd == "assets":

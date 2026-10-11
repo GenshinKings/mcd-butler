@@ -20,3 +20,7 @@ screenshots/*.gif
 
 # WorkBuddy 工作区内部笔记，不公开
 .workbuddy/
+
+# pip install -e . 的构建产物
+mcd_butler.egg-info/
+*.egg-info/

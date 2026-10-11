@@ -30,7 +30,42 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Sequence
 
-from .coupon_engine import Assignment, Budget, CartItem, Coupon, PriceResult
+from .coupon_engine import (
+    Assignment,
+    Budget,
+    BudgetExhausted,
+    CartItem,
+    Coupon,
+    PriceResult,
+    to_fen,
+)
+from .mcd_client import McpFatalError
+
+# 除了 McpFatalError，这些也按「环境/代码坏了」处理 —— 它们几乎不可能
+# 是麦当劳的业务答案，而是我们自己踩到了 bug 或本机出了问题。
+_FATAL_TYPES = (TypeError, AttributeError, KeyError, IndexError, OSError)
+
+
+def _is_fatal(exc: BaseException) -> bool:
+    """这个错是「环境/代码坏了」还是「这件商品用不上这张券」。
+
+    必须分清楚，因为两种错的处置完全相反：
+
+    - **环境坏了**（Token 失效、断网、限流、返回体变了）：
+      继续跑下去只会得到一份写满「没查出来」的假报告，必须立刻抛出去，
+      让用户去换 Token / 调预算，而不是让他以为自己的券都是废纸。
+    - **业务性拒绝**（实测 `calculate-price` 会回「促销规则不支持该商品」）：
+      这是这张券跟这几件商品不匹配的**正常答案**，换一件商品照样能查，
+      为它放弃整张券是误伤 —— 一张「麦咖啡」券挂到汉堡上就是这个错。
+
+    判定**只看类型，不看错误文案**。早先这里用正则匹配「401 / token /
+    鉴权 / 授权 / 超时 / 限流」这些关键词，实测 15 条真实文案错 12 条：
+    「该优惠券仅限授权门店使用」「订单超时未支付」是业务拒绝却被判死，
+    「502 Bad Gateway」「Connection reset」「登录已失效」是环境故障却被放过。
+    自然语言猜不出错误的性质 —— 那是抛错的地方才知道的事，
+    所以改由 `McpFatalError` 这个类型在 raise 处显式标注。
+    """
+    return isinstance(exc, (McpFatalError, *_FATAL_TYPES))
 
 # 三种判决。注意「废券」和「死券」必须分开：
 # 废券是「能挂但没用」，死券是「压根没地方挂」，
@@ -61,10 +96,10 @@ def face_value_fen(title: str) -> int:
     m = _FACE_RE.search(title or "")
     if not m:
         return 0
-    try:
-        return int(round(float(m.group(1)) * 100))
-    except (TypeError, ValueError):
-        return 0
+    # 必须用项目统一的 to_fen（Decimal + ROUND_HALF_UP），不能自己
+    # `int(round(float(x) * 100))` —— 后者是 banker's rounding，
+    # 0.125 元会算成 12 分而不是 13 分，跟别处对不上。
+    return to_fen(m.group(1))
 
 
 def yuan(fen: int) -> str:
@@ -82,10 +117,12 @@ class Verdict:
     best_item: CartItem | None = None
     baseline_fen: int = 0     # 这件商品不挂券时的最优价
     best_price_fen: int = 0   # 挂上这张券之后的最优价
-    probed: int = 0           # 试了几件适用商品
+    probed: int = 0           # 真正算出价的商品件数（不是候选件数）
+    attempted: int = 0        # 本来打算试几件
     works_from_fen: int = 0   # 试出来的「生效价」下界
     blocked_fen: int = 0      # 试出来的「不生效价」上界（比 works_from 便宜）
     calls: int = 0
+    partial: bool = False     # 有商品算价报错、结论可能偏保守
     note: str = ""
 
     @property
@@ -122,43 +159,105 @@ def _candidates(menu: Sequence[CartItem], coupon: Coupon, probe: int) -> list[Ca
     if not hits:
         return []
     hits.sort(key=lambda i: i.effective_price_fen())
-    if len(hits) <= probe:
-        return hits
-    picks = [hits[0], hits[len(hits) // 2], hits[-1]]
-    out: list[CartItem] = []
-    seen: set[str] = set()
-    for it in picks:
-        if it.product_code in seen:
+    # 去重键要带价格：同一个 productCode 若有不同规格，得各试一件；
+    # 但完全相同的条目只算一件，否则报告会虚报「试了 N 件」。
+    uniq: list[CartItem] = []
+    seen: set[tuple] = set()
+    for it in hits:
+        k = (it.product_code, it.effective_price_fen())
+        if k in seen:
             continue
-        seen.add(it.product_code)
-        out.append(it)
-    return out
+        seen.add(k)
+        uniq.append(it)
+    # probe<=0 是「一件都别试」，直接返回空，不能掉进下面的采样 ——
+    # `[:0]` 得到空表之后 `picks[-1] = ...` 会 IndexError。
+    if probe <= 0:
+        return []
+    if len(uniq) <= probe:
+        return uniq
+    # probe 必须真的生效（早先写了 picks=[首,中,尾] 三件，probe 形同虚设）；
+    # 且**最贵那件一定要试** —— 满减券只在贵的那件上生效，
+    # 只试便宜的会把一张好券误判成废券。
+    step = max(1, (len(uniq) - 1) // max(probe - 1, 1))
+    picks = [uniq[i] for i in range(0, len(uniq), step)][:probe]
+    if uniq[-1] not in picks:
+        picks[-1] = uniq[-1]
+    return picks
 
 
-def _best(
+def _opt_sig(opt: Any) -> str:
+    """随单购档位的稳定标识（缓存键用）。"""
+    sig = getattr(opt, "signature", None)
+    return sig() if callable(sig) else ""
+
+
+def _probe(
     oracle: Callable[[list[CartItem], Assignment], PriceResult],
     cart: list[CartItem],
     options: Sequence[Any],
-    mapping: dict[int, int],
+    coupon_idx: int,
     budget: Budget | None,
     counter: list[int],
-) -> PriceResult | None:
-    """在几个随单购档位里挑最便宜的那个。
+    base_cache: dict[tuple, int],
+    key: tuple,
+    errors: list[BaseException],
+) -> tuple[tuple[int, int, int, Any] | None, bool]:
+    """在**同一个随单购档位**下比「挂券 vs 不挂券」，返回差价最大的那一档。
 
-    单件商品 + 单张券的组合空间小到可以直接穷举档位，
-    不需要爬山 —— 这里求的是**精确值**，不是近似值。
+    为什么必须同档位比，不能两边各自取最优档：
+    券和随单购可能互斥（实测：麦金卡随单购不能与部分券同享）。
+    若 baseline 取"最优档"、挂券价也取"最优档"，两边都会落到麦金卡那一档、
+    券被作废，差值恒为 0 —— 于是一张本来能省 ¥4 的券被判成废券。
+
+    而真相是两件不同的事，必须分开说：
+      · 这张券**本身**能减 ¥4（不随单购时）
+      · 但它配上麦金卡后不再额外省钱，因为麦金卡那一档更便宜
+    混成一个"废券"，用户会以为这张券是假的；其实只是有更优的选择。
+
+    返回 (最大值结果, 是否被预算截断)。
     """
-    best: PriceResult | None = None
+    best: tuple[int, int, int, Any] | None = None
+    truncated = False
     for opt in options:
         if budget is not None and budget.remaining <= 0:
+            truncated = True
             break
-        res = oracle(cart, Assignment(mapping=dict(mapping), with_order=opt))
+        ck = (key, _opt_sig(opt))
+
+        base = base_cache.get(ck)
+        if base is None:
+            try:
+                base = oracle(
+                    cart, Assignment(mapping={}, with_order=opt)
+                ).price_fen
+            except Exception as exc:  # noqa: BLE001 - 见下方「一次都没成功才抛」
+                errors.append(exc)
+                continue
+            counter[0] += 1
+            if budget is not None:
+                budget.spend()
+            base_cache[ck] = base
+
+        if budget is not None and budget.remaining <= 0:
+            truncated = True
+            break
+        try:
+            with_c = oracle(
+                cart, Assignment(mapping={0: coupon_idx}, with_order=opt)
+            ).price_fen
+        except Exception as exc:  # noqa: BLE001 - 见下方「一次都没成功才抛」
+            # 单个候选失败只跳过它：实测券挂到不适配的商品上会返回
+            # 「促销规则不支持该商品」，换一件商品照样能查，不该整张券放弃。
+            errors.append(exc)
+            continue
         counter[0] += 1
         if budget is not None:
             budget.spend()
-        if best is None or res.price_fen < best.price_fen:
-            best = res
-    return best
+
+        gap = base - with_c
+        if best is None or gap > best[0]:
+            best = (gap, base, with_c, opt)
+    return best, truncated
 
 
 def _sort_key(pair: tuple[int, Coupon]) -> tuple[int, str, int]:
@@ -189,8 +288,15 @@ def audit_coupons(
     `min_worth_fen` 是「算不算真省了钱」的门槛，默认 ¥0.30：
     低于这个数，用户根本感知不到，报成「省钱」是自欺欺人。
     """
+    if budget is not None and budget.total <= 0:
+        # 预算为 0 时不该输出一份「没有可体检的券」——那是把配置错误
+        # 伪装成业务结论。直接说清楚要调大 --budget。
+        raise BudgetExhausted(
+            "算价预算为 0，一张券都查不了；把 --budget 调大（建议 ≥ 40）"
+        )
+
     counter = [0]
-    base_cache: dict[str, int] = {}
+    base_cache: dict[tuple, int] = {}
     verdicts: list[Verdict] = []
     errors: list[BaseException] = []
 
@@ -220,77 +326,111 @@ def audit_coupons(
             coupon=coupon,
             status=DUD,
             face_fen=face_value_fen(coupon.title),
-            probed=len(cands),
+            attempted=len(cands),
         )
         if is_universal:
             v.note = f"通用券，只在 {len(cands)} 件代表商品上试"
 
         before = counter[0]
         probed_ok = 0
+        item_failed = 0
+        truncated_any = False
+        min_no = None   # 所有试过的档位里，不挂券的最低价
+        min_with = None  # 所有试过的档位里，挂上券的最低价
         for item in cands:
             if budget is not None and budget.remaining <= 0:
+                truncated_any = True
                 break
             cart = [item]
-            options = with_order_options(cart)
-            if not options:
+            try:
+                options = list(with_order_options(cart)) or [None]
+            except Exception as exc:  # noqa: BLE001 - 档位构造失败不该拖垮整张券
+                errors.append(exc)
                 options = [None]
 
-            baseline = base_cache.get(item.product_code)
-            if baseline is None:
-                try:
-                    b = _best(oracle, cart, options, {}, budget, counter)
-                except Exception as exc:  # noqa: BLE001 - 见下方「全部失败则抛出」
-                    errors.append(exc)
-                    continue
-                if b is None:
-                    continue
-                baseline = b.price_fen
-                base_cache[item.product_code] = baseline
-
-            try:
-                w = _best(oracle, cart, options, {0: orig_idx}, budget, counter)
-            except Exception as exc:  # noqa: BLE001 - 见下方「全部失败则抛出」
-                # 单次失败只记下来、跳过这张券。
-                # 但绝不允许「全都失败」还输出一份全是废券的报告 ——
-                # 那是把鉴权失效/断网伪装成了业务结论，比报错坏得多。
-                errors.append(exc)
-                break
-            if w is None:
+            # 缓存键必须带上价格：同一个 productCode 若有不同规格/价格，
+            # 只按 code 缓存会串味（实测会把好券判成废券）。
+            key = (item.product_code, item.effective_price_fen())
+            best, truncated = _probe(
+                oracle, cart, options, orig_idx, budget, counter, base_cache, key, errors
+            )
+            if truncated:
+                truncated_any = True
+            if best is None:
+                # 这件商品在所有随单购档位上都没算出价 —— 记的是「件」
+                # 不是「次」：一件商品跨 3 个档位失败会落 3 个 error，
+                # 拿 error 数去当件数会打出「6/3 件商品报错」这种鬼话。
+                item_failed += 1
                 continue
             probed_ok += 1
 
-            value = baseline - w.price_fen
+            value, base_fen, with_fen, _opt = best
+            min_no = base_fen if min_no is None else min(min_no, base_fen)
+            min_with = with_fen if min_with is None else min(min_with, with_fen)
+
             price = item.effective_price_fen()
             if value > 0:
                 if v.works_from_fen == 0 or price < v.works_from_fen:
                     v.works_from_fen = price
-            else:
-                if price > v.blocked_fen:
-                    v.blocked_fen = price
+            elif price > v.blocked_fen:
+                v.blocked_fen = price
 
             if value > v.value_fen:
                 v.value_fen = value
                 v.best_item = item
-                v.baseline_fen = baseline
-                v.best_price_fen = w.price_fen
+                v.baseline_fen = base_fen
+                v.best_price_fen = with_fen
 
         v.calls = counter[0] - before
+        # probed 必须是**成功算出价**的件数，不能是候选件数：
+        # 候选 3 件里只成功 1 件却对外说「试了 3 件」，是虚报。
+        v.probed = probed_ok
+        failed = item_failed
 
         if probed_ok == 0:
             v.status = UNKNOWN
-            v.note = "算价接口这件商品没返回价格"
+            if failed and not truncated_any:
+                v.note = f"{failed} 件商品算价报错，这张券没查出来"
+            else:
+                v.note = (
+                    "预算不够，这张券没查完（调大 --budget）"
+                    if truncated_any
+                    else "算价接口这件商品没返回价格"
+                )
         elif v.value_fen >= min_worth_fen:
             v.status = WORTH
+            # 券本身有效力，但搭上随单购后不再额外省钱 —— 这两件事必须分开说，
+            # 否则用户会以为券是假的，其实是随单购那一档更便宜。
+            if min_no is not None and min_with is not None and min_with >= min_no:
+                v.note = "配上随单购后它不再额外省钱（随单购那一档本身就更低）"
+        elif v.value_fen > 0:
+            # 减了但没到"值得为它凑单"的程度。
+            # 早先这里一律打印「一分没减」，那是事实错误 —— 它明明减了 ¥0.25。
+            v.status = DUD
+            v.note = f"只省 ¥{yuan(v.value_fen)}，不值得专门为它凑单"
         else:
             v.status = DUD
+
+        # 有几件报错、但别的算出来了 —— 这是线上的真实形态，不能装作没发生：
+        # 报错的那几件里可能正有关卡价商品，那会让这张券的价值被低估。
+        if failed and probed_ok:
+            v.partial = True
+            v.note = (
+                (v.note + "；" if v.note else "")
+                + f"{failed}/{len(cands)} 件商品算价报错，这个数可能偏保守"
+            )
         verdicts.append(v)
 
-    # 一次都没算成功、还报错了 → 这是鉴权/网络故障，不能伪装成「全是废券」。
-    # 判据必须看「成功调用次数」而不是「是不是全 UNKNOWN」：
-    # 券池里本来就可能有死券（status=DEAD），那样永远凑不出「全 UNKNOWN」，
-    # 一个 Token 失效就会被静默吞掉。
-    if counter[0] == 0 and errors:
-        raise errors[0]
+    # 环境级故障绝不能伪装成业务结论。
+    #
+    # 判据不能只看「一次都没成功」（早先就是这么写的）：
+    # Token 跑到一半失效时前半段是成功的，那样照样输出一份看似正常、
+    # 实则残缺的报告，用户会以为自己的券都是废纸。
+    # 所以只要出现过一条**环境级**错误就抛 —— 业务性拒绝不算，
+    # 那是「这张券跟这件商品不匹配」的正常答案。
+    fatal = [e for e in errors if _is_fatal(e)]
+    if errors and (counter[0] == 0 or fatal):
+        raise fatal[0] if fatal else errors[-1]
 
     return verdicts
 
@@ -362,9 +502,16 @@ def render(
         lines.append(f"  没查出来   {unknown} 张")
     lines.append("")
 
-    counted = worth + dud + dead
+    # 分母必须包含 UNKNOWN：漏掉它时「1 张能省 + 4 张没查出来」会算出
+    # 健康度 100%，那是拿未知当好消息，比不报更坏。
+    counted = worth + dud + dead + unknown
     ratio = (worth / counted) if counted else 0.0
-    lines.append(f"  健康度 {_bar(ratio)} {ratio * 100:.0f}%")
+    suffix = f"（{unknown} 张没查出来，按未通过计入）" if unknown else ""
+    lines.append(f"  健康度 {_bar(ratio)} {ratio * 100:.0f}%{suffix}")
+    if counted and counted < 3:
+        # 券池只有 1~2 张时，健康度不是"你的券很健康"，而是"样本太少"。
+        # 把接口现状讲明白，它就成了洞察而不是缺陷。
+        lines.append(f"  ⚠️ 只体检到 {counted} 张券，样本太小，健康度仅供参考")
     lines.append("")
 
     # ── 最值钱的几张
@@ -413,10 +560,18 @@ def render(
             face = f"（标着减 ¥{yuan(v.face_fen)}）" if v.face_fen > 0 else ""
             lines.append(f"  × {v.coupon.title}{face}")
             th = v.threshold_note()
-            if th:
+            if v.value_fen > 0:
+                # 减了但不多：不能说「一分没减」，那是事实错误
+                lines.append(
+                    f"    试了 {v.probed} 件适用商品，最多只省 ¥{yuan(v.value_fen)}"
+                    + (f"；{th}" if th else "")
+                )
+            elif th:
                 lines.append(f"    {th}，便宜的东西够不到")
             elif v.probed:
                 lines.append(f"    试了 {v.probed} 件适用商品，接口一分没减")
+            if v.note:
+                lines.append(f"    {v.note}")
         lines.append("")
 
     # ── 死券
