@@ -23,6 +23,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .persona import butler_warning
+
 
 # ------------------------------------------------------------------ 出行方式
 @dataclass(frozen=True)
@@ -193,17 +195,8 @@ def verdict(quotes: list[StoreQuote]) -> str:
             )
 
     # 这趟路费值不值：拿"省下的券钱"跟"路费"比
-    if best.travel.money_fen > 0 and best.saved_fen > 0:
-        if best.travel.money_fen >= best.saved_fen:
-            lines.append(
-                f"⚠️ 提醒：这趟路费 ¥{best.travel.money_fen / 100:.2f} "
-                f"≥ 券省下的 ¥{best.saved_fen / 100:.2f}，"
-                "等于白跑 —— 除非你本来就要出门。"
-            )
-        else:
-            lines.append(
-                f"路费 ¥{best.travel.money_fen / 100:.2f} 小于券省下的 "
-                f"¥{best.saved_fen / 100:.2f}，这趟值得跑。"
-            )
+    # 「路费吃掉优惠」这句话交给管家说 —— 干巴巴的"等于白跑"没人记得住，
+    # 带人味的劝才传得开。数字照旧，只是换了张嘴。
+    lines.append(butler_warning(best.travel.money_fen, best.saved_fen))
 
     return "\n".join(lines)

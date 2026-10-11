@@ -534,8 +534,8 @@ def run() -> int:
     q_taxi = StoreQuote("C", "打车店", distance_m=144, paid_fen=3680, baseline_fen=3880,
                         travel=travel_cost(144, "taxi"))
     check(
-        "比价-路费吃掉优惠时提醒白跑",
-        "白跑" in verdict([q_taxi]),
+        "比价-路费吃掉优惠时管家出言劝退",
+        "路费" in verdict([q_taxi]) and "劝" in verdict([q_taxi]),
         f"路费¥{q_taxi.travel.money_fen / 100:.2f} vs 省¥{q_taxi.saved_fen / 100:.2f}",
     )
 
@@ -563,6 +563,117 @@ def run() -> int:
         check("券范围-解释函数不崩（0/1/2 张）", True)
     except Exception as exc:  # noqa: BLE001
         check("券范围-解释函数不崩（0/1/2 张）", False, repr(exc))
+
+    # 20. 麦门黄历：这是项目的门面，每一条宜忌都必须是真算出来的
+    from datetime import datetime
+
+    from .almanac import build as build_almanac
+    from .almanac import days_left, expiry_note, period_of, render as render_almanac
+
+    check("黄历-时段划分覆盖全天", period_of(datetime(2026, 10, 11, 8))[0] == "早市"
+          and period_of(datetime(2026, 10, 11, 12))[0] == "午市"
+          and period_of(datetime(2026, 10, 11, 15))[0] == "下午茶"
+          and period_of(datetime(2026, 10, 11, 19))[0] == "晚市"
+          and period_of(datetime(2026, 10, 11, 22))[0] == "夜宵"
+          and period_of(datetime(2026, 10, 11, 2))[0] == "深夜")
+    check(
+        "黄历-到期天数解析",
+        days_left("2026-10-11", datetime(2026, 10, 11)) == 0
+        and days_left("2026-10-12 23:59", datetime(2026, 10, 11)) == 1
+        and days_left("", datetime(2026, 10, 11)) is None,
+    )
+    check(
+        "黄历-临期提示",
+        "今日到期" in expiry_note("2026-10-11", datetime(2026, 10, 11))
+        and expiry_note("2026-12-31", datetime(2026, 10, 11)) == "",
+    )
+
+    # 构造一个「有券省 8 元 / 有券反而贵 1 元 / 有单品没券」的小世界
+    # （Budget/CartItem/Coupon/PriceResult 已在模块顶部导入，此处不可再局部导入，
+    #  否则会把整个 run() 里的同名名字变成局部变量而 UnboundLocalError）
+    menu = [
+        CartItem(product_code="A1", name="板烧三件套", unit_price_fen=3700, list_price_fen=3700),
+        CartItem(product_code="A2", name="麦香鱼", unit_price_fen=1500, list_price_fen=1500),
+        CartItem(product_code="A3", name="薯条", unit_price_fen=1200, list_price_fen=1200),
+    ]
+    coupons = [
+        Coupon(coupon_id="c1", coupon_code="k1", title="板烧立减8元",
+               product_codes=frozenset({"A1"}), valid_until="2026-10-11"),
+        Coupon(coupon_id="c2", coupon_code="k2", title="薯条陷阱券",
+               product_codes=frozenset({"A3"})),
+    ]
+
+    def almanac_oracle(items, assignment):
+        # 模拟真实接口：挂 c1 省 800 分；挂 c2 反而贵 100 分（卡费口径）
+        base = sum(i.unit_price_fen * i.quantity for i in items)
+        saved = 0
+        for idx, ci in (assignment.mapping or {}).items():
+            saved += 800 if ci == 0 else -100
+        return PriceResult(price_fen=base - saved, original_fen=base, discount_fen=max(saved, 0))
+
+    day = build_almanac(menu, coupons, almanac_oracle, Budget(40), now=datetime(2026, 10, 11, 12))
+    kinds = [(r.product_name, r.kind, r.saved_fen) for r in day["readings"]]
+    check(
+        "黄历-省钱的券进宜",
+        ("板烧三件套", "宜", 800) in kinds,
+        str(kinds),
+    )
+    check(
+        "黄历-挂券反而更贵的进忌（随单购陷阱）",
+        any(n == "薯条" and k == "忌" and s < 0 for n, k, s in kinds),
+        str(kinds),
+    )
+    check(
+        "黄历-无券可挂的贵价单品进忌",
+        ("麦香鱼", "忌", 0) in kinds,
+        str(kinds),
+    )
+    check("黄历-临期券被点出来", len(day["expiry"]) == 1, str(day["expiry"]))
+
+    text = render_almanac(day, "小的不编。")
+    check("黄历-渲染不崩且含日期与时段", "麦门黄历" in text and "2026-10-11" in text and "午市" in text)
+
+    # 预算见底时必须收工，绝不偷偷超支
+    tiny = build_almanac(menu, coupons, almanac_oracle, Budget(1), now=datetime(2026, 10, 11))
+    check("黄历-预算为1时不炸且不乱报宜", tiny["probes"] <= 1, str(tiny["probes"]))
+
+    # 没有券时不能编宜忌
+    empty = build_almanac(menu, [], almanac_oracle, Budget(40), now=datetime(2026, 10, 11))
+    check("黄历-无券时不编造条目", "算不出" in render_almanac(empty, ""))
+
+    # 21. 段位与晒单：空账单、满级、中途三档都要站得住
+    from .persona import brag_card, butler_total, butler_warning, progress_bar, rank_of, summarize
+
+    check("段位-零起步是麦门路人", rank_of(0)["title"] == "麦门路人")
+    check("段位-满级无下一档", rank_of(99999999)["title"] == "麦门永存" and rank_of(99999999)["next"] is None)
+    check(
+        "段位-差额计算正确",
+        rank_of(5000)["next"]["gap_fen"] == 10000,
+        str(rank_of(5000)["next"]),
+    )
+    check("段位-负数不炸", rank_of(-100)["title"] == "麦门路人")
+    check("段位-进度条首尾正确", progress_bar(0, 6).startswith("░") and set(progress_bar(6, 6)) == {"█"})
+    check("段位-满级进度条实心", set(progress_bar(6, 6)) == {"█"})
+    check("口吻-空账单有说法", "空" in butler_total(0, 0))
+    check("口吻-劝退敢说实话", "劝" in butler_warning(1500, 500))
+    check("口吻-路费为零时是稳赚", "稳赚" in butler_warning(0, 500))
+
+    entries = [
+        {"baseline_fen": 3800, "paid_fen": 3600, "store_name": "人民广场店",
+         "coupon_titles": ["板烧立减"], "saved_at": "2026-10-11T12:00:00"},
+        {"baseline_fen": 5000, "paid_fen": 4700, "store_name": "人民广场店",
+         "coupon_titles": ["板烧立减"], "saved_at": "2026-10-12T12:00:00"},
+    ]
+    s = summarize(entries)
+    check("账单-汇总真实节省", s["saved_fen"] == 500 and s["orders"] == 2, str(s))
+    check("账单-最常光顾与最常用券", s["top_store"] == "人民广场店" and s["top_coupon"] == "板烧立减")
+    check("账单-脏数据不崩", summarize([{}, {"baseline_fen": None}])["saved_fen"] == 0)
+    card = brag_card(500, 2, "麦门学徒", "X店", "Y券")
+    check(
+        "晒单-卡片含段位与仓库地址",
+        "麦门学徒" in card and "github.com" in card and "¥5.00" in card,
+        card,
+    )
 
     # ---------------------------------------------------------------- 输出
     passed = sum(1 for _, ok, _ in _RESULTS if ok)

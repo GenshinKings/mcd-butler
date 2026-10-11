@@ -80,7 +80,50 @@ def run_demo() -> int:
     print("历史订单复刻（replay）")
     print("=" * 62)
     _demo_replay()
+
+    print("\n" + "=" * 62)
+    print("麦门黄历（almanac）")
+    print("=" * 62)
+    _demo_almanac()
+
+    print("\n" + "=" * 62)
+    print("麦门段位（brag）")
+    print("=" * 62)
+    _demo_ranks()
     return 0
+
+
+def _demo_almanac() -> None:
+    """黄历的离线演示：每一条宜忌都来自 demo_oracle 的真实算价。"""
+    from datetime import datetime
+
+    from .almanac import build as build_almanac
+    from .almanac import render as render_almanac
+    from .persona import butler_almanac
+
+    day = build_almanac(
+        list(demo.DEMO_MENU),
+        demo.DEMO_COUPONS,
+        demo.demo_oracle,
+        Budget(40),
+        now=datetime(2026, 10, 11, 12),
+    )
+    best = max((r.saved_fen for r in day["readings"]), default=0)
+    print(render_almanac(day, butler_almanac(best, len(day["expiry"]))))
+    print("  （以上每条宜忌都真的打过算价接口；演示数据，不代表真实价格）")
+
+
+def _demo_ranks() -> None:
+    """段位体系的离线展示。真人跑 `brag` 读的是本机快照。"""
+    from .persona import RANKS, progress_bar, rank_of
+
+    for need, title, comment in RANKS:
+        r = rank_of(need)
+        print(
+            f"  ¥{need / 100:>7.0f} 起　{title:<6} {progress_bar(r['index'], r['max_index'])}　{comment}"
+        )
+    print("\n  段位来自本机快照累计（~/.mcd-butler/），不联网、不上传。")
+    print("  看自己的账本：`python -m src.cli brag`")
 
 
 def _demo_replay() -> None:
@@ -302,8 +345,95 @@ def run_advise(city: str, keyword: str, budget: int) -> int:
 
     extra = _print_insights(oracle, cart, coupons, best, shared)
     print(f"\n算价接口共调用 {optimizer.budget_used} 次（上限 {budget}）")
+    print(f"\n{_butler_close(best.price.saved_vs(baseline.price_fen))}")
     print("\n想换成自己爱吃的：")
     print('  python -m src.cli optimize --items "板烧鸡腿堡三件套,薯条x2"')
+    return 0
+
+
+def _butler_close(saved_fen: int) -> str:
+    """主流程收尾：先点评这一单，再报一下累计段位。
+
+    累计数据来自本机快照，读不出来（权限/损坏）就只说这一单，
+    绝不因为账单读不到而把整单结果搞崩。
+    """
+    from .persona import butler_saved, rank_of, summarize
+    from .snapshot import load_all
+
+    lines = [butler_saved(saved_fen)]
+    try:
+        s = summarize(load_all())
+    except Exception:
+        s = None
+    if s and s.get("orders"):
+        r = rank_of(s["saved_fen"])
+        lines.append(
+            f"账上累计 {s['orders']} 单、省下 ¥{s['saved_fen'] / 100:.2f}，"
+            f"当前段位「{r['title']}」。"
+        )
+        lines.append("想看完整账单和可晒的卡片：`python -m src.cli brag`")
+    return "\n".join(lines)
+
+
+def run_almanac(city: str, keyword: str, budget: int) -> int:
+    """麦门黄历：今天宜吃什么、忌吃什么。
+
+    和别的"趣味黄历"唯一的区别是 —— 这里的每一条宜忌都真的打过算价接口。
+    宜：挂这张券，接口真的给便宜了这么多钱。
+    忌：要么没券可挂（白付原价），要么挂上去反而更贵（随单购把卡费算进来了）。
+    """
+    from datetime import datetime
+
+    from .almanac import build as build_almanac
+    from .almanac import render as render_almanac
+    from .mcd_client import McdMcpClient
+    from .persona import butler_almanac
+
+    client = McdMcpClient()
+    client.initialize()
+
+    print(f"定位门店：{city} / {keyword}")
+    ctx = _locate(client, city, keyword)
+    if ctx is None:
+        print("未找到门店，请换一个关键词。")
+        return 1
+    store, store_code, menu, coupons = ctx
+    print(f"命中：{store.get('storeName', '未知门店')}　菜单 {len(menu)} 项，券 {len(coupons)} 张")
+    if not coupons:
+        print("\n这家门店当前没有可挂载的券，黄历算不出来。")
+        print("小的不编 —— 换个时间或换家门店再来。")
+        return 1
+
+    def oracle(items: list[CartItem], assignment: Assignment) -> PriceResult:
+        payload_items = []
+        for idx, item in enumerate(items):
+            entry = {"productCode": item.product_code, "quantity": item.quantity}
+            ci = assignment.mapping.get(idx)
+            if ci is not None:
+                entry["couponId"] = coupons[ci].coupon_id
+                entry["couponCode"] = coupons[ci].coupon_code
+            payload_items.append(entry)
+        data = client.data(
+            "calculate-price",
+            {
+                "storeCode": store_code,
+                "orderType": 1,
+                "beType": 1,
+                "items": payload_items,
+            },
+        )
+        return PriceResult(
+            price_fen=int(data.get("price", 0)),
+            original_fen=int(data.get("originalPrice", 0)),
+            discount_fen=int(data.get("discount", 0)),
+        )
+
+    shared = Budget(budget)
+    day = build_almanac(menu, coupons, oracle, shared, now=datetime.now())
+    best_saved = max((r.saved_fen for r in day["readings"]), default=0)
+    print(render_almanac(day, butler_almanac(best_saved, len(day["expiry"]))))
+    print(f"\n算价接口共调用 {shared.used} 次（上限 {budget}）")
+    print("\n想直接照着点：`python -m src.cli advise`")
     return 0
 
 
@@ -462,6 +592,10 @@ def run_optimize(
         except OSError as exc:
             # 快照只是锦上添花：写盘失败（权限/磁盘满）绝不该让已算完的结果崩掉。
             print(f"\n（快照保存失败，不影响本次结果：{exc}）")
+    else:
+        print("\n（本次未存快照，账本里不会有这一单）")
+
+    print(f"\n{_butler_close(saved)}")
     return 0
 
 
@@ -684,6 +818,60 @@ def run_compare(
     print()
     print(verdict(ranked))
     print(f"\n算价接口共调用 {shared.used} 次（上限 {budget}）")
+    return 0
+
+
+def run_brag() -> int:
+    """麦门账单：段位 + 能直接晒出去的卡片。
+
+    不需要 Token，也不联网 —— 数据全部来自本机快照（~/.mcd-butler/）。
+
+    为什么要有这个命令：省钱这件事，**能跟朋友说的那一刻才有快感**。
+    一个只能自己看的省钱工具，是传播不出去的。
+    """
+    from .persona import brag_card, butler_total, progress_bar, rank_of, summarize
+    from .snapshot import load_all
+
+    entries = load_all()
+    if not entries:
+        print("账上还空着。先让小的办一单：")
+        print('  python -m src.cli optimize --items "板烧鸡腿堡三件套,薯条x2"')
+        print("（跑完会自动记进本地快照，之后这里就有得看了）")
+        return 1
+
+    s = summarize(entries)
+    r = rank_of(s["saved_fen"])
+
+    print("\n麦门账单（全部来自本机快照，不联网、不上传）\n")
+    print(f"  累计省下   ¥{s['saved_fen'] / 100:.2f}　　共 {s['orders']} 单")
+    if s["top_store"]:
+        print(f"  最常光顾   {s['top_store']}")
+    if s["top_coupon"]:
+        print(f"  最常用券   {s['top_coupon']}")
+    if s["first_at"]:
+        print(f"  记账起始   {s['first_at'][:10]}")
+
+    print(f"\n  当前段位   {r['title']}  {progress_bar(r['index'], r['max_index'])}")
+    print(f"             {r['comment']}")
+    if r["next"]:
+        n = r["next"]
+        print(f"  再省 ¥{n['gap_fen'] / 100:.2f} 即可升到「{n['title']}」")
+    else:
+        print("  已满级 —— 您就是麦门本身。")
+
+    print(f"\n  {butler_total(s['saved_fen'], s['orders'])}")
+    print()
+    print(
+        brag_card(
+            s["saved_fen"],
+            s["orders"],
+            r["title"],
+            s["top_store"],
+            s["top_coupon"],
+            s["first_at"],
+        )
+    )
+    print("\n（上面这段可以直接复制粘贴去晒）")
     return 0
 
 
@@ -1266,6 +1454,13 @@ def main(argv: list[str] | None = None) -> int:
     p_cmp.add_argument("--wage", type=float, default=None, help="时薪（元/小时），把等待时间也折算成钱")
     p_cmp.add_argument("--top", type=int, default=3, help="最多比几家店")
 
+    sub.add_parser("brag", help="麦门账单：段位 + 可晒的卡片（读本地快照，无需 Token）")
+
+    p_alm = sub.add_parser("almanac", help="麦门黄历：今天宜吃什么忌吃什么（每条都真算过价）")
+    p_alm.add_argument("--city", default=city_default)
+    p_alm.add_argument("--keyword", default=kw_default)
+    p_alm.add_argument("--budget", type=int, default=40, help="算价接口调用上限")
+
     p_nut = sub.add_parser("nutrition", help="热量预算搭配")
     p_nut.add_argument("--city", default=city_default)
     p_nut.add_argument("--keyword", default=kw_default)
@@ -1324,6 +1519,10 @@ def _dispatch(args) -> int:
             args.wage,
             args.top,
         )
+    if args.cmd == "brag":
+        return run_brag()
+    if args.cmd == "almanac":
+        return run_almanac(args.city, args.keyword, args.budget)
     if args.cmd == "nutrition":
         return run_nutrition(args.city, args.keyword, args.kcal, args.size)
     if args.cmd == "optimize":

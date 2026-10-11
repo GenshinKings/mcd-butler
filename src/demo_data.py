@@ -36,6 +36,18 @@ DEMO_MENU: list[CartItem] = [
     CartItem("D005", "中杯可乐", 1, 900),
     CartItem("D006", "麦旋风", 1, 1000),
     CartItem("D007", "脆薯饼", 1, 800),
+    # 条件价商品：菜单上标 62.90 是「随单购麦金卡」价，不办卡按 122.50 结。
+    # 真实菜单里这种商品不少（四件套、八件套都这样），演示里必须留一个，
+    # 否则新人看不出「菜单标价可能骗人」这件最关键的事。
+    CartItem(
+        "D008",
+        "BFF四宫格小食盘双人餐",
+        1,
+        6290,
+        list_price_fen=12250,
+        discount_type="随单购麦金卡优惠",
+        needs_with_order=True,
+    ),
 ]
 
 DEMO_MENU_BY_CODE: dict[str, CartItem] = {m.product_code: m for m in DEMO_MENU}
@@ -110,9 +122,17 @@ def demo_oracle(items: list[CartItem], assignment) -> PriceResult:
     coupon_ids = [_cid(coupon_idx) for _, coupon_idx in assignment.mapping.items()]
 
     discount = 0
-    for cid in coupon_ids:
-        if cid:
-            discount += _DEMO_DISCOUNT.get(cid, 0)
+    for idx, coupon_idx in assignment.mapping.items():
+        cid = _cid(coupon_idx)
+        if not cid:
+            continue
+        unit = _DEMO_DISCOUNT.get(cid, 0)
+        # 「买一送一」这类券按件数生效：买 1 件省半价、买 2 件省一件的钱。
+        # 不按件数算会出现「一件商品挂买一送一券 → 到手 ¥0」这种假得离谱的演示。
+        if cid == "C3":
+            qty = items[idx].quantity if idx < len(items) else 1
+            unit = (unit // 2) * qty
+        discount += unit
 
     wo_label = assignment.with_order.label if assignment.with_order else ""
 
