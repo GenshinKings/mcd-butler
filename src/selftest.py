@@ -2486,6 +2486,33 @@ def run() -> int:
         not _dead,
         f"指向不存在锚点的链接：{_dead}",
     )
+    # ── 相对链接必须真的点得到
+    # 上一轮把自用传播稿 docs/ 移出了仓库，README 却还留着 4 个指向它的链接：
+    # 本地全部点得开，远端全部 404 —— 因为那些文件根本没被推上去。
+    # 「存在但没被跟踪」是最阴的一种死链：作者永远发现不了，路人一点就空。
+    # 这里不调 git（自检要能在没装 git 的机器上跑），改成读 .gitignore：
+    # 凡是命中忽略规则的链接目标，一律算死链；文件不存在当然也算。
+    _gitignore = (_Path(__file__).resolve().parent.parent / ".gitignore").read_text(
+        encoding="utf-8"
+    )
+    _ignored = {
+        ln.strip().rstrip("/")
+        for ln in _gitignore.splitlines()
+        if ln.strip() and not ln.strip().startswith("#") and ln.strip().endswith("/")
+    }
+    _dead_rel = []
+    for _t in re.findall(r"\[[^\]]*\]\((?!https?://|#|mailto:)([^)\s]+)\)", _readme):
+        _p = _Path(__file__).resolve().parent.parent / _t
+        if not _p.exists():
+            _dead_rel.append(f"{_t}（文件不存在）")
+        elif _t.split("/")[0] in _ignored:
+            _dead_rel.append(f"{_t}（在 .gitignore 里，推上去就是 404）")
+    check(
+        "文档-README 里的相对链接必须真的点得到（不能指向没上传的文件）",
+        not _dead_rel,
+        f"点不到的链接：{_dead_rel}",
+    )
+
     # 徽章一个占一行的话，首屏 6 行就被彩色小图吃掉了。
     # banner 行 = 以 ! 或 [! 开头的行。
     _head_rows = [
