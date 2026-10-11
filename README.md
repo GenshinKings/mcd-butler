@@ -48,45 +48,28 @@ python -m src.cli demo
 
 | 你想干嘛 | 去这 | 大概几行 |
 |---|---|---|
-| 30 秒判断值不值得往下读 | [三行看完](#hook) → [离线演示长什么样](#demo) | 120 |
-| 装到我电脑上（含 Windows / macOS / Token） | [三分钟跑起来](#install) | 150 |
-| 查某个命令是什么意思 | [全部 16 个命令](#commands)（中文名 ←→ 命令名对照） | 25 |
-| 想知道真能省多少钱 | [真实账号实测](#realtest) · [省钱洞察](#insights) | 100 |
-| 确认它会不会偷我的东西 | [红线](#redline) | 8 |
-| 判断仓库是不是还活着 | [校验与开发](#verify)（CI / 238 项自检 / 83 处变异测试） | 55 |
-| 转发给朋友 | [传播素材](#promo)（三份稿子都是现成的） | 10 |
+| 30 秒判断值不值得往下读 | [三行看完](#hook) → [离线演示长什么样](#demo) | 67 |
+| 装到我电脑上（含 Windows / macOS / Token） | [三分钟跑起来](#install) | 98 |
+| 查某个命令是什么意思 | [全部 16 个命令](#commands)（中文名 ←→ 命令名对照） | 28 |
+| 想知道真能省多少钱 | [真实账号实测](#realtest) · [省钱洞察](#insights) | 160 |
+| 确认它会不会偷我的东西 | [红线](#redline) | 14 |
+| 判断仓库是不是还活着 | [校验与开发](#verify)（CI / 238 项自检 / 83 处变异测试） | 33 |
 
 不确定的话就顺着往下读 —— 顺序是按「最容易决定要不要走」排的。
 
 </details>
 
-<details>
-
-<summary><b>觉得有用？顺手点个 ⭐；想转发？文案已经写好了</b></summary>
-
-这个项目是给一个比赛做的，排名**只看 Star 数**。你点一下星，就是它唯一的成长方式。
-
-想发朋友圈 / 微信群 / CSDN，不用自己写，三份都写好了：
-
-- [`docs/promo.md`](docs/promo.md) —— 发朋友圈和群用的短版/长版文案、标题备选
-- [`docs/CSDN-麦当劳MCP实战.md`](docs/CSDN-麦当劳MCP实战.md) —— CSDN 长文
-- [`docs/微信公众号.md`](docs/微信公众号.md) —— 公众号稿
-
-</details>
+> ⭐ **觉得有用就点个星** —— 这个项目是给一个比赛做的，排名只看 Star 数，你点一下就是它唯一的成长方式。
 
 <details>
 
 <summary><b>怎么做到的（不想看算法可以跳过）</b></summary>
 
-把「券 ↔ 商品」建模成**二分匹配**，但算价接口是个黑盒 —— 它只回总价，不回导数，
-  
-没法直接求梯度。于是拿官方接口**当试价器**：贪心构造一个初始解，再用
-  
-换券 / 删券 / 换随单购档位三种邻域动作做局部搜索，在调用预算内收敛。
+把「券 ↔ 商品」建模成**二分匹配**。但算价接口是个黑盒（只回总价、不回导数），没法求梯度，
+于是拿官方接口**当试价器**：贪心构造初始解，再用换券 / 删券 / 换随单购档位三种邻域动作做局部搜索。
 
-「够不够好」不是嘴上说的。离线自检里拿**穷举最优**当标尺去量它：
-  
-80 组随机购物车，命中率 **94%**（`selftest` 里是一条硬性断言，阈值低于 0.85 就红）。
+「够不够好」不是嘴上说的：离线自检拿**穷举最优**当标尺，80 组随机购物车命中 **94%**
+（这是 `selftest` 里一条硬性断言，跌破 85% 就红）。
 
 </details>
 
@@ -136,6 +119,10 @@ python -m src.cli demo
 >   
 > 或者菜单上那个诱人的低价其实是条件价。
 
+<details>
+
+<summary><b>演示还有这两段：券包体检 / 活动日历</b></summary>
+
 **《券包体检》**——你手里每张券，在这家店到底值多少钱：
 
 ```
@@ -171,6 +158,7 @@ python -m src.cli demo
 ```
 
 > 只提示**今天吃不到的新活动**。今天就能买的东西劝你干等，那不叫建议，叫拖延。
+</details>
 
 真实门店（需 Token）跑 `advise` / `audit` / `campaign` / `almanac`，一次给你完整结论。
 
@@ -179,13 +167,8 @@ python -m src.cli demo
 <a id="install"></a>
 ## 三分钟跑起来
 
-零第三方依赖（只用 Python 标准库），需要 **Python 3.10 以上**。
-  
-（**不用 pip install 任何东西** —— 这是刻意的，clone 下来就能跑。
-  
-后面第 ② 步末尾有个 `pip install -e .`，那是**可选**的：不装也能用，装了只是多一个
-  
-`mcd-butler` 命令入口，让你在任何目录都能直接敲它。）
+零第三方依赖（只用 Python 标准库），需要 **Python 3.10 以上**。**不用 pip install 任何东西** —— clone 下来就能跑。
+第 ② 步末尾那个 `pip install -e .` 是**可选**的：不装也能用，装了只是多一个 `mcd-butler` 命令入口。
 
 **⓪ 先确认你有 Python**（没装过的先看这段）
 
@@ -194,12 +177,8 @@ python --version        # 应该打印 Python 3.10.x 或更高
 ```
 
 - 打印了版本号 → 跳过这一节，直接往下走
-- 提示「不是内部或外部命令」/ `command not found` → 去 <https://www.python.org/downloads/>
-    
-  下载安装包。**Windows 用户安装时务必勾选 `Add Python to PATH`**（安装界面最下面那个框），
-    
-  否则装完命令行还是找不到它。装完重开一个命令行窗口，再敲一次 `python --version` 确认。
-- 系统里是 `python3` 而不是 `python` → 把下面所有命令里的 `python` 换成 `python3` 即可
+- 提示「不是内部或外部命令」/ `command not found` → 去 <https://www.python.org/downloads/> 下载。**Windows 用户务必勾选 `Add Python to PATH`**（安装界面最下面那个框），否则装完命令行还是找不到它；装完重开一个窗口再确认一次。
+- 系统里是 `python3` 而不是 `python` → 把下面所有命令里的 `python` 换成 `python3`
 
 **① 拿到代码**（两种都行，挑你会的那个）
 
@@ -219,10 +198,7 @@ python -m src.cli demo        # 离线演示
 python -m src.cli selftest    # 离线自检，238 项，几秒跑完（全绿才算跑通）
 ```
 
-> ⚠️ 上面这些命令**必须在项目文件夹里执行**。
->   
-> 在其他目录会报 `No module named 'src'`——先 `cd` 进来就好了。
->
+> ⚠️ 上面这些命令**必须在项目文件夹里执行** —— 在其他目录会报 `No module named 'src'`，先 `cd` 进来就好了。
 > `selftest` 跑完如果**不是全绿**，把最后的红条发到 Issues —— 那是真 bug，不是你装坏了。
 
 想在任何目录都能用（可选，不装也不影响上面任何一步）：
@@ -262,12 +238,6 @@ set MCD_MCP_TOKEN=你的Token
 python -c "open('.env','w',encoding='utf-8').write('MCD_MCP_TOKEN=你的Token')"
 ```
 
-文件内容就一行：
-
-```
-MCD_MCP_TOKEN=你的Token
-```
-
 **这个 Token 能干什么、不能干什么**（很多人到这一步会犹豫，说清楚）：
 
 - ✅ **只能查询**：查附近门店、查菜单、查你卡包里的券、试算价格
@@ -290,17 +260,6 @@ python -m src.cli advise
 ```bash
 python -m src.cli almanac      # 今天宜吃什么、忌吃什么（每条都真算过价）
 python -m src.cli brag         # 我的麦门账本与段位（读本机快照，无需 Token）
-```
-
-有 Token 之后，想吃什么自己点：
-
-```bash
-python -m src.cli menu --filter 堡                      # 先看菜单
-python -m src.cli optimize --items "板烧鸡腿堡三件套,薯条x2,脆薯饼"
-python -m src.cli compare --items "板烧鸡腿堡三件套" --mode taxi  # 该去哪家店、值不值得跑
-python -m src.cli audit                                # 券包体检：每张券真实值多少钱
-python -m src.cli campaign                             # 活动日历：今天有什么活动、哪天有新品
-python -m src.cli meal --name 三件套                    # 这套餐能换成什么、换哪个更便宜
 ```
 
 <a id="commands"></a>
@@ -379,17 +338,9 @@ python -m src.cli meal --name 三件套                    # 这套餐能换成�
 >   
 > 那是最劝退的一种失败：不是工具算错，是它没把账摊开给你看。
 
-> 上面这段是 `python -m src.cli demo` 真实输出的**开头两段**（演示数据，不代表真实价格）。
->   
-> 完整跑完还有四段，比这长得多：麦门黄历（今天宜吃什么、忌吃什么）、
->   
-> 券包体检（每张券在这家店到底值多少钱、门槛在哪）、麦门活动日历（哪天有新品）、
->   
-> 麦门段位（能直接粘进朋友圈的账单卡片）。
->   
-> 截图由 `python scripts/render_terminal_svg.py` 从真实 stdout 渲染生成——
->   
-> 改了引擎输出就重跑一次，文档不会和代码脱节。
+> 上面是真实输出的开头两段（演示数据）。完整共六段；截图由
+> `python scripts/render_terminal_svg.py` 从真实 stdout 渲染 —— 改了引擎输出就重跑一次，
+> 文档不会和代码脱节。
 
 ---
 
@@ -444,7 +395,9 @@ python -m src.cli optimize --items "板烧鸡腿堡三件套,薯条x2,脆薯饼"
 
 ---
 
-## 为什么不是"挑一张最猛的券"
+<details>
+
+<summary><b>为什么不是「挑一张最猛的券」（算法细节，可跳过）</b></summary>
 
 麦当劳的 `calculate-price` 允许购物车里**每个商品各自挂一张券**。所以这个问题不是「选一张券」，而是一个**二分匹配**：
 
@@ -466,21 +419,7 @@ python -m src.cli optimize --items "板烧鸡腿堡三件套,薯条x2,脆薯饼"
 
 代码在 `src/coupon_engine.py`，求解器接受可注入的 `oracle`，因此离线演示能完整复现搜索过程。
 
----
-
-## 接真实账号
-
-```bash
-export MCD_MCP_TOKEN=<在 https://open.mcd.cn/mcp 激活得到的 Token>
-python -m src.cli optimize --city 上海 --keyword 人民广场
-python -m src.cli tools        # 列出官方暴露的全部 35 个工具
-```
-
-真实链路已实测跑通：定位门店 → 载入菜单（实测 68 项）→ 拉门店可用券 → 算价寻优。
-
-> 卡包为空时 `optimize` 会提示先领券，此时离线演示仍可正常查看。
-
-踩坑记录另见 [`FINDINGS.md`](./FINDINGS.md)。
+</details>
 
 ---
 
@@ -510,7 +449,11 @@ python -m src.cli optimize --no-insights                      # 跳过，快一�
 
 ---
 
-## 资产巡检：券的保质期比你想的短
+## 还有三件事顺手做了
+
+<details>
+
+<summary><b>① 券的保质期比你想的短</b></summary>
 
 ```bash
 python -m src.cli assets           # 只读，绝不领券
@@ -533,7 +476,6 @@ python -m src.cli assets --claim   # 显式加参数才真领（会写进你的�
   ...
 ```
 
-
 顺带一个真实的坑：领了 6 张券，但门店券池里**只剩 1 张能用** —— 其余是早餐/小食时段券，  
 在非早餐时段自动失效。这就是「券迷宫」的体感来源：你以为你有 6 张券，其实此刻能用的只有 1 张。
 
@@ -541,7 +483,11 @@ python -m src.cli assets --claim   # 显式加参数才真领（会写进你的�
 
 ---
 
-## 复刻上一单：这单变贵了还是变便宜了
+</details>
+
+<details>
+
+<summary><b>② 这单变贵了还是变便宜了</b></summary>
 
 ```bash
 python -m src.cli optimize                     # 跑完自动存快照
@@ -572,7 +518,11 @@ python -m src.cli replay --list                # 列出历史快照
 
 ---
 
-## 热量预算搭配
+</details>
+
+<details>
+
+<summary><b>③ 热量预算搭配</b></summary>
 
 ```bash
 python -m src.cli nutrition --kcal 600
@@ -600,6 +550,7 @@ python -m src.cli nutrition --kcal 600
 宁可少选也不能拿错数据给建议。
 
 ---
+</details>
 
 ## 麦门黄历：今天该吃什么，别吃什么
 
@@ -620,7 +571,9 @@ python -m src.cli almanac
 | 忌 · 条件价陷阱  | 菜单 `currentPrice` vs `originalPrice` 的真实差额 | 否（零成本）      |
 | 忌 · 无券可挂   | 该单品不在任何券的适用范围                              | 否           |
 
-几个必须说清楚的取舍：
+<details>
+
+<summary><b>几个必须说清楚的取舍</b></summary>
 
 - **时段先说在前头**：麦当劳大量券是时段券（早餐/夜宵），
     
@@ -636,6 +589,7 @@ python -m src.cli almanac
     
   宁可少给，也不拿原价凑成一条「忌」。
 - **临期券单独喊出来**：今天/明天到期的券会被点名，作废比花错更可惜。
+</details>
 
 ---
 
@@ -659,12 +613,8 @@ python -m src.cli brag        # 读本机快照，不联网、不需要 Token
   经手单数：14 单
 ```
 
-段位共 7 档（麦门路人 → 学徒 → 信徒 → 执事 → 主教 → 大主教 → 麦门永存），
-  
-按**累计真实节省**晋升，数据全部来自本机快照 `~/.mcd-butler/`，
-  
-不联网、不上传 —— 一个省钱工具去上传你的消费记录，那才是真离谱。
-
+段位共 7 档（麦门路人 → 学徒 → 信徒 → 执事 → 主教 → 大主教 → 麦门永存），按**累计真实节省**晋升。
+数据全部来自本机快照 `~/.mcd-butler/`，不联网、不上传 —— 一个省钱工具去上传你的消费记录，那才是真离谱。
 卡片是纯文本的，可以直接粘进朋友圈和群里。**省钱这件事，能跟朋友说的那一刻才有快感。**
 
 ---
@@ -693,7 +643,9 @@ python -m src.cli compare --mode taxi --wage 60        # 打车 + 把等待折�
 ⚠️ 提醒：这趟路费 ¥14.72 ≥ 券省下的 ¥2.00，等于白跑 —— 除非你本来就要出门。
 ```
 
-几个设计取舍：
+<details>
+
+<summary><b>几个设计取舍</b></summary>
 
 - **距离是真值，不是估算**：`query-nearby-stores` 实测返回 `distance`（米），  
   到店门店和得来速都有。路程模型只负责把米换算成分钟和钱。
@@ -705,6 +657,7 @@ python -m src.cli compare --mode taxi --wage 60        # 打车 + 把等待折�
   不给就只按真金白银排 —— 工具不该替用户决定 15 分钟值多少钱。
 - **只做到店**：外卖（麦乐送）的价格与配送费目前取不到真值，暂不纳入，  
   也不做估算 —— 宁可少一块功能，也不拿假数字冒充。
+</details>
 
 ---
 
@@ -718,7 +671,9 @@ python -m src.cli compare --mode taxi --wage 60        # 打车 + 把等待折�
 
 ---
 
-## 路线图
+<details>
+
+<summary><b>路线图：做完的 18 项、还没做的 3 项</b></summary>
 
 - [x] MCP 客户端与真实链路打通
 - [x] 券价最优组合引擎（贪心 + 局部搜索）
@@ -731,7 +686,7 @@ python -m src.cli compare --mode taxi --wage 60        # 打车 + 把等待折�
 - [x] 省钱洞察：真实成本 / 冗余券检测 / 拆单建议
 - [x] 一键顾问 `advise`（到期提醒 + 最优一单 + 洞察）
 - [x] 离线自检 `selftest`（238 项，覆盖三种返回体格式、接口异常结构守卫、匹配回归、路程模型、黄历与段位、随单购 payload、抖动不降级、体检与活动日历解析、餐品详情换项差价、传输层错误归类与退避、演示与 README 的一致性）
-- [x] 变异测试 `scripts/mutate.py`：故意把 76 处核心逻辑改坏，自检必须逐条翻红（自检全绿不等于自检有效）
+- [x] 变异测试 `scripts/mutate.py`：故意把 83 处核心逻辑改坏，自检必须逐条翻红（自检全绿不等于自检有效）
 - [x] 多门店比价 + 路程性价比 `compare`（距离取接口 `distance` 真值）
 - [x] 麦门黄历 `almanac`（每条宜忌都真打过算价，含条件价陷阱与时段判定）
 - [x] 麦门段位与可晒账单 `brag`（读本机快照，不联网）
@@ -741,12 +696,13 @@ python -m src.cli compare --mode taxi --wage 60        # 打车 + 把等待折�
 - [ ] 定时领券（配合系统 cron / 计划任务）
 - [ ] 外卖（麦乐送）测算：需 `delivery-query-addresses` 有收货地址才能取真值
 - [ ] 麦金卡权益雷达：活动规则变动解读
+</details>
 
 ---
 
----
+<details>
 
-## 代码地图
+<summary><b>代码地图：想改代码从哪个文件下手</b></summary>
 
 ```
 src/
@@ -772,7 +728,7 @@ src/
 FINDINGS.md          35 个工具实测避坑笔记 ← 调麦当劳 MCP 前建议先看
 MCP_INTEGRATION.md   使用的 MCP Server、Tool、调用流程与业务价值
 ```
-
+</details>
 
 <a id="verify"></a>
 ## 校验与开发
@@ -785,7 +741,7 @@ python -m src.cli selftest            # 238 项离线自检，几秒
 python -m src.cli selftest --twice    # 连跑两轮并比对断言总数（证明自检本身可重入）
 python -m src.cli demo                # 离线演示，这是路人的第一印象
 python scripts/smoke.py               # 编译 / 3.10 兼容 / 自检 / 演示 / 16 个命令 --help / 四种代码页
-python scripts/mutate.py              # 变异测试：改坏 76 处核心逻辑，自检必须翻红
+python scripts/mutate.py              # 变异测试：改坏 83 处核心逻辑，自检必须翻红
 ```
 
 <details>
@@ -807,14 +763,9 @@ CI **刻意不调麦当劳接口**：Token 走 secret 会把真实账号暴露�
 </details>
 
 `mutate.py` 是这个项目最不一样的一条约束：**自检全绿不能证明自检有效。**
-  
-第一轮把 60 处核心逻辑逐个改坏，其中 33 处改坏后自检依然全绿 —— 那些断言守的是运气，
-  
-不是行为。补完断言后又自造了 10 处新变异，其中 8 处照样毫无反应；
-  
-把「改坏 → 跑自检 → 数变红条数」固化成一条命令之后，这 76 处变异才做到
-  
-每一处都至少有一条断言跟着翻红。
+第一轮把 60 处核心逻辑逐个改坏，其中 **33 处改坏后自检依然全绿** —— 那些断言守的是运气，不是行为。
+后来又自造 10 处新变异，8 处照样毫无反应。直到把「改坏 → 跑自检 → 数变红条数」固化成一条命令，
+这 83 处变异才做到每一处都至少有一条断言跟着翻红。
 
 两条从这条约束里长出来的做法，值得单独说：
 
@@ -839,16 +790,6 @@ CI **刻意不调麦当劳接口**：Token 走 secret 会把真实账号暴露�
 也别用它做付费代下单那类生意 —— 原因写在 [红线](#redline) 里。
 
 ---
-
-<a id="promo"></a>
-## 传播素材
-
-写好了，直接拿去用（不用改署名，链接带上就行）：
-
-- [`docs/promo.md`](docs/promo.md) —— 标题备选、开场痛点、短版/长版传播稿
-- [`docs/CSDN-麦当劳MCP实战.md`](docs/CSDN-麦当劳MCP实战.md) —— CSDN 成稿（35 个工具实测 + 避坑清单）
-- [`docs/微信公众号.md`](docs/微信公众号.md) —— 公众号成稿
-- `python -m src.cli brag --with-link` —— 生成一张可直接粘贴的晒单卡片（带仓库链接）
 
 ## 参赛
 

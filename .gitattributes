@@ -1,0 +1,3 @@
+# 一律 LF。Windows 上 pathlib.write_text 默认会把 \n 写成 \r\n，
+# scripts/mutate.py 每跑一遍就污染一次全仓库，满屏 git diff 会淹掉真正的改动。
+* text=auto eol=lf

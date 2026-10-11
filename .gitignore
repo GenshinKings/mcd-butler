@@ -27,3 +27,6 @@ mcd_butler.egg-info/
 
 # 提交信息暂存文件（含内部评审措辞，不进仓库）
 .commitmsg.txt
+
+# 自用传播稿（朋友圈/公众号/CSDN 成稿），不随仓库公开
+docs/

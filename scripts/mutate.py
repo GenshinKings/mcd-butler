@@ -42,7 +42,7 @@ _BACKUPS: dict[pathlib.Path, str] = {}
 def _restore_all() -> None:
     for path, text in list(_BACKUPS.items()):
         try:
-            path.write_text(text, encoding="utf-8")
+            path.write_text(text, encoding="utf-8", newline="\n")
         except OSError:
             pass
     _BACKUPS.clear()
@@ -625,10 +625,12 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
         True,
     ),
     (
+        # 只改链接、不碰行尾数字：导航表那列「大概几行」每次压缩 README 都会变，
+        # 把数字写进 old 会让这条变异在下一轮排版调整后静默失效（S3 已经跳过一次了）。
         "S3-导航表出现死链（改了锚点忘了改跳过去的链接）",
         "README.md",
-        "| 查某个命令是什么意思 | [全部 16 个命令](#commands)（中文名 ←→ 命令名对照） | 25 |",
-        "| 查某个命令是什么意思 | [全部 16 个命令](#command-list)（中文名 ←→ 命令名对照） | 25 |",
+        "](#commands)（中文名 ←→ 命令名对照）",
+        "](#command-list)（中文名 ←→ 命令名对照）",
         True,
     ),
     (
@@ -641,8 +643,8 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
     (
         "S5-代码地图改回名不符实的「目录」",
         "README.md",
-        "## 代码地图",
-        "## 目录",
+        "<summary><b>代码地图：想改代码从哪个文件下手</b></summary>",
+        "<summary><b>目录：想改代码从哪个文件下手</b></summary>",
         True,
     ),
     (
@@ -719,10 +721,12 @@ def main() -> int:
             continue
         _BACKUPS[path] = original
         try:
-            path.write_text(original.replace(old, new, 1), encoding="utf-8")
+            path.write_text(
+                original.replace(old, new, 1), encoding="utf-8", newline="\n"
+            )
             passed, total, rc = run_selftest()
         finally:
-            path.write_text(original, encoding="utf-8")
+            path.write_text(original, encoding="utf-8", newline="\n")
             _BACKUPS.pop(path, None)
 
         if total <= 0:
