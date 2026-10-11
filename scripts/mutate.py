@@ -197,6 +197,20 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
         False,
     ),
     (
+        "演示券名改掉（README 贴的数字会失效）",
+        "demo_data.py",
+        '"安格斯厚牛堡立减 8 元"',
+        '"安格斯厚牛堡立减 6 元"',
+        False,
+    ),
+    (
+        "README 删掉一段演示输出",
+        "README.md",
+        "挂券后小计 ¥42.00",
+        "（这一行被删掉了）",
+        True,
+    ),
+    (
         "演示券写死过期日期",
         "demo_data.py",
         "_DEMO_WITH_ORDER_DISCOUNT = {\"\": 0, \"麦金卡（随单购）\": 600}",
@@ -246,7 +260,8 @@ def main() -> int:
     print(f"{'变异':<38} {'变红':>4}  判定")
     print("-" * 62)
     for name, rel, old, new, _q in mutations:
-        path = SRC / rel
+        # src/ 下的文件写相对名即可，根目录文件（README）写全名
+        path = (SRC / rel) if (SRC / rel).is_file() else (ROOT / rel)
         original = path.read_text(encoding="utf-8")
         if old not in original:
             print(f"{name:<38} {'—':>4}  跳过（原文已变，需更新 mutate.py）")

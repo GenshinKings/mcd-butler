@@ -1859,6 +1859,53 @@ def run() -> int:
         all(set(c.product_codes) <= _menu_codes for c in demo.DEMO_COUPONS),
     )
 
+    # ── 16. README 里贴的演示输出，必须跟真的 demo 对得上。
+    # 「照着文档跑，跑出不一样的东西」是最劝退的一种失败 ——
+    # 读者第一反应是"我是不是跑错了"，而不是"文档过期了"。
+    # 这里双向比对：这些句子既要在真实 demo 输出里，也要在 README 里。
+    import contextlib as _ctx2
+    import io as _io4
+
+    from .cli import run_demo
+
+    _buf = _io4.StringIO()
+    with _ctx2.redirect_stdout(_buf):
+        _demo_rc = run_demo()
+    _demo_out = _buf.getvalue()
+    check("演示-离线演示能跑完且正常退出", _demo_rc == 0, f"rc={_demo_rc}")
+
+    _readme = (_Path(__file__).resolve().parent.parent / "README.md").read_text(
+        encoding="utf-8"
+    )
+    _must_appear = [
+        "挂券后小计 ¥42.00",
+        "随单购「麦金卡（随单购）」再减 ¥6.00",
+        "到手 ¥6.00（省 ¥6.00，力度 50%）",
+        "菜单标 ¥62.90 是「随单购麦金卡优惠」",
+        "标着减 ¥8.00，实测只省 ¥5.00",
+        "¥10.00 的商品上不生效，¥25.00 的才生效",
+    ]
+    _missing_demo = [s for s in _must_appear if s not in _demo_out]
+    _missing_doc = [s for s in _must_appear if s not in _readme]
+    check(
+        "文档-README 贴的演示输出必须是真的（不是手改过的）",
+        not _missing_demo,
+        f"demo 里没有：{_missing_demo}",
+    )
+    check(
+        "文档-README 没漏掉演示的关键数字",
+        not _missing_doc,
+        f"README 里没有：{_missing_doc}",
+    )
+
+    # ── 17. 演示里不能出现「今天」之类跟真实日期打架的话
+    # （黄历标题会印日期，必须等于 date.today()）
+    check(
+        "演示-黄历标题印的是真今天，不是写死的日期",
+        f"{_date.today().isoformat()}" in _demo_out,
+        "README/demo 与真时钟脱节了",
+    )
+
     # ---------------------------------------------------------------- 输出
     passed = sum(1 for _, ok, _ in _RESULTS if ok)
     total = len(_RESULTS)
