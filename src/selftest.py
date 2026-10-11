@@ -471,6 +471,55 @@ def run() -> int:
         _parse_coupons({"a": 1}) == [] and _parse_coupons(None) == [] and _parse_coupons("x") == [],
     )
 
+    # 18. 路程性价比模型：把「省下的钱」和「跑一趟的成本」放进同一量纲。
+    # 距离来自接口真实 distance（单位米），这里是换算逻辑本身的回归。
+    from .route import MODES, OVERHEAD_MIN, StoreQuote, rank_stores, travel_cost, yuan_to_fen
+
+    # 元→分必须用 round，否则 14.0*100 会被浮点误差砍成 1399（老 bug）
+    check("金额-元转分不截断", yuan_to_fen(14.0) == 1400 and yuan_to_fen(0.07) == 7)
+
+    tw = travel_cost(144, "walk")  # 真实门店距离 144 米
+    check(
+        "路程-步行往返与耗时",
+        tw.round_meters == 288 and tw.minutes == 9 and tw.money_fen == 0,
+        f"往返{tw.round_meters}m/{tw.minutes}分",
+    )
+    tx = travel_cost(144, "taxi")
+    check(
+        "路程-打车起步价+里程",
+        tx.money_fen == 1472,  # 起步 1400 + 0.288km × 250
+        f"{tx.money_fen} 分",
+    )
+    txw = travel_cost(144, "taxi", wage_per_hour=60)
+    check(
+        "路程-时薪折算时间成本",
+        txw.time_money_fen == 600 and txw.total_fen == 2072,  # 6 分钟 × ¥60/h = ¥6
+        f"{txw.time_money_fen} 分",
+    )
+    check(
+        "路程-覆盖每公里价",
+        travel_cost(1000, "walk", yuan_per_km=3).money_fen == 600,  # 往返 2km × ¥3
+    )
+    check("路程-未知方式回退到步行", travel_cost(1000, "飞船").minutes == travel_cost(1000, "walk").minutes)
+    check("路程-固定开销存在", OVERHEAD_MIN > 0 and MODES["bus"].base_fen == 200)
+
+    # 缺货的店不能跟齐全的比 —— 必须沉到最后，否则是拿不同的东西比价
+    # 关键场景：远店东西更便宜（¥35 < ¥36.80），但打车路费高得多。
+    # 加起来反而更贵 —— 这正是「只比价格」会选错、必须算路程的理由。
+    q_ok = StoreQuote("A", "近店", distance_m=144, paid_fen=3680, baseline_fen=3880,
+                      travel=travel_cost(144, "taxi"))
+    q_far = StoreQuote("B", "远店", distance_m=3000, paid_fen=3500, baseline_fen=3880,
+                       travel=travel_cost(3000, "taxi"))
+    q_miss = StoreQuote("C", "缺货店", distance_m=10, missing=("麦咖啡™美式",))
+    ranked = rank_stores([q_far, q_miss, q_ok])
+    check("比价-缺货店不参与排序", ranked[-1].store_code == "C")
+    check(
+        "比价-便宜但远的店会因路费落败",
+        [q.store_code for q in ranked[:2]] == ["A", "B"],
+        f"近店¥{q_ok.total_fen / 100:.2f} vs 远店¥{q_far.total_fen / 100:.2f}",
+    )
+    check("比价-真实节省计算", q_ok.saved_fen == 200 and q_ok.total_fen == 5152)
+
     # ---------------------------------------------------------------- 输出
     passed = sum(1 for _, ok, _ in _RESULTS if ok)
     total = len(_RESULTS)

@@ -40,7 +40,7 @@
 git clone https://github.com/GenshinKings/mcd-butler.git
 cd mcd-butler
 python -m src.cli demo        # 离线演示，无需 Token
-python -m src.cli selftest    # 离线自检，50 项，几秒跑完
+python -m src.cli selftest    # 离线自检，60 项，几秒跑完
 ```
 
 零第三方依赖（只用标准库），Python 3.10+。
@@ -58,6 +58,7 @@ python -m src.cli advise
 ```bash
 python -m src.cli menu --filter 堡                      # 先看菜单
 python -m src.cli optimize --items "板烧鸡腿堡三件套,薯条x2,脆薯饼"
+python -m src.cli compare --items "板烧鸡腿堡三件套" --mode taxi  # 该去哪家店、值不值得跑
 ```
 
 ---
@@ -306,6 +307,46 @@ python -m src.cli nutrition --kcal 600
 
 ---
 
+## 该不该跑这一趟：多门店比价 + 路程性价比
+
+券引擎只回答「这单最省几块」，它默认**去这家店是免费的**。
+现实里不是：门店离你 144 米和 3 公里，是两种完全不同的决策。
+
+```bash
+python -m src.cli compare --items "龙焰鸡腿堡三件套,美式" --top 3
+python -m src.cli compare --mode taxi --wage 60        # 打车 + 把等待折算成钱
+python -m src.cli compare --delivery-total 45          # 把 App 里的外卖合计填进来做对照
+```
+
+真实输出（上海人民广场，接口返回的 `distance` 为真值）：
+
+```
+出行方式：打车（400 米/分，起步 ¥14.00，每公里 ¥2.50，另计 5 分钟进出店开销）
+
+门店                              距离      来回       到手价       路费        综合
+麦当劳上海黄浦华旭国际大厦餐厅      144m      6分    36.80   14.72    57.52
+麦当劳上海福州路餐厅               235m      6分    36.80   15.18    57.98
+麦当劳上海食品一店餐厅             355m      7分    36.80   15.78    59.58
+
+综合算下来去「麦当劳上海黄浦华旭国际大厦餐厅」最划算。
+⚠️ 提醒：这趟路费 ¥14.72 ≥ 券省下的 ¥2.00，等于白跑 —— 除非你本来就要出门。
+外卖合计 ¥45.00 比到店的 ¥57.52 还便宜，这单建议点外卖。
+```
+
+几个设计取舍：
+
+- **距离是真值，不是估算**：`query-nearby-stores` 实测返回 `distance`（米），
+  到店门店和得来速都有。路程模型只负责把米换算成分钟和钱。
+- **缺货的店不参与排序**：拿「有货的店」和「缺货的店」比价是不公平比较，
+  缺货店单独列出但不进入排名。
+- **时间值不值钱由你决定**：`--wage` 给了才把等待折成钱，
+  不给就只按真金白银排 —— 工具不该替用户决定 15 分钟值多少钱。
+- **外卖不编造**：麦乐送要另走 `delivery-query-addresses` → `delivery-query-stores`，
+  而这个账号常常一个收货地址都没存（实测返回空），价格与配送费取不到真值。
+  取不到就明说，并留 `--delivery-total` 让你把 App 里的合计填进来做人工对照。
+
+---
+
 ## 目录
 
 ```
@@ -317,10 +358,11 @@ src/
   snapshot.py        本地订单快照（~/.mcd-butler/，不进仓库）
   nutrition.py       热量预算搭配（解析类 CSV 营养表）
   insights.py        省钱洞察：真实成本 / 冗余券 / 拆单建议
+  route.py           路程性价比模型：距离 → 时间 + 钱，多门店比价排序
   selftest.py        离线自检（真实报文 fixture，无需 Token）
   cli.py             命令行入口
 
-命令：demo / selftest / tools / advise / menu / optimize / assets / nutrition / replay
+命令：demo / selftest / tools / advise / menu / optimize / compare / assets / nutrition / replay
 
 FINDINGS.md          35 个工具实测避坑笔记 ← 调麦当劳 MCP 前建议先看
 MCP_INTEGRATION.md   使用的 MCP Server、Tool、调用流程与业务价值
@@ -349,9 +391,10 @@ MCP_INTEGRATION.md   使用的 MCP Server、Tool、调用流程与业务价值
 - [x] 自选购物车（`--items`，支持数量）与菜单浏览（`menu`）
 - [x] 省钱洞察：真实成本 / 冗余券检测 / 拆单建议
 - [x] 一键顾问 `advise`（到期提醒 + 最优一单 + 洞察）
-- [x] 离线自检 `selftest`（50 项，覆盖三种返回体格式、接口异常结构守卫与匹配回归）
+- [x] 离线自检 `selftest`（60 项，覆盖三种返回体格式、接口异常结构守卫、匹配回归与路程模型）
+- [x] 多门店比价 + 路程性价比 `compare`（距离取接口 `distance` 真值）
 - [ ] 定时领券（配合系统 cron / 计划任务）
-- [ ] 多门店比价：同一单在不同门店的最优价对比
+- [ ] 麦乐送自动测算（当前账号无收货地址，取不到真值，暂用 `--delivery-total` 人工对照）
 - [ ] 麦金卡权益雷达：活动规则变动解读
 
 ---

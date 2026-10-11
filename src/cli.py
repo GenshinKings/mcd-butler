@@ -395,10 +395,9 @@ def run_optimize(
 
     shared = Budget(budget)
     optimizer = CouponOptimizer(oracle, max_calls=budget, budget=shared)
-    # 裸买基准先算（占 1 次调用），否则 optimize 吃光预算后这里拿到 None 会崩溃
-    baseline = optimizer.try_evaluate(cart, Assignment(mapping={}, with_order=None))
-    if baseline is None:
-        raise BudgetExhausted("预算不足以计算裸买基准，请调大 --budget")
+    # 裸买基准用 evaluate 直接算：预算耗尽抛 BudgetExhausted、网络错抛 McpError，
+    # 不被 try_evaluate 把瞬时抖动误判成「预算不足」而误导用户调大 --budget。
+    baseline = optimizer.evaluate(cart, Assignment(mapping={}, with_order=None))
     best = optimizer.optimize(cart, coupons, _with_order_options(cart))
     if best.price is None:
         raise BudgetExhausted("没能算出任何价格")
@@ -440,6 +439,241 @@ def run_optimize(
         except OSError as exc:
             # 快照只是锦上添花：写盘失败（权限/磁盘满）绝不该让已算完的结果崩掉。
             print(f"\n（快照保存失败，不影响本次结果：{exc}）")
+    return 0
+
+
+def run_compare(
+    city: str,
+    keyword: str,
+    items: str,
+    budget: int,
+    mode: str,
+    yuan_per_km: float | None,
+    wage: float | None,
+    top: int,
+    delivery_total: float | None,
+) -> int:
+    """多门店比价 + 路程性价比：这单到底该去哪家店、值不值得跑这一趟。
+
+    为什么需要这个命令
+    ------------------
+    券引擎只回答「这单最省几块」，它默认**去这家店是免费的**。
+    现实里 144 米和 6.7 公里是两种完全不同的决策：
+    省下 ¥5 但要走 20 分钟，对很多人来说并不划算。
+
+    所以这里把接口真实返回的 `distance` 换算成时间和钱，
+    让「优惠」和「路程」在同一个量纲上比 —— 这才是完整的一笔账。
+
+    关于外卖
+    --------
+    麦乐送要另走 `delivery-query-addresses` → `delivery-query-stores`，
+    而这个账号常常一个收货地址都没存（实测返回空），价格与配送费取不到真值。
+    所以这里**不编造外卖价**：取不到就明说，并提供 `--delivery-total`
+    让你把 App 里看到的外卖合计填进来做人工对照。
+    """
+    from dataclasses import replace
+
+    from .mcd_client import McdMcpClient
+    from .route import (
+        MODES,
+        OVERHEAD_MIN,
+        StoreQuote,
+        rank_stores,
+        travel_cost,
+        verdict,
+        yuan_to_fen,
+    )
+
+    client = McdMcpClient()
+    client.initialize()
+
+    stores = client.data(
+        "query-nearby-stores", {"beType": 1, "searchType": 2, "city": city, "keyword": keyword}
+    )
+    if not isinstance(stores, list) or not stores:
+        print("未找到门店，请换一个城市/关键词。")
+        return 1
+    stores = [s for s in stores if isinstance(s, dict) and s.get("storeCode")]
+    # distance 是接口真实返回的（米）；个别门店可能没有该字段，排到最后
+    stores.sort(
+        key=lambda s: s.get("distance")
+        if isinstance(s.get("distance"), (int, float))
+        else 10**9
+    )
+    if top > 0:
+        stores = stores[:top]
+    if not stores:
+        print("附近没有可用门店。")
+        return 1
+
+    print(f"定位 {city} / {keyword}：取附近 {len(stores)} 家门店参与比价")
+    print("（距离取接口返回的 distance 字段，单位米 —— 真实值，不是估算）")
+
+    # 用最近的店把「想吃什么」解析成商品编码，后面各家按同一组编码对齐，
+    # 否则各家菜单品名不一致会导致比价失真。
+    first_code = str(stores[0]["storeCode"])
+    menu0 = _parse_menu(
+        client.data("query-meals", {"storeCode": first_code, "orderType": 1, "beType": 1})
+    )
+    coupons0 = _parse_coupons(
+        client.data("query-store-coupons", {"storeCode": first_code, "orderType": 1, "beType": 1})
+    )
+    tokens = [t.strip() for t in items.split(",") if t.strip()] if items else []
+    if tokens:
+        cart0, missed = _pick_cart(menu0, tokens, coupons0)
+        if missed:
+            print("\n⚠️ 这些在最近的店里没找到，已跳过：")
+            for m in missed:
+                print(f"  - {m}")
+    else:
+        cart0 = _build_cart(menu0, coupons0)
+
+    wants: list[tuple[str, int, str]] = [
+        (it.product_code, it.quantity, it.name or it.product_code) for it in cart0
+    ]
+    if not wants:
+        print("购物车为空，无法比价。")
+        return 1
+    print(f"\n比价标的（在最近的店解析，各家按同一组编码对齐）：")
+    print("  " + "、".join(n for _, _, n in wants))
+
+    shared = Budget(budget)
+    quotes: list[StoreQuote] = []
+
+    for st in stores:
+        code = str(st.get("storeCode", ""))
+        dist_raw = st.get("distance")
+        dist = int(dist_raw) if isinstance(dist_raw, (int, float)) else 0
+        is_first = code == first_code
+        menu = menu0 if is_first else _parse_menu(
+            client.data("query-meals", {"storeCode": code, "orderType": 1, "beType": 1})
+        )
+        coupons = coupons0 if is_first else _parse_coupons(
+            client.data("query-store-coupons", {"storeCode": code, "orderType": 1, "beType": 1})
+        )
+        by_code = {i.product_code: i for i in menu}
+        cart: list[CartItem] = []
+        missing: list[str] = []
+        for pc, qty, name in wants:
+            base = by_code.get(pc)
+            if base is None:
+                missing.append(name)
+                continue
+            cart.append(replace(base, quantity=qty))
+
+        if missing:
+            # 缺货的店不能跟齐全的比，那是不公平比较 —— 记下来但不参与排序
+            quotes.append(
+                StoreQuote(
+                    store_code=code,
+                    store_name=st.get("storeName", ""),
+                    address=st.get("address", ""),
+                    distance_m=dist,
+                    travel=travel_cost(dist, mode, yuan_per_km, wage),
+                    missing=tuple(missing),
+                )
+            )
+            continue
+
+        if shared.remaining <= 0:
+            print(f"\n（已达 --budget {budget} 上限，「{st.get('storeName', '')}」及之后未测算）")
+            break
+
+        def oracle(items_, assignment, _code=code, _coupons=coupons):
+            payload_items = []
+            for idx, item in enumerate(items_):
+                entry = {"productCode": item.product_code, "quantity": item.quantity}
+                ci = assignment.mapping.get(idx)
+                if ci is not None:
+                    entry["couponId"] = _coupons[ci].coupon_id
+                    entry["couponCode"] = _coupons[ci].coupon_code
+                payload_items.append(entry)
+            payload: dict = {
+                "storeCode": _code,
+                "orderType": 1,
+                "beType": 1,
+                "items": payload_items,
+            }
+            if isinstance(assignment.with_order, dict):
+                payload["withOrder"] = assignment.with_order.payload
+            data = client.data("calculate-price", payload)
+            return PriceResult(
+                price_fen=int(data.get("price", 0)),
+                original_fen=int(data.get("originalPrice", 0)),
+                discount_fen=int(data.get("discount", 0)),
+                delivery_fen=int(data.get("deliveryPrice", 0)),
+                packing_fen=int(data.get("packingPrice", 0)),
+            )
+
+        optimizer = CouponOptimizer(oracle, max_calls=budget, budget=shared)
+        try:
+            baseline = optimizer.evaluate(cart, Assignment(mapping={}, with_order=None))
+            best = optimizer.optimize(cart, coupons, _with_order_options(cart))
+        except BudgetExhausted:
+            print(f"\n（预算用完，「{st.get('storeName', '')}」及之后未测算）")
+            break
+        if best.price is None:
+            continue
+        quotes.append(
+            StoreQuote(
+                store_code=code,
+                store_name=st.get("storeName", ""),
+                address=st.get("address", ""),
+                distance_m=dist,
+                paid_fen=best.price.price_fen,
+                baseline_fen=baseline.price_fen,
+                travel=travel_cost(dist, mode, yuan_per_km, wage),
+            )
+        )
+
+    if not quotes:
+        print("一家店都没算出来，调大 --budget 再试。")
+        return 1
+
+    ranked = rank_stores(quotes)
+    tm = MODES.get(mode, MODES["walk"])
+    print(
+        f"\n出行方式：{tm.label}（{tm.speed_m_per_min} 米/分，"
+        f"起步 ¥{tm.base_fen / 100:.2f}，每公里 ¥{tm.per_km_fen / 100:.2f}，"
+        f"另计 {OVERHEAD_MIN} 分钟进出店开销）"
+    )
+    if wage:
+        print(f"时间成本：按时薪 ¥{wage:.0f}/小时把等待也折算成钱")
+
+    print("\n" + "-" * 80)
+    print(f"{'门店':<26}{'距离':>8}{'来回':>8}{'到手价':>10}{'路费':>9}{'综合':>10}")
+    print("-" * 80)
+    for q in ranked:
+        if not q.comparable:
+            print(
+                f"{q.store_name[:24]:<26}{q.distance_m:>7}m{'—':>8}"
+                f"{'缺货':>10}{'—':>9}{'不参与':>10}"
+            )
+            print(f"    缺少：{'、'.join(q.missing)}")
+            continue
+        print(
+            f"{q.store_name[:24]:<26}{q.distance_m:>7}m{q.travel.minutes:>7}分"
+            f"{q.paid_fen / 100:>9.2f}{q.travel.money_fen / 100:>8.2f}{q.total_fen / 100:>9.2f}"
+        )
+    print("-" * 80)
+
+    delivery_fen = yuan_to_fen(delivery_total) if delivery_total is not None else None
+    print()
+    print(verdict(ranked, delivery_fen))
+
+    if delivery_fen is None:
+        # 取不到真值就明说，绝不用猜的数字冒充"外卖价"
+        n = -1
+        try:
+            addrs = client.data("delivery-query-addresses", {})
+            n = len((addrs or {}).get("addresses") or []) if isinstance(addrs, dict) else 0
+        except Exception:
+            pass
+        if n == 0:
+            print("\n（你的账号没有保存收货地址，麦乐送的价格和配送费取不到真值，")
+            print("  所以没有外卖对照。要比就把 App 里的外卖合计填进来：")
+            print("  --delivery-total 42.5）")
+    print(f"\n算价接口共调用 {shared.used} 次（上限 {budget}）")
     return 0
 
 
@@ -1002,6 +1236,31 @@ def main(argv: list[str] | None = None) -> int:
     p_rep.add_argument("--store", default=None, help="指定门店编码，默认用最近快照")
     p_rep.add_argument("--list", action="store_true", help="只列出本地快照")
 
+    p_cmp = sub.add_parser("compare", help="多门店比价 + 路程性价比（该不该跑这一趟）")
+    p_cmp.add_argument("--city", default=city_default)
+    p_cmp.add_argument("--keyword", default=kw_default)
+    p_cmp.add_argument("--budget", type=int, default=60, help="算价接口调用上限")
+    p_cmp.add_argument(
+        "--items",
+        default="",
+        help="指定想吃什么，逗号分隔，可带数量；留空则自动挑选",
+    )
+    p_cmp.add_argument(
+        "--mode",
+        default="walk",
+        choices=sorted(["walk", "bike", "bus", "taxi"]),
+        help="出行方式：walk 步行 / bike 骑行 / bus 公交地铁 / taxi 打车",
+    )
+    p_cmp.add_argument("--yuan-per-km", type=float, default=None, help="覆盖每公里路费（元）")
+    p_cmp.add_argument("--wage", type=float, default=None, help="时薪（元/小时），把等待时间也折算成钱")
+    p_cmp.add_argument("--top", type=int, default=3, help="最多比几家店")
+    p_cmp.add_argument(
+        "--delivery-total",
+        type=float,
+        default=None,
+        help="外卖合计（元，含配送费），从 App 里抄来做对照",
+    )
+
     p_nut = sub.add_parser("nutrition", help="热量预算搭配")
     p_nut.add_argument("--city", default=city_default)
     p_nut.add_argument("--keyword", default=kw_default)
@@ -1049,6 +1308,18 @@ def _dispatch(args) -> int:
         return run_assets(args.claim)
     if args.cmd == "replay":
         return run_replay(args.store, args.list)
+    if args.cmd == "compare":
+        return run_compare(
+            args.city,
+            args.keyword,
+            args.items,
+            args.budget,
+            args.mode,
+            args.yuan_per_km,
+            args.wage,
+            args.top,
+            args.delivery_total,
+        )
     if args.cmd == "nutrition":
         return run_nutrition(args.city, args.keyword, args.kcal, args.size)
     if args.cmd == "optimize":
