@@ -152,8 +152,8 @@ def rank_stores(quotes: list[StoreQuote]) -> list[StoreQuote]:
     )
 
 
-def verdict(quotes: list[StoreQuote], delivery_fen: int | None = None) -> str:
-    """给一句人话结论：到底该不该跑、该跑哪家、外卖划不划算。"""
+def verdict(quotes: list[StoreQuote]) -> str:
+    """给一句人话结论：到底该不该跑这一趟、该去哪家店。"""
     good = [q for q in quotes if q.comparable]
     if not good:
         return "没有一家店能凑齐你要的东西，换个关键词试试。"
@@ -182,6 +182,15 @@ def verdict(quotes: list[StoreQuote], delivery_fen: int | None = None) -> str:
                 f"比次优的「{second.store_name}」省 ¥{gap / 100:.2f}"
                 f"（它远 {second.distance_m - best.distance_m} 米）。"
             )
+        else:
+            # 同城同券时各家到手价常常一模一样，这时"距离"就是唯一的决策变量。
+            # 不点破这一点，用户会以为工具没算明白。
+            dd = second.distance_m - best.distance_m
+            dt = second.travel.minutes - best.travel.minutes
+            lines.append(
+                f"各家到手价其实一样（¥{best.paid_fen / 100:.2f}），"
+                f"那就挑最近的 —— 比次选近 {dd} 米、来回少花 {dt} 分钟。"
+            )
 
     # 这趟路费值不值：拿"省下的券钱"跟"路费"比
     if best.travel.money_fen > 0 and best.saved_fen > 0:
@@ -195,18 +204,6 @@ def verdict(quotes: list[StoreQuote], delivery_fen: int | None = None) -> str:
             lines.append(
                 f"路费 ¥{best.travel.money_fen / 100:.2f} 小于券省下的 "
                 f"¥{best.saved_fen / 100:.2f}，这趟值得跑。"
-            )
-
-    if delivery_fen is not None:
-        if delivery_fen < best.total_fen:
-            lines.append(
-                f"外卖合计 ¥{delivery_fen / 100:.2f} 比到店的 "
-                f"¥{best.total_fen / 100:.2f} 还便宜，这单建议点外卖。"
-            )
-        else:
-            lines.append(
-                f"到店 ¥{best.total_fen / 100:.2f} 仍比外卖 "
-                f"¥{delivery_fen / 100:.2f} 便宜，出门更划算。"
             )
 
     return "\n".join(lines)

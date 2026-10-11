@@ -451,7 +451,6 @@ def run_compare(
     yuan_per_km: float | None,
     wage: float | None,
     top: int,
-    delivery_total: float | None,
 ) -> int:
     """多门店比价 + 路程性价比：这单到底该去哪家店、值不值得跑这一趟。
 
@@ -464,25 +463,15 @@ def run_compare(
     所以这里把接口真实返回的 `distance` 换算成时间和钱，
     让「优惠」和「路程」在同一个量纲上比 —— 这才是完整的一笔账。
 
-    关于外卖
-    --------
-    麦乐送要另走 `delivery-query-addresses` → `delivery-query-stores`，
-    而这个账号常常一个收货地址都没存（实测返回空），价格与配送费取不到真值。
-    所以这里**不编造外卖价**：取不到就明说，并提供 `--delivery-total`
-    让你把 App 里看到的外卖合计填进来做人工对照。
+    范围
+    ----
+    只做到店（含得来速）。外卖（麦乐送）价格与配送费取不到真值，暂不纳入，
+    不做估算也不给对照入口 —— 宁可少一块，也不拿假数字冒充。
     """
     from dataclasses import replace
 
     from .mcd_client import McdMcpClient
-    from .route import (
-        MODES,
-        OVERHEAD_MIN,
-        StoreQuote,
-        rank_stores,
-        travel_cost,
-        verdict,
-        yuan_to_fen,
-    )
+    from .route import MODES, OVERHEAD_MIN, StoreQuote, rank_stores, travel_cost, verdict
 
     client = McdMcpClient()
     client.initialize()
@@ -494,6 +483,18 @@ def run_compare(
         print("未找到门店，请换一个城市/关键词。")
         return 1
     stores = [s for s in stores if isinstance(s, dict) and s.get("storeCode")]
+
+    # 打烊的店先剔掉：推荐一家已经关门的店是硬伤，不是"排序靠后"能弥补的。
+    # businessStatus 实测是布尔值（True=营业中）；字段缺失时不敢乱猜，按营业处理。
+    closed = [s for s in stores if s.get("businessStatus") is False]
+    if closed:
+        names = "、".join(
+            f"{s.get('storeName', '?')}（{s.get('businessStartTime', '')}-{s.get('businessEndTime', '')}）"
+            for s in closed[:3]
+        )
+        print(f"（{len(closed)} 家门店当前打烊，已排除：{names}）")
+    stores = [s for s in stores if s.get("businessStatus") is not False]
+
     # distance 是接口真实返回的（米）；个别门店可能没有该字段，排到最后
     stores.sort(
         key=lambda s: s.get("distance")
@@ -503,7 +504,7 @@ def run_compare(
     if top > 0:
         stores = stores[:top]
     if not stores:
-        print("附近没有可用门店。")
+        print("附近没有正在营业的门店，换个关键词试试。")
         return 1
 
     print(f"定位 {city} / {keyword}：取附近 {len(stores)} 家门店参与比价")
@@ -657,22 +658,8 @@ def run_compare(
         )
     print("-" * 80)
 
-    delivery_fen = yuan_to_fen(delivery_total) if delivery_total is not None else None
     print()
-    print(verdict(ranked, delivery_fen))
-
-    if delivery_fen is None:
-        # 取不到真值就明说，绝不用猜的数字冒充"外卖价"
-        n = -1
-        try:
-            addrs = client.data("delivery-query-addresses", {})
-            n = len((addrs or {}).get("addresses") or []) if isinstance(addrs, dict) else 0
-        except Exception:
-            pass
-        if n == 0:
-            print("\n（你的账号没有保存收货地址，麦乐送的价格和配送费取不到真值，")
-            print("  所以没有外卖对照。要比就把 App 里的外卖合计填进来：")
-            print("  --delivery-total 42.5）")
+    print(verdict(ranked))
     print(f"\n算价接口共调用 {shared.used} 次（上限 {budget}）")
     return 0
 
@@ -1254,12 +1241,6 @@ def main(argv: list[str] | None = None) -> int:
     p_cmp.add_argument("--yuan-per-km", type=float, default=None, help="覆盖每公里路费（元）")
     p_cmp.add_argument("--wage", type=float, default=None, help="时薪（元/小时），把等待时间也折算成钱")
     p_cmp.add_argument("--top", type=int, default=3, help="最多比几家店")
-    p_cmp.add_argument(
-        "--delivery-total",
-        type=float,
-        default=None,
-        help="外卖合计（元，含配送费），从 App 里抄来做对照",
-    )
 
     p_nut = sub.add_parser("nutrition", help="热量预算搭配")
     p_nut.add_argument("--city", default=city_default)
@@ -1318,7 +1299,6 @@ def _dispatch(args) -> int:
             args.yuan_per_km,
             args.wage,
             args.top,
-            args.delivery_total,
         )
     if args.cmd == "nutrition":
         return run_nutrition(args.city, args.keyword, args.kcal, args.size)

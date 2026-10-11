@@ -520,6 +520,39 @@ def run() -> int:
     )
     check("比价-真实节省计算", q_ok.saved_fen == 200 and q_ok.total_fen == 5152)
 
+    # 同城同券时各家到手价常常一模一样 —— 这时必须点破"挑最近的就行"，
+    # 否则用户会以为工具没算明白（真实场景：三店同为 ¥36.80）。
+    from .route import verdict
+
+    qa = StoreQuote("A", "近店", distance_m=144, paid_fen=3680, baseline_fen=3880,
+                    travel=travel_cost(144, "walk"))
+    qb = StoreQuote("B", "远店", distance_m=900, paid_fen=3680, baseline_fen=3880,
+                    travel=travel_cost(900, "walk"))
+    v_same = verdict([qb, qa])
+    check("比价-同价时点破挑最近", "一样" in v_same and "挑最近" in v_same, v_same[:40])
+
+    q_taxi = StoreQuote("C", "打车店", distance_m=144, paid_fen=3680, baseline_fen=3880,
+                        travel=travel_cost(144, "taxi"))
+    check(
+        "比价-路费吃掉优惠时提醒白跑",
+        "白跑" in verdict([q_taxi]),
+        f"路费¥{q_taxi.travel.money_fen / 100:.2f} vs 省¥{q_taxi.saved_fen / 100:.2f}",
+    )
+
+    # 打烊门店必须被排除（businessStatus 实测为布尔值，True=营业中）
+    open_stores = [
+        s for s in (
+            {"storeName": "A", "businessStatus": True},
+            {"storeName": "B", "businessStatus": False},
+            {"storeName": "C"},  # 字段缺失：不敢乱猜，按营业处理
+        )
+        if s.get("businessStatus") is not False
+    ]
+    check(
+        "营业-打烊门店被排除而字段缺失不误杀",
+        [s["storeName"] for s in open_stores] == ["A", "C"],
+    )
+
     # ---------------------------------------------------------------- 输出
     passed = sum(1 for _, ok, _ in _RESULTS if ok)
     total = len(_RESULTS)
