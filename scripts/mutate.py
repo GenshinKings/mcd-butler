@@ -606,6 +606,59 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
         '    closed = [s for s in stores if not s.get("businessStatus")]',
         True,
     ),
+    # ---------------------------------------------------------------- README 版式
+    # 版式约束跟功能约束一样，不写断言就是装饰品 —— 而且它们比功能更容易漂：
+    # 谁改 README 都可能顺手把许可证那行删了、把徽章拆成几行、把限制挪到文末。
+    # 这些变异全是「真实会发生的手滑」，不是编出来的。
+    (
+        "S1-首屏免责漏写「Token 不出本机」（陌生人最关心的那一条没了）",
+        "README.md",
+        "> **MIT 开源 · 非麦当劳官方产品 · 不碰支付、不代下单，只读公开算价接口 · Token 只留在本机**",
+        "> **MIT 开源 · 非麦当劳官方产品 · 不碰支付、不代下单，只读公开算价接口**",
+        True,
+    ),
+    (
+        "S2-README 限制取消前置（红线不再在首屏出现）",
+        "README.md",
+        "> 觉得这几条重要的话，完整的写在 [红线](#redline) 一节 —— 不用你翻到最底下。",
+        "> 更多说明见文末的红线一节。",
+        True,
+    ),
+    (
+        "S3-导航表出现死链（改了锚点忘了改跳过去的链接）",
+        "README.md",
+        "| 查某个命令是什么意思 | [全部 16 个命令](#commands)（中文名 ←→ 命令名对照） | 25 |",
+        "| 查某个命令是什么意思 | [全部 16 个命令](#command-list)（中文名 ←→ 命令名对照） | 25 |",
+        True,
+    ),
+    (
+        "S4-徽章被拆行（首屏多吃掉两行垂直空间）",
+        "README.md",
+        '![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)',
+        "\n![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)\n",
+        True,
+    ),
+    (
+        "S5-代码地图改回名不符实的「目录」",
+        "README.md",
+        "## 代码地图",
+        "## 目录",
+        True,
+    ),
+    (
+        "S6-删掉导航表入口（820 行 README 没有地图）",
+        "README.md",
+        "<summary><b>在这一页里找东西</b>（这份 README 很长，先给张地图，点哪都能跳）</summary>",
+        "<summary><b>更多说明</b></summary>",
+        True,
+    ),
+    (
+        "S7-删掉 License 徽章（首屏再也看不到协议）",
+        "README.md",
+        ' [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)',
+        "",
+        True,
+    ),
 ]
 
 

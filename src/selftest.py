@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import itertools
 import random
+import re
 
 from .assets import parse_claimable_markdown, parse_coupon_markdown, fmt_num, _num
 from .coupon_engine import (
@@ -2434,6 +2435,80 @@ def run() -> int:
         "文档-README 要把六段都提到（不能只说「还有好几段」）",
         all(s in _readme for s in _SECTIONS),
         f"README 没提：{[s for s in _SECTIONS if s not in _readme]}",
+    )
+
+    # ================================================================ README 版式
+    # 下面这几条守的不是功能，是「路人划不划走」。《Art of README》里两条硬性结论：
+    #   ① 许可证要往上放 —— 协议合不来的人会在几秒内划走，不该让他翻到底才发现
+    #   ② Caveats and limitations mentioned up-front —— 限制要前置
+    # 这两条没法靠眼睛检查维持：README 每次改动都可能顺手把它们挪走。
+    # 只看 «全篇有没有» 不够 —— 得看它在第几行。挪到文末就等于没前置，
+    # 而 "LICENSE 文件存在" 从来不是问题，问题是读者会不会在决定要不要用之前看到。
+    _head20 = "\n".join(_readme.splitlines()[:20])
+    _lic_ok = ("License" in _head20) or ("[MIT](LICENSE)" in _head20)
+    check(
+        "文档-许可证必须在首屏就看得见（翻到文末才发现等于没写）",
+        _lic_ok,
+        "前 20 行里没有 License 徽章也没有 [MIT](LICENSE)",
+    )
+    # 这是一条独立的安全承诺，不是许可证的附属品：
+    # 「Token 只留在本机」是陌生人决定要不要填 Token 的唯一依据。
+    _disclaimer = next(
+        (ln for ln in _readme.splitlines()[:20] if ln.startswith("> **MIT 开源")),
+        "",
+    )
+    check(
+        "文档-首屏免责一行三联：非官方 / 不碰支付 / Token 不出本机",
+        all(
+            k in _disclaimer
+            for k in ("非麦当劳官方产品", "不碰支付", "不代下单", "Token 只留在本机")
+        ),
+        f"顶部免责行缺项：{_disclaimer!r}",
+    )
+    # 只看 «有没有» 不够 —— 得看它在第几行。挪到文末就等于没前置。
+    _redline_row = next(
+        (i for i, ln in enumerate(_readme.splitlines(), 1) if "红线" in ln and "#redline" in ln),
+        -1,
+    )
+    check(
+        "文档-限制必须前置（红线要在首屏就出现，不能藏到第 700 行）",
+        0 < _redline_row <= 40,
+        f"红线首次出现在第 {_redline_row} 行（要求 ≤40）",
+    )
+    # 目录里的每一个锚点都得有对应的 <a id>，否则点了不跳 ——
+    # 中文标题的 GitHub slug 会吃掉全角冒号和引号，赌 slug 必然出问题，
+    # 所以全部改成显式 id，这里再验一次「写的链接和目标对得上」。
+    _anchors = set(re.findall(r'<a id="([^"]+)"></a>', _readme))
+    _links = set(re.findall(r"\]\(#([^)]+)\)", _readme))
+    _dead = sorted(_links - _anchors)
+    check(
+        "文档-README 里的每一个页内跳转都要跳得到（不能有死链）",
+        not _dead,
+        f"指向不存在锚点的链接：{_dead}",
+    )
+    # 徽章一个占一行的话，首屏 6 行就被彩色小图吃掉了。
+    # banner 行 = 以 ! 或 [! 开头的行。
+    _head_rows = [
+        ln
+        for ln in _readme.splitlines()[:30]
+        if ln.strip().startswith("![") or ln.strip().startswith("[![")
+    ]
+    check(
+        "文档-徽章必须挤在同一行（拆成多行会吃掉首屏六行）",
+        len(_head_rows) <= 1,
+        f"前 30 行里有 {len(_head_rows)} 行是徽章：{[r[:40] for r in _head_rows]}",
+    )
+    # 「目录」这个名字曾经挂着一堆文件树，挂在第 690 行，谁也看不到它。
+    # 名不符实的章节比没有更糟 —— 读者会以为那就是目录。
+    check(
+        "文档-不再有名不符实的「目录」章节（文件树应叫代码地图）",
+        "\n## 目录\n" not in _readme and "## 代码地图" in _readme,
+        "README 里仍有 ## 目录（那是文件树，名字骗人）",
+    )
+    check(
+        "文档-长 README 必须给导航表（没有 Tableau of Contents 就是让人迷路）",
+        "在这一页里找东西" in _readme and "#install" in _readme and "#commands" in _readme,
+        "缺 TOC 或导航链接不完整",
     )
 
     # ================================================================ 24.

@@ -1,24 +1,20 @@
 # 麦门管家 · mcd-butler
 
-[![CI](https://github.com/GenshinKings/mcd-butler/actions/workflows/ci.yml/badge.svg)](https://github.com/GenshinKings/mcd-butler/actions/workflows/ci.yml)
-
-![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)
-
-![零依赖](https://img.shields.io/badge/依赖-仅标准库-2ea44f)
-
-![MCP实测](https://img.shields.io/badge/MCP-35个工具实测-orange)
-
-![离线体验](https://img.shields.io/badge/体验-无需Token-9cf)
+[![CI](https://github.com/GenshinKings/mcd-butler/actions/workflows/ci.yml/badge.svg)](https://github.com/GenshinKings/mcd-butler/actions/workflows/ci.yml) ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB) ![零依赖](https://img.shields.io/badge/依赖-仅标准库-2ea44f) ![离线可跑](https://img.shields.io/badge/先试-无需Token-9cf) [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 **麦当劳永远不会告诉你，你手里这张券到底值多少钱。**
 
 它只回答两个问题：**哪张券挂到哪件商品最划算；这一趟值不值得跑。**
 
+> **MIT 开源 · 非麦当劳官方产品 · 不碰支付、不代下单，只读公开算价接口 · Token 只留在本机**
+>   
+> 觉得这几条重要的话，完整的写在 [红线](#redline) 一节 —— 不用你翻到最底下。
+
 券上印着「立减 8 元」，挂上去接口只给你减 5 块 —— 差的 3 块去哪了没人说得清，
   
 因为算价接口只回一个总价，从不告诉你每张券各自贡献了多少。
   
-麦门管家把每张券逐一挂到不同价位的商品上真打一遍算价接口，把它的真实价值**试**出来：
+麦门管家把每张券逐一挂到不同价位的商品上，真打一遍[麦当劳官方开放的 MCP 接口](https://open.mcd.cn/mcp)，把它的真实价值**试**出来：
 
 ```
 ── 券面额 ≠ 券价值 ──────────────────────────
@@ -34,6 +30,7 @@
 
 门槛接口从不告诉你，只能靠「便宜的挂不上、贵的挂得上」反推 —— 上面每一个数字背后都是真实的算价调用。
 
+<a id="hook"></a>
 ### 三行看完（不用账号、不用 Token）
 
 ```bash
@@ -44,6 +41,24 @@ python -m src.cli demo
 
 `demo` 是**离线**的：不用注册、不用填 Token、不发一个网络请求，就能看到下面那一整屏。
 看完再决定要不要继续。
+
+<details>
+
+<summary><b>在这一页里找东西</b>（这份 README 很长，先给张地图，点哪都能跳）</summary>
+
+| 你想干嘛 | 去这 | 大概几行 |
+|---|---|---|
+| 30 秒判断值不值得往下读 | [三行看完](#hook) → [离线演示长什么样](#demo) | 120 |
+| 装到我电脑上（含 Windows / macOS / Token） | [三分钟跑起来](#install) | 150 |
+| 查某个命令是什么意思 | [全部 16 个命令](#commands)（中文名 ←→ 命令名对照） | 25 |
+| 想知道真能省多少钱 | [真实账号实测](#realtest) · [省钱洞察](#insights) | 100 |
+| 确认它会不会偷我的东西 | [红线](#redline) | 8 |
+| 判断仓库是不是还活着 | [校验与开发](#verify)（CI / 238 项自检 / 83 处变异测试） | 55 |
+| 转发给朋友 | [传播素材](#promo)（三份稿子都是现成的） | 10 |
+
+不确定的话就顺着往下读 —— 顺序是按「最容易决定要不要走」排的。
+
+</details>
 
 <details>
 
@@ -161,6 +176,7 @@ python -m src.cli demo
 
 ---
 
+<a id="install"></a>
 ## 三分钟跑起来
 
 零第三方依赖（只用 Python 标准库），需要 **Python 3.10 以上**。
@@ -200,7 +216,7 @@ cd mcd-butler
 
 ```bash
 python -m src.cli demo        # 离线演示
-python -m src.cli selftest    # 离线自检，231 项，几秒跑完（全绿才算跑通）
+python -m src.cli selftest    # 离线自检，238 项，几秒跑完（全绿才算跑通）
 ```
 
 > ⚠️ 上面这些命令**必须在项目文件夹里执行**。
@@ -287,12 +303,13 @@ python -m src.cli campaign                             # 活动日历：今天�
 python -m src.cli meal --name 三件套                    # 这套餐能换成什么、换哪个更便宜
 ```
 
+<a id="commands"></a>
 ### 全部 16 个命令（中文名 ←→ 命令名）
 
 | 我想干什么           | 命令          | 要 Token 吗 |
 | --------------- | ----------- | --------- |
 | 先看看效果（离线，什么都不用配）  | `demo`      | 不要        |
-| 跑作者给自己留的 231 项检查   | `selftest`  | 不要        |
+| 跑作者给自己留的 238 项检查   | `selftest`  | 不要        |
 | 看我的麦门账本和段位       | `brag`      | 不要        |
 | 删掉本机账本里记错的一笔（**不动会员账号、不解绑**） | `forget`    | 不要        |
 | 今天该怎么点（一条命令给结论） | `advise`    | 要         |
@@ -314,6 +331,7 @@ python -m src.cli meal --name 三件套                    # 这套餐能换成�
 
 ---
 
+<a id="demo"></a>
 ## 离线演示长什么样
 
 ![demo](screenshots/demo.svg)
@@ -375,6 +393,7 @@ python -m src.cli meal --name 三件套                    # 这套餐能换成�
 
 ---
 
+<a id="realtest"></a>
 ## 真实账号实测
 
 ```bash
@@ -465,6 +484,7 @@ python -m src.cli tools        # 列出官方暴露的全部 35 个工具
 
 ---
 
+<a id="insights"></a>
 ## 省钱洞察：钱是怎么省下来的
 
 ```bash
@@ -688,7 +708,45 @@ python -m src.cli compare --mode taxi --wage 60        # 打车 + 把等待折�
 
 ---
 
-## 目录
+<a id="redline"></a>
+## 红线
+
+- Token 只走环境变量，不入库、不打印
+- `calculate-price` 只算价；`create-order` 只到支付链接，**绝不触碰支付环节**
+- 非商业：不售卖、不付费分发、不引流变现
+- 本项目为参赛作品，**非麦当劳官方产品**；餐品信息、价格与供应状态以官方渠道实时结果为准
+
+---
+
+## 路线图
+
+- [x] MCP 客户端与真实链路打通
+- [x] 券价最优组合引擎（贪心 + 局部搜索）
+- [x] 离线演示数据层
+- [x] 资产巡检：卡包到期预警 + 积分过期提醒（默认只读）
+- [x] 历史订单 replay（真实 `order-list` + 本地快照双数据源）
+- [x] 随单购档位（麦金卡等）自动选档，并把「券省了多少 / 卡省了多少」分开报
+- [x] 减脂模式：`list-nutrition-foods` 热量预算搭配
+- [x] 自选购物车（`--items`，支持数量）与菜单浏览（`menu`）
+- [x] 省钱洞察：真实成本 / 冗余券检测 / 拆单建议
+- [x] 一键顾问 `advise`（到期提醒 + 最优一单 + 洞察）
+- [x] 离线自检 `selftest`（238 项，覆盖三种返回体格式、接口异常结构守卫、匹配回归、路程模型、黄历与段位、随单购 payload、抖动不降级、体检与活动日历解析、餐品详情换项差价、传输层错误归类与退避、演示与 README 的一致性）
+- [x] 变异测试 `scripts/mutate.py`：故意把 76 处核心逻辑改坏，自检必须逐条翻红（自检全绿不等于自检有效）
+- [x] 多门店比价 + 路程性价比 `compare`（距离取接口 `distance` 真值）
+- [x] 麦门黄历 `almanac`（每条宜忌都真打过算价，含条件价陷阱与时段判定）
+- [x] 麦门段位与可晒账单 `brag`（读本机快照，不联网）
+- [x] 券包体检 `audit`（券面额 vs 真实价值、废券/死券、试出来的门槛、到期倒计时）
+- [x] 活动日历 `campaign`（只提示今天吃不到的新活动，不劝人为已有活动干等）
+- [x] 餐品详情 `meal`（套餐由哪几件组成、换一样的差价，并单独挑出「换过去反而更便宜」的项）
+- [ ] 定时领券（配合系统 cron / 计划任务）
+- [ ] 外卖（麦乐送）测算：需 `delivery-query-addresses` 有收货地址才能取真值
+- [ ] 麦金卡权益雷达：活动规则变动解读
+
+---
+
+---
+
+## 代码地图
 
 ```
 src/
@@ -715,50 +773,15 @@ FINDINGS.md          35 个工具实测避坑笔记 ← 调麦当劳 MCP 前建�
 MCP_INTEGRATION.md   使用的 MCP Server、Tool、调用流程与业务价值
 ```
 
----
 
-## 红线
-
-- Token 只走环境变量，不入库、不打印
-- `calculate-price` 只算价；`create-order` 只到支付链接，**绝不触碰支付环节**
-- 非商业：不售卖、不付费分发、不引流变现
-- 本项目为参赛作品，**非麦当劳官方产品**；餐品信息、价格与供应状态以官方渠道实时结果为准
-
----
-
-## 路线图
-
-- [x] MCP 客户端与真实链路打通
-- [x] 券价最优组合引擎（贪心 + 局部搜索）
-- [x] 离线演示数据层
-- [x] 资产巡检：卡包到期预警 + 积分过期提醒（默认只读）
-- [x] 历史订单 replay（真实 `order-list` + 本地快照双数据源）
-- [x] 随单购档位（麦金卡等）自动选档，并把「券省了多少 / 卡省了多少」分开报
-- [x] 减脂模式：`list-nutrition-foods` 热量预算搭配
-- [x] 自选购物车（`--items`，支持数量）与菜单浏览（`menu`）
-- [x] 省钱洞察：真实成本 / 冗余券检测 / 拆单建议
-- [x] 一键顾问 `advise`（到期提醒 + 最优一单 + 洞察）
-- [x] 离线自检 `selftest`（231 项，覆盖三种返回体格式、接口异常结构守卫、匹配回归、路程模型、黄历与段位、随单购 payload、抖动不降级、体检与活动日历解析、餐品详情换项差价、传输层错误归类与退避、演示与 README 的一致性）
-- [x] 变异测试 `scripts/mutate.py`：故意把 76 处核心逻辑改坏，自检必须逐条翻红（自检全绿不等于自检有效）
-- [x] 多门店比价 + 路程性价比 `compare`（距离取接口 `distance` 真值）
-- [x] 麦门黄历 `almanac`（每条宜忌都真打过算价，含条件价陷阱与时段判定）
-- [x] 麦门段位与可晒账单 `brag`（读本机快照，不联网）
-- [x] 券包体检 `audit`（券面额 vs 真实价值、废券/死券、试出来的门槛、到期倒计时）
-- [x] 活动日历 `campaign`（只提示今天吃不到的新活动，不劝人为已有活动干等）
-- [x] 餐品详情 `meal`（套餐由哪几件组成、换一样的差价，并单独挑出「换过去反而更便宜」的项）
-- [ ] 定时领券（配合系统 cron / 计划任务）
-- [ ] 外卖（麦乐送）测算：需 `delivery-query-addresses` 有收货地址才能取真值
-- [ ] 麦金卡权益雷达：活动规则变动解读
-
----
-
+<a id="verify"></a>
 ## 校验与开发
 
 每次 push 都会自动跑一遍下面的前三项 —— 徽章是绿的，说明**在你 clone 的这一刻**，
 这几件事在 3.10 / 3.13 × Linux / Windows 四种组合下都被真跑过一遍了。
 
 ```bash
-python -m src.cli selftest            # 231 项离线自检，几秒
+python -m src.cli selftest            # 238 项离线自检，几秒
 python -m src.cli selftest --twice    # 连跑两轮并比对断言总数（证明自检本身可重入）
 python -m src.cli demo                # 离线演示，这是路人的第一印象
 python scripts/smoke.py               # 编译 / 3.10 兼容 / 自检 / 演示 / 16 个命令 --help / 四种代码页
@@ -802,10 +825,22 @@ CI **刻意不调麦当劳接口**：Token 走 secret 会把真实账号暴露�
   0.5 秒」改坏了也不会红。抽成 `_backoff_for()` 之后可以直接断言数值。
 - **`--twice` 不是摆设。** 自检的结果列表是模块级的，`run()` 不清空的话跑第二轮
     
-  会在 231 条后面再追加 231 条，打印出「462/462」并且**全绿** ——
+  会在 238 条后面再追加 238 条，打印出「476/476」并且**全绿** ——
     
   污染同时放大分子和分母，只看「N/M 通过」永远发现不了。必须连跑两轮比总数。
 
+<a id="license"></a>
+
+## 开源协议
+
+[MIT](LICENSE)。改、抄、商用都不用跟我打招呼，也不用署名。
+
+唯一想说的一句：这是个人做的**非官方**作品，别拿它暗示麦当劳背书，
+也别用它做付费代下单那类生意 —— 原因写在 [红线](#redline) 里。
+
+---
+
+<a id="promo"></a>
 ## 传播素材
 
 写好了，直接拿去用（不用改署名，链接带上就行）：
