@@ -89,6 +89,11 @@ def run_demo() -> int:
     _demo_almanac()
 
     print("\n" + "=" * 62)
+    print("券包体检（audit）")
+    print("=" * 62)
+    _demo_audit()
+
+    print("\n" + "=" * 62)
     print("麦门段位（brag）")
     print("=" * 62)
     _demo_ranks()
@@ -112,6 +117,33 @@ def _demo_almanac() -> None:
     best = max((r.saved_fen for r in day["readings"]), default=0)
     print(render_almanac(day, butler_almanac(best, len(day["expiry"]))))
     print("  （以上每条宜忌都真的打过算价接口；演示数据，不代表真实价格）")
+
+
+def _demo_audit() -> None:
+    """券包体检的离线演示。
+
+    用一套带「门槛规则」的专用演示数据：真实接口就是这样 ——
+    不够门槛它不报错也不提示，就是不给你减，只能一件一件试出来。
+    """
+    from .audit import audit_coupons, render
+
+    verdicts = audit_coupons(
+        demo.audit_oracle,
+        demo.AUDIT_MENU,
+        demo.AUDIT_COUPONS,
+        lambda cart: demo.AUDIT_WITH_ORDER_OPTIONS,
+        limit=10,
+    )
+    print(
+        render(
+            verdicts,
+            store_name=demo.DEMO_STORE["storeName"],
+            menu_count=len(demo.AUDIT_MENU),
+            calls=sum(v.calls for v in verdicts),
+            total_coupons=len(demo.AUDIT_COUPONS),
+        )
+    )
+    print("  （演示数据；真实门店跑 `python -m src.cli audit`）")
 
 
 def _demo_ranks() -> None:
@@ -200,6 +232,73 @@ def run_assets(claim: bool) -> int:
     client = McdMcpClient()
     client.initialize()
     print(build_report(client, claim=claim))
+    return 0
+
+
+def run_campaign(days: int) -> int:
+    """麦门活动日历：今天有什么活动，以及哪天有今天吃不到的新品。"""
+    from .campaign import fetch, render
+    from .mcd_client import McdMcpClient
+
+    client = McdMcpClient()
+    client.initialize()
+    parsed = fetch(client)
+    if not parsed:
+        print("活动日历这次没返回可解析的内容（不影响其它功能）。")
+        return 0
+    print(render(parsed, within=days, max_per_day=4))
+    return 0
+
+
+def run_audit(
+    city: str, keyword: str, budget: int, limit: int, store_code: str | None = None
+) -> int:
+    """券包体检：一张一张试出来，你手里的券到底值多少钱。
+
+    跟 `advise` 的区别要说清楚：
+        advise 回答「**这一单**怎么买最便宜」
+        audit  回答「**这些券**本身值不值钱」
+    后者是前者的前提 —— 拿着一堆废券去优化，优化得再好也是白搭。
+    """
+    from .audit import audit_coupons, render
+    from .mcd_client import McdMcpClient
+    from .oracle import make_price_oracle
+
+    client = McdMcpClient()
+    client.initialize()
+
+    ctx = _locate(client, city, keyword, store_code)
+    if ctx is None:
+        return 1
+    store, store_code, menu, coupons = ctx
+
+    if not coupons:
+        print("这家门店当前没有可体检的券（券码由 `query-store-coupons` 提供）。")
+        return 0
+
+    shared = Budget(budget)
+    oracle = make_price_oracle(client, store_code, coupons)
+    verdicts = audit_coupons(
+        oracle, menu, coupons, _with_order_options, budget=shared, limit=limit
+    )
+    calls = sum(v.calls for v in verdicts)
+
+    print(
+        render(
+            verdicts,
+            store_name=store.get("storeName", ""),
+            menu_count=len(menu),
+            calls=calls,
+            total_coupons=len(coupons),
+            now=server_now(client),
+        )
+    )
+
+    audited = len(verdicts)
+    if audited < len(coupons):
+        print(f"  （券池共 {len(coupons)} 张，本次只体检了 {audited} 张；"
+              f"想多查几张：`--limit {len(coupons)} --budget {max(budget, audited * 12 + 40)}`）")
+    print("  门槛和「废券」都不是接口告诉我们的，是拿不同价位的商品一件件试出来的。")
     return 0
 
 
@@ -321,6 +420,13 @@ def run_advise(city: str, keyword: str, budget: int, store_code: str | None = No
 
     client = McdMcpClient()
     client.initialize()
+
+    # 0. 先看活动日历：不急的话，改天可能更划算 —— 这比省几块钱更值钱
+    from .campaign import advise_line, fetch as fetch_campaign
+
+    for line in advise_line(fetch_campaign(client)):
+        print(line)
+    print()
 
     # 1. 先看有没有今天就要作废的券 —— 这个比省几块钱更急
     try:
@@ -1395,6 +1501,16 @@ def main(argv: list[str] | None = None) -> int:
     p_adv.add_argument("--budget", type=int, default=40, help="算价接口调用上限")
     p_adv.add_argument("--store", default=None, help="直接指定 storeCode，跳过关键词搜索")
 
+    p_camp = sub.add_parser("campaign", help="麦门活动日历：今天有什么活动、哪天有新品")
+    p_camp.add_argument("--days", type=int, default=7, help="往后看几天")
+
+    p_aud = sub.add_parser("audit", help="券包体检：每张券真实值多少钱、门槛在哪")
+    p_aud.add_argument("--city", default=city_default)
+    p_aud.add_argument("--keyword", default=kw_default)
+    p_aud.add_argument("--budget", type=int, default=120, help="算价接口调用上限")
+    p_aud.add_argument("--limit", type=int, default=10, help="最多体检几张券")
+    p_aud.add_argument("--store", default=None, help="直接指定 storeCode，跳过关键词搜索")
+
     p_assets = sub.add_parser("assets", help="麦门资产周报（默认只读）")
     p_assets.add_argument(
         "--claim", action="store_true", help="真的去领券（会写入你的真实会员账号）"
@@ -1505,6 +1621,10 @@ def _dispatch(args) -> int:
         return run_selftest()
     if args.cmd == "advise":
         return run_advise(args.city, args.keyword, args.budget, args.store)
+    if args.cmd == "campaign":
+        return run_campaign(args.days)
+    if args.cmd == "audit":
+        return run_audit(args.city, args.keyword, args.budget, args.limit, args.store)
     if args.cmd == "menu":
         return run_menu(args.city, args.keyword, args.filter, args.limit, args.store)
     if args.cmd == "assets":

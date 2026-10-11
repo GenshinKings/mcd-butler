@@ -192,3 +192,68 @@ DEMO_PRICE_SNAPSHOT = {
     "D002": {"2026-09-02": 2200, "now": 2200},
     "D006": {"2026-09-02": 1000, "now": 1000},
 }
+
+
+# ------------------------------------------------------- 券包体检演示数据
+#
+# 体检要演示的是三件真实存在、但演示券池堆不出来的事：
+#   门槛券（便宜的挂不上）、废券（挂着一分不减）、死券（这家店没得挂）。
+# 所以这里单独配一套小菜单 + 小券池，规则明确、可离线复现。
+
+def _days(n: int) -> str:
+    """相对今天的到期日 —— 演示里必须能稳定出现「明天到期」这类提示。"""
+    from datetime import date, timedelta
+
+    return (date.today() + timedelta(days=n)).isoformat()
+
+
+AUDIT_MENU: list[CartItem] = [
+    CartItem("A1", "麦香鱼", 1, 1000),
+    CartItem("A2", "麦旋风", 1, 1000),
+    CartItem("A3", "板烧鸡腿堡", 1, 1800),
+    CartItem("A4", "巨无霸", 1, 2500),
+]
+
+AUDIT_COUPONS: list[Coupon] = [
+    Coupon("K1", "KA1", "板烧鸡腿堡立减 4 元", frozenset({"A3"}), valid_until=_days(1)),
+    Coupon("K2", "KA2", "满 20 减 3 元", frozenset({"A2", "A4"}), valid_until=_days(30)),
+    Coupon("K3", "KA3", "小食满 15 减 3 元", frozenset({"A1", "A2"}), valid_until=_days(2)),
+    # 面额 8 元、实测只减 5 元 —— 券印多少和真减多少从来不是一回事
+    Coupon("K4", "KA4", "巨无霸立减 8 元", frozenset({"A4"}), valid_until=_days(7)),
+    # 这家店不卖咖啡：一张看着好好的死券
+    Coupon("K5", "KA5", "麦咖啡新品立减 3 元", frozenset({"X9"}), valid_until=_days(5)),
+]
+
+# coupon_id -> (门槛分, 实减分)。门槛是演示世界自己定的，接口不会告诉你。
+_AUDIT_RULES: dict[str, tuple[int, int]] = {
+    "K1": (0, 400),
+    "K2": (2000, 300),
+    "K3": (1500, 300),
+    "K4": (0, 500),  # 印着 8 元，只减 5 元
+}
+
+# 体检演示不引入随单购：它跟券叠加会把价格打到 0，
+# 那是演示世界的假象，不该混进「这张券值多少钱」的判断里。
+AUDIT_WITH_ORDER_OPTIONS = [None]
+
+
+def audit_oracle(items: list[CartItem], assignment) -> PriceResult:
+    """体检演示用求价器：带门槛规则，够不到门槛就一分不减。
+
+    真实接口正是这样 —— 不满足门槛时它不报错、不提示，就是不给你减。
+    """
+    subtotal = sum(i.effective_price_fen() * i.quantity for i in items)
+    discount = 0
+    for idx, coupon_idx in assignment.mapping.items():
+        if idx >= len(items):
+            continue
+        cid = AUDIT_COUPONS[coupon_idx].coupon_id
+        threshold, off = _AUDIT_RULES.get(cid, (0, 0))
+        spend = items[idx].effective_price_fen() * items[idx].quantity
+        if spend >= threshold:
+            discount += off
+    return PriceResult(
+        price_fen=max(subtotal - discount, 0),
+        original_fen=subtotal,
+        discount_fen=discount,
+    )

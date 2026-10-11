@@ -799,6 +799,197 @@ def run() -> int:
         f"抖动下 {jitter_price} vs 正常 {clean_price}",
     )
 
+    # ---------------------------------------------------------- 券包体检
+    from .audit import (
+        audit_coupons,
+        face_value_fen,
+        render,
+        DEAD,
+        DUD,
+        WORTH,
+    )
+
+    def _audit(limit: int = 10, budget: Budget | None = None, oracle=None):
+        return audit_coupons(
+            oracle or demo.audit_oracle,
+            demo.AUDIT_MENU,
+            demo.AUDIT_COUPONS,
+            lambda cart: demo.AUDIT_WITH_ORDER_OPTIONS,
+            budget=budget,
+            limit=limit,
+        )
+
+    vs = {v.coupon.coupon_id: v for v in _audit()}
+
+    check(
+        "体检-死券：这家店没得挂的券要单独标出来",
+        vs["K5"].status == DEAD,
+        f"K5={vs['K5'].status}",
+    )
+    check(
+        "体检-废券：够不到门槛、一分不减的券不能报成省钱",
+        vs["K3"].status == DUD and vs["K3"].value_fen == 0,
+        f"K3={vs['K3'].status} value={vs['K3'].value_fen}",
+    )
+    check(
+        "体检-门槛是试出来的：便宜的不生效、贵的生效，区间要说出来",
+        vs["K2"].status == WORTH
+        and vs["K2"].works_from_fen == 2500
+        and vs["K2"].blocked_fen == 1000
+        and "门槛" in vs["K2"].threshold_note(),
+        f"K2 works_from={vs['K2'].works_from_fen} blocked={vs['K2'].blocked_fen}",
+    )
+    check(
+        "体检-券面额不等于券价值",
+        vs["K4"].face_fen == 800 and vs["K4"].value_fen == 500,
+        f"K4 face={vs['K4'].face_fen} value={vs['K4'].value_fen}",
+    )
+
+    text = render(
+        list(vs.values()),
+        store_name="演示餐厅",
+        menu_count=len(demo.AUDIT_MENU),
+        calls=sum(v.calls for v in vs.values()),
+        total_coupons=len(demo.AUDIT_COUPONS),
+    )
+    check("体检-报告要写出面额与实测的落差", "标着减" in text)
+    check("体检-报告要给出试出来的门槛", "门槛" in text)
+    check("体检-报告要提醒快过期的券", "到期" in text)
+
+    # 面额解析最容易犯的错：把售价当成优惠额，凭空造出一张假废券
+    check(
+        "体检-售价不能被当成券面额",
+        face_value_fen("9.9元中杯冰美式") == 0
+        and face_value_fen("巨无霸立减 5 元") == 500
+        and face_value_fen("满 20 减 3 元") == 300
+        and face_value_fen("") == 0,
+        f"9.9元→{face_value_fen('9.9元中杯冰美式')}",
+    )
+
+    # 预算只够查一张时，必须先查明天就作废的那张 —— 代价不对称
+    tight = _audit(budget=Budget(2))
+    check(
+        "体检-预算紧张时先查快过期的券",
+        len(tight) == 1 and tight[0].coupon.coupon_id == "K1",
+        f"查了 {[v.coupon.coupon_id for v in tight]}",
+    )
+
+    capped = _audit(budget=Budget(5))
+    check(
+        "体检-绝不超出调用预算",
+        sum(v.calls for v in capped) <= 5,
+        f"用了 {sum(v.calls for v in capped)} 次",
+    )
+
+    def _dead_oracle(items, assignment):
+        raise RuntimeError("模拟鉴权失效")
+
+    try:
+        _audit(oracle=_dead_oracle)
+    except RuntimeError:
+        blew_up = True
+    except Exception:  # noqa: BLE001
+        blew_up = False
+    else:
+        blew_up = False
+    check(
+        "体检-接口全挂时必须报错，不能伪装成「全是废券」",
+        blew_up,
+        "鉴权失效被吞掉了",
+    )
+
+    # ---------------------------------------------------------- 活动日历
+    from .campaign import (
+        advise_line,
+        fresh_campaigns,
+        parse_campaign_markdown,
+        render,
+        today_campaigns,
+        upcoming,
+    )
+
+    # 报文节选：结构照搬真实返回（#### 日期 / 活动标题 / 活动内容介绍 / 活动图片介绍）
+    CAMPAIGN_FIXTURE = """### 当前时间：2026-10-11 14:25:13
+
+### 活动列表：
+
+
+#### 2026年10月11日 今日
+
+
+-   **活动标题**：超值\U0001d7e1.\U0001d7e1元早餐两件套陪你开工啦
+    **活动内容介绍**：早八的快乐，一堡一咖已就位
+    **活动图片介绍**：
+    <img src="https://example.com/a.jpg" alt="" height="300" width="auto">
+
+
+
+-   **活动标题**：学生专属！49元150天麦金学期卡
+    **活动内容介绍**：每天低至 0.33 元，一卡在手
+    **活动图片介绍**：
+    <img src="https://example.com/b.jpg" alt="" height="300" width="auto">
+
+
+
+#### 2026年10月12日
+
+
+-   **活动标题**：超值\U0001d7e1.\U0001d7e1元早餐两件套陪你开工啦
+    **活动内容介绍**：早八的快乐，一堡一咖已就位
+    **活动图片介绍**：
+    <img src="https://example.com/a.jpg" alt="" height="300" width="auto">
+
+
+
+#### 2026年10月15日
+
+
+-   **活动标题**：麦麦夜市回归
+    **活动内容介绍**：限时 12.9 元起，售完即止
+    **活动图片介绍**：
+    <img src="https://example.com/c.jpg" alt="" height="300" width="auto">
+"""
+
+    cdays = parse_campaign_markdown(CAMPAIGN_FIXTURE)
+    check(
+        "活动日历-按日切块：3 个日期、今天 2 个活动",
+        len(cdays) == 3 and len(cdays[0].campaigns) == 2 and cdays[0].is_today,
+        f"days={len(cdays)} today={len(cdays[0].campaigns) if cdays else 0}",
+    )
+    check(
+        "活动日历-标题里的数学粗体数字也能认出价格",
+        cdays[0].campaigns[0].price_yuan == 9.9,
+        f"price={cdays[0].campaigns[0].price_yuan}",
+    )
+    check(
+        "活动日历-摊销价不能当活动价（49元150天 → 49，不是每天 0.33）",
+        cdays[0].campaigns[1].price_yuan == 49.0,
+        f"price={cdays[0].campaigns[1].price_yuan}",
+    )
+
+    tdy = today_campaigns(cdays)
+    fut = upcoming(cdays, within=7)
+    check(
+        "活动日历-只把「今天吃不到」的算作值得等的新活动",
+        len(fut) == 2
+        and len(fresh_campaigns(fut[0], tdy)) == 0
+        and len(fresh_campaigns(fut[1], tdy)) == 1,
+        f"fut={[ (d.day.isoformat(), len(fresh_campaigns(d, tdy))) for d in fut ]}",
+    )
+
+    ctext = render(cdays, within=7)
+    check("活动日历-报告要点出新品那天", "麦麦夜市回归" in ctext)
+    check("活动日历-建议里不能劝人为已在跑的活动干等", "今天也在跑" not in ctext)
+    check("活动日历-空报文不崩", parse_campaign_markdown("") == [])
+
+    advise_lines = advise_line(cdays)
+    check(
+        "活动日历-advise 只提今天没有的新活动",
+        any("今天没有" in x for x in advise_lines)
+        and not any("干等" in x for x in advise_lines),
+        f"{advise_lines}",
+    )
+
     # ---------------------------------------------------------------- 输出
     passed = sum(1 for _, ok, _ in _RESULTS if ok)
     total = len(_RESULTS)
