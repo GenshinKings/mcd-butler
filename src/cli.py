@@ -34,6 +34,23 @@ from . import demo_data as demo
 
 FEN = lambda f: f"{f / 100:.2f}"
 
+
+def _dw(s: str) -> int:
+    """显示宽度：中文等全角字符占 2 列。
+
+    不做这个的话，f-string 的 :<N> 按字符数补空格 ——
+    「巨无霸」补到 10 列实际只占 6，「中份薯条」占 8，
+    于是同一个循环里打出来的两行永远错位，表格越看越累。
+    """
+    import unicodedata
+
+    return sum(2 if unicodedata.east_asian_width(c) in ("F", "W") else 1 for c in s)
+
+
+def _pad(s: str, width: int) -> str:
+    """按**显示宽度**左对齐补空格（f-string 的 :<N> 做不到）。"""
+    return s + " " * max(0, width - _dw(s))
+
 # compare 一次要对每家店各打 2 次非算价接口，不设上限会静默吃满配额。
 MAX_COMPARE_STORES = 20
 
@@ -86,9 +103,8 @@ def run_demo(show_all: bool = False) -> int:
         所以默认只跑「购物车 + 券 → 逐张试出真实价值 → 挂上去 → 省了多少」
         和「复刻上一单」，玩法向的四段留给 `demo --all`。
     """
-    print("=" * 62)
-    print("麦门管家 · 离线演示（无需 Token）")
-    print("=" * 62)
+    print("麦门管家 · 离线演示（无需 Token · 演示数据）")
+    print("-" * 46)
 
     cart = [
         demo.DEMO_MENU[0],  # 巨无霸
@@ -98,16 +114,19 @@ def run_demo(show_all: bool = False) -> int:
     ]
     coupons = demo.DEMO_COUPONS
 
-    print("\n购物车：")
+    print("\n购物车")
+    name_w = max(_dw(i.name) for i in cart)
     for item in cart:
-        print(f"  - {item.name:<10} ¥{FEN(item.unit_price_fen)}")
+        print(f"  {_pad(item.name, name_w + 2)}¥{FEN(item.unit_price_fen)}")
     subtotal = sum(i.unit_price_fen for i in cart)
-    print(f"  原价合计：¥{FEN(subtotal)}")
+    print(f"  {_pad('合计', name_w + 2)}¥{FEN(subtotal)}")
 
-    print(f"\n可用券 {len(coupons)} 张：")
+    by_code = {m.product_code: m for m in demo.DEMO_MENU}
+    print(f"\n可用券（{len(coupons)} 张）")
+    title_w = max(_dw(c.title) for c in coupons)
     for c in coupons:
-        scope = "、".join(sorted(c.product_codes)) or "通用"
-        print(f"  - {c.title:<20} 适用：{scope}")
+        names = "、".join(by_code[code].name for code in sorted(c.product_codes))
+        print(f"  {_pad(c.title, title_w + 2)}适用 {names}")
 
     # 40 与 CLI 的 --budget 默认值一致。早先这里写 60，于是演示打出
     # 「共调用 42 次」，而 README 写的是「默认 40 次」—— 读者会以为程序
@@ -115,9 +134,7 @@ def run_demo(show_all: bool = False) -> int:
     optimizer = CouponOptimizer(demo.demo_oracle, max_calls=40)
     best = optimizer.optimize(cart, coupons, demo.DEMO_WITH_ORDER_OPTIONS)
 
-    print("\n" + "-" * 62)
-    print("寻优结果")
-    print("-" * 62)
+    print("\n怎么挂最省（每张券都真实试算过）")
     if best.price is None:
         raise BudgetExhausted("没能算出任何价格")
 
@@ -130,12 +147,12 @@ def run_demo(show_all: bool = False) -> int:
         ci = best.mapping.get(idx)
         sub = optimizer.oracle([item], Assignment(mapping={0: ci} if ci is not None else {}))
         per_item += sub.price_fen
-        title = coupons[ci].title if ci is not None else "（这张没挂券）"
+        title = coupons[ci].title if ci is not None else "没挂券"
         print(
-            f"  {item.name:<8} ¥{FEN(item.unit_price_fen):>6} "
-            f"← {title:<24} → ¥{FEN(sub.price_fen)}"
+            f"  {_pad(item.name, name_w + 2)}¥{FEN(item.unit_price_fen):>5}"
+            f"  ← {_pad(title, title_w + 2)}→ ¥{FEN(sub.price_fen):>5}"
         )
-    print("  " + "-" * 58)
+    print("  " + "-" * 46)
     print(f"  挂券后小计 ¥{FEN(per_item)}")
 
     wo_gain = 0
@@ -148,26 +165,20 @@ def run_demo(show_all: bool = False) -> int:
                 f"  （注意：各件单独算合计 ¥{FEN(per_item)}，整单一起算是 "
                 f"¥{FEN(no_wo.price_fen)} —— 券有跨件门槛时不能简单相加）"
             )
-    print("  " + "-" * 58)
-    print(f"  原价 ¥{FEN(best.price.original_fen)} → 到手 ¥{FEN(best.price.price_fen)}")
-    print(f"  省下 ¥{FEN(best.price.saved_fen)}    共调用算价接口 {optimizer.calls} 次")
+    # 一行收束：原价/到手/省下/试算次数。不再单打「不用券直接买」一行 ——
+    # 那行的信息（¥56.00、差 ¥20.00）跟原价和省下完全重复，纯占屏幕。
+    print("  " + "-" * 46)
+    print(
+        f"  原价 ¥{FEN(best.price.original_fen)} → 到手 ¥{FEN(best.price.price_fen)}"
+        f"，省下 ¥{FEN(best.price.saved_fen)}（试算 {optimizer.calls} 次）"
+    )
 
-    # 对比：一张券都不用
-    naive = Assignment(mapping={}, with_order=None)
-    naive.price = optimizer.oracle(cart, naive)
-    gap = naive.price.price_fen - best.price.price_fen
-    print(f"\n  不用券直接买：¥{FEN(naive.price.price_fen)}（差 ¥{FEN(gap)}）")
-
-    print("\n" + "=" * 62)
-    print("历史订单复刻（replay）")
-    print("=" * 62)
+    print("\n复刻上一单（同样的单，今天再买多少钱）")
     _demo_replay()
 
     if not show_all:
-        print("\n  上面两段就是演示的全部 —— 人人都用得到的那条链路：")
-        print("  购物车 + 券 → 逐张试出真实价值 → 挂到最合适的那件 → 省了多少。")
-        print("  黄历 / 券包体检 / 活动日历 / 段位这四段是玩法向的，`--all` 才跑：")
-        print("    python -m src.cli demo --all")
+        print("\n  就这两段 —— 购物车 + 券，逐张试出真实价值，挂上去。")
+        print("  黄历 / 券包体检 / 活动日历 / 段位在 --all：python -m src.cli demo --all")
         return 0
 
     print("\n" + "=" * 62)
@@ -291,7 +302,7 @@ def _demo_replay() -> None:
 
     for order in demo.DEMO_ORDER_HISTORY:
         date = order["createTime"][:10]
-        print(f"\n{order['createTime']}  {order['storeName']}")
+        print(f"\n  {date[5:]} · {order['storeName']}")
 
         cart: list[CartItem] = []
         for p in order["products"]:
@@ -311,7 +322,9 @@ def _demo_replay() -> None:
                 # 只印一个 "+1.00" 读者不知道这是什么：涨价？还是比上次贵？
                 # 把「当时多少钱 → 现在多少钱」两端都写出来，才加得起来。
                 flag = f"   当时 ¥{FEN(then)} → 现在 ¥{FEN(cur.unit_price_fen)}"
-            print(f"  - {cur.name} ×{p['quantity']}{flag}")
+            qty = p["quantity"]
+            item_line = _pad(f"{cur.name} ×{qty}", 16) if flag else f"{cur.name} ×{qty}"
+            print(f"    {item_line}{flag}")
 
         # 今天的最优到手价
         best = optimizer.optimize(cart, demo.DEMO_COUPONS, demo.DEMO_WITH_ORDER_OPTIONS)
@@ -324,20 +337,17 @@ def _demo_replay() -> None:
         verdict = "贵了" if diff > 0 else ("便宜了" if diff < 0 else "持平")
         mark = "  ⚠️" if diff > 0 else ""
 
-        print(f"  上次实付 ¥{FEN(paid_before)}  →  今天再买一次 ¥{FEN(paid_now)}")
-        # 随单购那一档减了多少必须写出来，否则读者按黄历里的单价自己加，
-        # 加出来的数字跟这里的到手价对不上（¥28 vs ¥26），会以为工具在编。
-        extra = ""
-        if best.with_order is not None:
-            no_wo = optimizer.oracle(cart, Assignment(mapping=best.mapping, with_order=None))
-            wo_gain = no_wo.price_fen - paid_now
-            extra = f"，其中「{best.with_order.label}」再减 ¥{FEN(wo_gain)}（卡费另算）"
+        # 「已用尽 N 张券 + 麦金卡（随单购），其中…再减 ¥6.00（卡费另算）」
+        # 这种括号套括号的话读者根本不读。收成一行「用了 N 张券 + X」，
+        # 随单购的账在第一段寻优结果里已经摊开，这里不重复。
         print(
-            f"  同样的单，{verdict} ¥{FEN(abs(diff))}{mark}"
-            f"（已用尽 {len(best.mapping)} 张券"
-            f" + {best.with_order.label if best.with_order else '无随单购'}{extra}）"
+            f"    上次实付 ¥{FEN(paid_before)} → 今天 ¥{FEN(paid_now)}"
+            f"，{verdict} ¥{FEN(abs(diff))}{mark}"
         )
-    print("\n（演示数据，不代表真实价格）")
+        used = f"用了 {len(best.mapping)} 张券"
+        if best.with_order is not None:
+            used += f" + {best.with_order.label}"
+        print(f"    （{used}）")
 
 
 # ==================================================================== real
