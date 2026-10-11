@@ -72,8 +72,14 @@ class TravelCost:
 
 
 def yuan_to_fen(yuan: float) -> int:
-    """元 → 分。用 round 而不是 int，避免 14.0*100 被浮点误差砍成 1399。"""
-    return int(round(float(yuan) * 100))
+    """元 → 分。
+
+    用 `to_fen` 而不是 `int(round(float(yuan) * 100))`：后者是 banker's rounding
+    加二进制浮点两个坑叠在一起。--yuan-per-km 0.125 会被算成 12 分而不是 13 分。
+    项目里 coupon_engine 和 audit 两处都已经明确禁用了这个写法。"""
+    from .coupon_engine import to_fen
+
+    return to_fen(yuan)
 
 
 def travel_cost(

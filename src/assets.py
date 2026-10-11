@@ -23,7 +23,7 @@ import re
 from datetime import datetime
 from typing import Any
 
-from .mcd_client import McdMcpClient
+from .mcd_client import McpFatalError, McdMcpClient
 
 # `2026-10-11 05:00-2026-10-11 10:29 周日 05:00-10:29` —— 只取前两个时间点，
 # 后面的「周日 05:00-10:29」是重复的可用餐时段说明，正则不碰它。
@@ -76,6 +76,11 @@ def fetch_points(client: McdMcpClient) -> dict:
     """积分账户。任何字段缺失都返回 0，不抛异常。"""
     try:
         payload = client.call_json("query-my-account")
+    except McpFatalError:
+        # Token 失效 / 限流 / 断网必须穿透。吞掉它就会打印
+        # 「卡包（0 张）／券池为空」，用户以为自己一张券都没有，
+        # 实际是这一次根本没问到服务器。
+        raise
     except Exception:
         return {}
     data = payload.get("data")
@@ -150,6 +155,8 @@ def fetch_my_coupons(client: McdMcpClient, now: datetime | None = None) -> list[
     """卡包内已持有的券，并标注距到期还有多久。"""
     try:
         text = client.call("query-my-coupons", {})
+    except McpFatalError:
+        raise
     except Exception:
         return []
     coupons = parse_coupon_markdown(text)
@@ -200,6 +207,8 @@ def fetch_claimable(client: McdMcpClient) -> list[dict]:
     """可领取（或已领取）的券。"""
     try:
         text = client.call("available-coupons", {})
+    except McpFatalError:
+        raise
     except Exception:
         return []
     return parse_claimable_markdown(text)

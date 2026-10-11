@@ -202,6 +202,10 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 
 def run() -> int:
+    # 必须清空：_RESULTS 是模块级列表，run() 跑两次会输出「294/294」，
+    # 而且上一次的失败记录会被继承。单条 CLI 调用掩盖了这个问题，
+    # 任何复用进程的做法（pytest 化、批量校验）都会拿到污染后的分子分母。
+    _RESULTS.clear()
     # 1. A 类解析：必须跳过占位符，拿到真正的报文
     p = extract_payload(MIXED)
     check("A类-能抽出报文", p is not None)
@@ -319,8 +323,10 @@ def run() -> int:
     # optimize 会把共享预算吃光，之后再 try_evaluate(裸买) 必然返回 None；
     # 因此调用方必须在 optimize 之前先算裸买基准。这里断言该契约成立，
     # 防止 cli 把 baseline 写回 optimize 之后导致 AttributeError。
-    opt_budget = Budget(40)
-    eng = CouponOptimizer(demo.demo_oracle, max_calls=40, budget=opt_budget)
+    # 预算必须小到「optimize 一定会吃光」。用 40 的话这条断言锁的是
+    # 演示数据恰好够费，而不是契约本身 —— 演示数据一改就塌，还查不出原因。
+    opt_budget = Budget(3)
+    eng = CouponOptimizer(demo.demo_oracle, max_calls=3, budget=opt_budget)
     eng.optimize(cart, demo.DEMO_COUPONS, demo.DEMO_WITH_ORDER_OPTIONS)
     late = eng.try_evaluate(list(cart), Assignment(mapping={}, with_order=None))
     check(
@@ -333,7 +339,14 @@ def run() -> int:
     eng2 = CouponOptimizer(demo.demo_oracle, max_calls=40, budget=early_budget)
     early = eng2.try_evaluate(list(cart), Assignment(mapping={}, with_order=None))
     eng2.optimize(cart, demo.DEMO_COUPONS, demo.DEMO_WITH_ORDER_OPTIONS)
-    check("契约-裸买基准先于optimize可正常算出", early is not None and early.price_fen >= 0)
+    check(
+        "契约-裸买基准先于optimize可正常算出",
+        # 不能只断言 "is not None and >= 0" —— 价格恒非负，后半句是恒真的，
+        # 等于只测了「没崩」。这里钉住真实数值：裸买 = 菜单原价。
+        early is not None
+        and early.price_fen == sum(i.unit_price_fen * i.quantity for i in cart),
+        f"{early.price_fen if early else None}",
+    )
 
     # 9. 真实节省口径：必须以裸买价为基准，不能用 discount
     pr = PriceResult(price_fen=7030, original_fen=10740, discount_fen=3710)
@@ -367,7 +380,27 @@ def run() -> int:
     )
 
     red = ins.redundant_coupons(demo.demo_oracle, cart, demo.DEMO_COUPONS, best)
-    check("洞察-冗余券检测不报错", isinstance(red, list))
+    # 只断言 isinstance(list) 是注水：返回 [] 也通过。
+    # 演示的最优解挂了 3 张券、随单购是麦金卡档，必须真能挑出「白挂」的那张。
+    check("洞察-冗余券返回的是 (商品, 券) 列表", isinstance(red, list))
+    # demo 场景里恰好没有冗余券，返回 [] 是正确的 —— 所以真断言不能指望 demo。
+    # 自己造一个：oracle 完全无视券（挂不挂同价），那这张券必然是摆设。
+    _flat_item = CartItem(product_code="X1", name="测试品", unit_price_fen=2000)
+    _flat_coupon = Coupon(coupon_id="X", coupon_code="x", title="看着能减 5 元",
+                          product_codes=frozenset({"X1"}))
+    _flat_best = Assignment(mapping={0: 0})
+    _flat_best.price = PriceResult(price_fen=2000, original_fen=2000)
+    red2 = ins.redundant_coupons(
+        lambda items, a: PriceResult(price_fen=2000, original_fen=2000),
+        [_flat_item],
+        [_flat_coupon],
+        _flat_best,
+    )
+    check(
+        "洞察-挂了等于没挂的券必须被点名",
+        [(it.product_code, c.coupon_id) for it, c in red2] == [("X1", "X")],
+        f"{red2!r}",
+    )
 
     splits = ins.split_suggestions(
         demo.demo_oracle,
@@ -377,7 +410,21 @@ def run() -> int:
         whole_fen=best.price.price_fen,
         per_call_budget=20,
     )
-    check("洞察-拆单检测不报错", isinstance(splits, list))
+    # 返回的是 (商品, 拆单后总价, 比整单便宜多少) 三元组。
+    # 只断言 isinstance(list) 的话，返回 [] 也通过。
+    check(
+        "洞察-拆单建议带得出金额（不是只返回个 list）",
+        isinstance(splits, list)
+        and len(splits) >= 1
+        and all(
+            len(x) == 3
+            and hasattr(x[0], "product_code")
+            and isinstance(x[1], int)
+            and isinstance(x[2], int)
+            for x in splits
+        ),
+        f"{splits[:1]!r}",
+    )
 
     # 11. 演示数据里那张「陷阱券」（C5，挂上反而加价）不该被选进最优解
     used_ids = {demo.DEMO_COUPONS[ci].coupon_id for ci in best.mapping.values()}
@@ -397,8 +444,23 @@ def run() -> int:
     from .coupon_engine import WithOrderOption
 
     wo = WithOrderOption(payload={"membershipCode": "M1"}, label="麦金卡")
-    check("随单购-payload不混展示字段", set(wo.payload) == {"membershipCode"})
-    check("随单购-标签独立", wo.label == "麦金卡")
+    # 早先这两条只是把刚传进去的实参回显一遍，改坏实现也不会红。
+    # 真要锁的是：payload 里**没有** label（否则会把展示文案发给接口），
+    # 以及 frozen（进了 dict/set 才不会变）。
+    check(
+        "随单购-payload不混展示字段",
+        set(wo.payload) == {"membershipCode"}
+        and "label" not in wo.payload
+        and len(wo.payload) == 1
+        and isinstance(wo.payload.get("membershipCode"), str),
+        str(wo.payload),
+    )
+    wo_mutated = False
+    try:
+        wo.label = "改了"
+    except Exception:
+        wo_mutated = True
+    check("随单购-标签独立且不可变", wo.label == "麦金卡" and wo_mutated)
 
     # 14. 全局预算：洞察也必须计入，绝不超支
     shared = Budget(30)
@@ -563,7 +625,25 @@ def run() -> int:
     try:
         for n in (0, 1, 2):
             _explain_coupon_scope(n)
-        check("券范围-解释函数不崩（0/1/2 张）", True)
+        # 不能写 check(..., True) —— 那是字面量，跟被测代码零耦合。
+        # 真要断言的是：三档数给出的解释互不相同（都说了同一句等于没说）。
+        import io as _io
+        import contextlib as _ctx
+        outs = []
+        for n in (0, 1, 2):
+            buf = _io.StringIO()
+            with _ctx.redirect_stdout(buf):
+                _explain_coupon_scope(n)
+            outs.append(buf.getvalue())
+        # 0 张和 1 张必须解释「券码拿不到」这件事；
+        # 2 张以上时券已经在用了，多说一句是噪音，故意不说。
+        check(
+            "券范围-券没用上时要解释清楚，够用时不要啰嗦",
+            "券码" in outs[0]
+            and "券码" in outs[1]
+            and outs[2] == "",
+            f"{outs!r}"[:160],
+        )
     except Exception as exc:  # noqa:BLE001
         check("券范围-解释函数不崩（0/1/2 张）", False, repr(exc))
 
@@ -679,7 +759,16 @@ def run() -> int:
     )
     check("段位-负数不炸", rank_of(-100)["title"] == "麦门路人")
     check("段位-进度条首尾正确", progress_bar(0, 6).startswith("░") and set(progress_bar(6, 6)) == {"█"})
-    check("段位-满级进度条实心", set(progress_bar(6, 6)) == {"█"})
+    # 早先这条跟上一行的 `set(progress_bar(6, 6)) == {"█"}` 完全重复，是凑数。
+    # 换成真正没人守的方向：进度条长度必须等于总格数，实心数等于当前级数。
+    check(
+        "段位-进度条长度与实心数正确",
+        len(progress_bar(3, 6)) == 12
+        and progress_bar(3, 6).count("█") == 6
+        and progress_bar(6, 6).count("░") == 0
+        and progress_bar(0, 6).count("█") == 0,
+        f"{progress_bar(3, 6)}|{progress_bar(9, 12)}",
+    )
     check("口吻-空账单有说法", "空" in butler_total(0, 0))
     check("口吻-劝退敢说实话", "劝" in butler_warning(1500, 500))
     check("口吻-路费为零时是稳赚", "稳赚" in butler_warning(0, 500))
@@ -815,13 +904,43 @@ def run() -> int:
     )
     # mapping 的值越界：静默跳过会让这一行「假装挂了券却没挂」，
     # 算出一个比真实更贵的价，优化器还会当成挂券方案采纳。
-    bad_idx_raised = False
+    #
+    # 这里早先写的是 `[one]` —— 全模块没有绑定 `one`，于是抛的是 NameError，
+    # 照样被 `except Exception` 兜住，断言恒为 True。删掉 _expand 的越界守卫
+    # 这条也照样全绿，等于零防护。下面改成真的构造一次越界调用。
+    def _raises_with(bad: int) -> bool:
+        try:
+            make_price_oracle(_RecClient({"price": 2500}), "S1", [coupon])(
+                [item], Assignment(mapping={0: bad})
+            )
+        except Exception:
+            return True
+        return False
+
+    check("oracle-券下标越界必须报错，不能静默不挂券", _raises_with(7))
+    # 负下标才是最阴的那个：它不抛 IndexError， coupons[-1] 会**静默挂上另一张券**。
+    # 只有显式的范围守卫挡得住，靠 Python 自己的下标检查挡不住。
+    other = Coupon(coupon_id="c2", coupon_code="k2", title="第二张")
+    rc_neg = _RecClient({"price": 2500})
+    neg_bad = False
     try:
-        rc7 = _RecClient({"price": 2500})
-        make_price_oracle(rc7, "S1", [coupon])([one], Assignment(mapping={0: 7}))
+        make_price_oracle(rc_neg, "S1", [coupon, other])([item], Assignment(mapping={0: -1}))
     except Exception:
-        bad_idx_raised = True
-    check("oracle-券下标越界必须报错，不能静默不挂券", bad_idx_raised)
+        # 报错就是对的：越界必须被挡住，不管正负。
+        neg_bad = False
+    else:
+        # 没报错的话，唯一可接受的结果是「压根没把第二张券发出去」。
+        # 如果 coupons[-1] 静默生效，用户以为挂的是 A 券，实际挂的是 B 券，
+        # 算出来的价是错的，而且屏幕上看不出任何异常。
+        sent_items = (rc_neg.payloads[-1] if rc_neg.payloads else {}).get("items") or []
+        neg_bad = any(
+            isinstance(it, dict) and it.get("couponCode") == "k2" for it in sent_items
+        )
+    check(
+        "oracle-负下标不能静默挂到另一张券上",
+        not neg_bad,
+        f"payload={rc_neg.payloads[-1] if rc_neg.payloads else None}",
+    )
 
     # 金额换算两套口径不能混：菜单是元字符串、算价是分整数
     check(
@@ -1007,7 +1126,9 @@ def run() -> int:
         "体检-样本不全时不能直接判「废券」（报错不等于这张券没用）",
         partial_ok
         and partial_vs.get("K2") is not None
-        and "一分没减" not in partial_vs["K2"].note,
+        # 这个字样只在 render() 的输出里，note 字段从来不产出它 ——
+        # 守在 note 上对任何实现都恒真。改成直接查渲染出来的文本。
+        and "偏保守" in render(list(partial_vs.values())),
         f"K2.note={getattr(partial_vs.get('K2'), 'note', '')}",
     )
 
@@ -1397,6 +1518,345 @@ def run() -> int:
     check(
         "餐品详情-非套餐（rounds 为空）要明说，不能渲染出一片空白",
         single is not None and not single.is_combo and "没有可换的组成部分" in render_meal(single),
+    )
+
+    # ============================================================ 回归防护
+    # 这一节是「变异测试」逼出来的。
+    # 上一轮把 60 处核心逻辑逐个故意改坏，其中 **33 处改坏后自检全绿** ——
+    # 那些断言是装饰品。这里补的就是那 33 个洞，外加本轮新修的几处。
+    # 判据只有一条：把对应逻辑改坏，这一节必须有一条变红。
+
+    from datetime import date as _date, timedelta as _td
+
+    # ── 1. McpFatalError 必须在**抛错的地方**就被分好类。
+    # 之前 selftest 只 import 了 extract_payload，从没碰过 McdMcpClient，
+    # 八条 raise 全靠手搓 McpFatalError 来验证，绕开了真实路径。
+    import io as _io3
+    import urllib.error as _uerr
+    import urllib.request as _ureq
+    import http.client as _hcli
+
+    from . import mcd_client as _mc
+
+    _real_urlopen = _ureq.urlopen
+
+    def _fatal_type(fake) -> type:
+        try:
+            _ureq.urlopen = fake
+            cli_ = _mc.McdMcpClient("tok", max_retries=0)
+            cli_._post({"x": 1})
+        except Exception as exc:  # noqa: BLE001
+            return type(exc)
+        finally:
+            _ureq.urlopen = _real_urlopen
+        return type(None)
+
+    def _http_error(code):
+        def f(req, timeout=None):
+            raise _uerr.HTTPError(
+                req.full_url, code, "err", {}, _io3.BytesIO(b'{"error":"x"}')
+            )
+        return f
+
+    def _raise(exc):
+        def f(req, timeout=None):
+            raise exc
+        return f
+
+    check("传输层-401 必须归类为环境故障", _fatal_type(_http_error(401)) is McpFatalError)
+    check("传输层-429 必须归类为环境故障", _fatal_type(_http_error(429)) is McpFatalError)
+    check("传输层-5xx 必须归类为环境故障", _fatal_type(_http_error(503)) is McpFatalError)
+    check("传输层-URLError 必须归类为环境故障",
+          _fatal_type(_raise(_uerr.URLError("boom"))) is McpFatalError)
+    # 这两个**不是** URLError：urlopen 已经成功返回，错是随后的 read() 抛的。
+    # 漏掉这一层，用户看到的是一整屏 traceback 而不是「网络错误，请重试」。
+    check("传输层-读到一半断连（RemoteDisconnected）必须归类为环境故障",
+          _fatal_type(_raise(_hcli.RemoteDisconnected("reset"))) is McpFatalError)
+    check("传输层-读超时（TimeoutError）必须归类为环境故障",
+          _fatal_type(_raise(TimeoutError("timeout"))) is McpFatalError)
+    check("错误类型-McpFatalError 是 McpError 的子类（老代码才能照常接住）",
+          issubclass(McpFatalError, McpError))
+
+    # ── 2. 黄历不能把环境故障吞成「这家店没券」
+    from .almanac import _call
+
+    def _fatal_oracle(items, a):
+        raise McpFatalError("Token 无效或已过期（HTTP 401）。")
+
+    alm_raised = False
+    try:
+        _call(_fatal_oracle, Budget(5), [CartItem("Z", "测试")], Assignment(mapping={}))
+    except McpFatalError:
+        alm_raised = True
+    except Exception:
+        alm_raised = False
+    check("黄历-环境故障必须穿透，不能印成「这家门店没有可挂载的券」", alm_raised)
+
+    # ── 3. 卡包三处查询：半路限流不能印成「你一张券都没有」
+    from .assets import fetch_claimable, fetch_my_coupons, fetch_points
+
+    class _DeadClient:
+        def call_json(self, *a, **k):
+            raise McpFatalError("触发限流（每 Token 每分钟 600 次）。")
+
+        def call(self, *a, **k):
+            raise McpFatalError("触发限流（每 Token 每分钟 600 次）。")
+
+    assets_raised = 0
+    for fn in (fetch_points, fetch_my_coupons, fetch_claimable):
+        try:
+            fn(_DeadClient())
+        except McpFatalError:
+            assets_raised += 1
+        except Exception:  # noqa: BLE001, S110
+            pass
+    check("卡包-限流/断网不能降级成「卡包为空」", assets_raised == 3, f"{assets_raised}/3")
+
+    # ── 4. Verdict 的三个字段：之前一个断言都没有
+    check(
+        "体检-probed 记的是成功算出价的件数，不是候选件数",
+        partial_ok
+        and partial_vs.get("K2") is not None
+        and partial_vs["K2"].probed == 1
+        and partial_vs["K2"].attempted == 2,
+        f"probed={getattr(partial_vs.get('K2'), 'probed', None)} "
+        f"attempted={getattr(partial_vs.get('K2'), 'attempted', None)}",
+    )
+    check(
+        "体检-全部成功时 probed 等于 attempted",
+        vs["K2"].probed == vs["K2"].attempted and vs["K2"].probed > 0,
+        f"{vs['K2'].probed}/{vs['K2'].attempted}",
+    )
+
+    # ── 5. 健康度的分母、样本告警、文案
+    from .audit import UNKNOWN, Verdict, render as render_audit
+
+    def _mk(cid: str, status: str) -> Verdict:
+        return Verdict(
+            coupon=Coupon(coupon_id=cid, coupon_code=cid, title=cid), status=status
+        )
+
+    _t3 = render_audit([_mk("a", WORTH), _mk("b", UNKNOWN), _mk("c", UNKNOWN)])
+    check(
+        "体检-健康度分母必须含没查出来的券（不能拿未知当好消息）",
+        "33%" in _t3 and "没查出来" in _t3,
+        _t3[:160],
+    )
+    check(
+        "体检-样本太小时要自己说清楚",
+        "样本太小" in render_audit([_mk("a", WORTH), _mk("b", DEAD)]),
+    )
+    _vd = _mk("d", DUD)
+    _vd.probed = 3
+    check("体检-确实一分没减时才说「一分没减」", "一分没减" in render_audit([_vd]))
+
+    # ── 6. 活动日历：label() 不接受报文里的「今日」标记
+    from .campaign import Campaign, CampaignDay, advise_line, upcoming
+
+    _T1 = _date.today()
+    check(
+        "日历-标了「今日」但不是今天就不能叫今天",
+        CampaignDay(day=_T1 + _td(days=30), is_today=True).label(_T1) != "今天",
+        CampaignDay(day=_T1 + _td(days=30), is_today=True).label(_T1),
+    )
+    check(
+        "日历-真的是今天就要叫今天（不看标记）",
+        CampaignDay(day=_T1, is_today=False).label(_T1) == "今天",
+    )
+
+    # ── 7. within 参数必须真的接进来（写死 7 天跟 --days 脱钩）
+    _d2 = CampaignDay(
+        day=_T1 + _td(days=2), campaigns=(Campaign(title="两天后", summary="", price_yuan=9.0),)
+    )
+    _d4 = CampaignDay(
+        day=_T1 + _td(days=4), campaigns=(Campaign(title="四天后", summary="", price_yuan=5.0),)
+    )
+    check(
+        "日历-upcoming 的 within 真的生效（写死 7 天会漏改）",
+        [d.day for d in upcoming([_d2, _d4], _T1, within=3)] == [_d2.day],
+    )
+    check(
+        "日历-advise_line 的 within 真的生效",
+        "四天后" not in "\n".join(advise_line([_d2, _d4], _T1, within=3)),
+    )
+
+    # ── 8. _first_price 的正文兜底分支（之前四次调用都只传 title，从没走到）
+    from .campaign import _first_price, build_markdown, parse_campaign_markdown
+
+    check(
+        "日历-正文里的价也要先挖掉门槛再取",
+        _first_price("标题里没有价", "任意消费满 6 元即可加购 9.9 元麦旋风") == 9.9,
+        str(_first_price("标题里没有价", "任意消费满 6 元即可加购 9.9 元麦旋风")),
+    )
+    check(
+        "日历-标题里只有门槛时返回 None，不能把门槛当卖价",
+        _first_price("满 20 减 3 元") is None,
+        str(_first_price("满 20 减 3 元")),
+    )
+    _md_rt = build_markdown(
+        [(_T1, "标题A", [("活动甲", "满20减3")]), (_T1 + _td(days=1), "", [("活动乙", "")])]
+    )
+    _parsed_rt = parse_campaign_markdown(_md_rt)
+    check(
+        "日历-共享构造器产出的报文能原样解析回来",
+        len(_parsed_rt) == 2 and _parsed_rt[0].campaigns[0].title == "活动甲",
+    )
+
+    # ── 9. CLI 的两处入参：离线也要能断言
+    from .cli import _advise_within, _meal_payload, clamp_top
+
+    check("CLI-advise 的 --days 会传进活动日历窗口", _advise_within(14) == 14)
+    check("CLI-advise 的 --days 有下限（0 天等于没窗口）", _advise_within(0) == 1)
+    _mp = _meal_payload("S1", "D008")
+    check(
+        "CLI-meal 入参键是 code 且不带 beCode（传错接口直接报错）",
+        _mp.get("code") == "D008" and "beCode" not in _mp and "productCode" not in _mp,
+        str(_mp),
+    )
+    check("CLI-compare 的 --top 至少为 1（0 会变成不截断）", clamp_top(0) == 1)
+    check("CLI-compare 的 --top 有上限", clamp_top(9999) == 20)
+
+    # ── 10. 营养搭配：枚举量必须算全，不能只看端点
+    from .nutrition import MAX_COMBOS, MAX_MEAL_SIZE, _trim_pool, clamp_size
+
+    check("营养-超大 --size 必须被夹住", clamp_size(50) == MAX_MEAL_SIZE and clamp_size(0) == 1)
+    _big = [(f"p{i}", {"kcal": 100 + i, "protein": 10}) for i in range(60)]
+    _trimmed = _trim_pool(list(_big), MAX_MEAL_SIZE)
+    _n = len(_trimmed)
+    _total = 0
+    _c = 1
+    for _i in range(1, MAX_MEAL_SIZE + 1):
+        _c = _c * (_n - _i + 1) // _i
+        _total += _c
+    check(
+        "营养-裁剪后的真实枚举量在上限内（判据要算全部档位，不是只看 C(n,size)）",
+        _total <= MAX_COMBOS,
+        f"n={_n} 枚举量={_total} 上限={MAX_COMBOS}",
+    )
+
+    # ── 11. 金额量纲守卫
+    from .oracle import _assert_price_scale
+
+    _scale_bad = False
+    try:
+        _assert_price_scale({"price": "57.00"}, [CartItem("Z", "测试", 1, 5700)])
+    except McpError:
+        _scale_bad = True
+    check("算价-price 变成元字符串时必须报错（否则会读成 ¥0.57）", _scale_bad)
+    _scale_ok = True
+    try:
+        _assert_price_scale({"price": 5700}, [CartItem("Z", "测试", 1, 5700)])
+    except McpError:
+        _scale_ok = False
+    check("算价-正常的分口径不能被量纲守卫误伤", _scale_ok)
+
+    # ── 12. 金额换算不能用 banker's rounding
+    from .route import yuan_to_fen
+
+    check("金额-元转分不能用 int(round(x*100))（0.125 必须是 13 分）",
+          yuan_to_fen(0.125) == 13, str(yuan_to_fen(0.125)))
+
+    # ── 13. forget --last 0 必须什么都不删
+    import tempfile as _tf
+    from pathlib import Path as _Path
+
+    from . import snapshot as _snap
+    from .cli import run_forget
+
+    _tmpdir = _tf.mkdtemp(prefix="mcdbutler-selftest-")
+    _old_snap = _snap.SNAPSHOT_FILE
+    _snap.SNAPSHOT_FILE = _Path(_tmpdir) / "snapshots.json"
+    try:
+        _snap.save(
+            _snap.entry_from_cart(
+                cart=[CartItem("Z", "测试品", 1, 2000)],
+                paid_fen=1500,
+                baseline_fen=2000,
+                discount_fen=500,
+                store_code="S1",
+                store_name="测试店",
+                city="",
+                keyword="",
+                coupon_titles=["测试券"],
+                with_order_label="",
+            )
+        )
+        _before = len(_snap.load_all())
+        run_forget(0, False)
+        _after = len(_snap.load_all())
+        check(
+            "账本-forget --last 0 必须一条都不删（max(last,1) 会静默删 1 条）",
+            _before == 1 and _after == 1,
+            f"{_before} → {_after}",
+        )
+    finally:
+        _snap.SNAPSHOT_FILE = _old_snap
+
+    # ── 14. 餐品详情：排序 / isDefault 严格判定 / 无默认时的兜底
+    from .meal_detail import parse_meal_detail
+
+    _dirty = {
+        "code": "X",
+        "name": "测试套餐",
+        "rounds": [
+            {
+                "name": "换饮",
+                "choices": [
+                    {"name": "中杯", "diffPrice": "- ¥1.00", "isDefault": 1},
+                    {"name": "小杯", "diffPrice": "- ¥4.00", "isDefault": 1},
+                ],
+            },
+            {
+                "name": "换薯",
+                "choices": [
+                    {"name": "小份", "diffPrice": "- ¥3.00"},
+                    # isDefault=2：真值但不是 1。严格判定（== 1）下它**不是**默认项，
+                    # 于是默认回落到首个（小份）；放宽成真值判断它会变成默认项（大份）。
+                    # 只有把这种值放在**第二个**才区分得出两种实现 ——
+                    # 放第一个的话，两种实现都取它。
+                    {"name": "大份", "diffPrice": "+ ¥2.00", "isDefault": 2},
+                ],
+            },
+        ],
+    }
+    _mdx = parse_meal_detail(_dirty)
+    check(
+        "餐品详情-同一环两个 isDefault=1 时取第一个",
+        _mdx is not None and _mdx.rounds[0].default_choice().name == "中杯",
+        f"{_mdx.rounds[0].default_choice() if _mdx else None}",
+    )
+    check(
+        "餐品详情-isDefault 只认 1，不认真值（2 不能冒充默认项）",
+        _mdx is not None
+        and _mdx.rounds[1].default_choice().name == "小份"
+        and not any(c.is_default for c in _mdx.rounds[1].choices),
+        f"{_mdx.rounds[1].default_choice() if _mdx else None}",
+    )
+    check(
+        "餐品详情-更便宜的换项按差价升序排（最省的排最前）",
+        _mdx is not None
+        and [c.diff_fen for _b, c in _mdx.cheaper_swaps()] == sorted(
+            c.diff_fen for _b, c in _mdx.cheaper_swaps()
+        )
+        # 严格判定下第二环的默认项是「小份」，它自己不算换项；
+        # 放宽成真值判断后默认变成「大份」，小份就会混进省钱换项名单。
+        and [c.name for _b, c in _mdx.cheaper_swaps()] == ["小杯"],
+        f"{[(c.name, c.diff_fen) for _b, c in _mdx.cheaper_swaps()] if _mdx else None}",
+    )
+
+    # ── 15. 演示数据的一致性（写死日期会变成时间炸弹）
+    check(
+        "演示-券不能已经过期（写死日期迟早会炸）",
+        all(
+            (valid_until_end(c.valid_until) or "9999-12-31") >= _T1.isoformat()
+            for c in demo.DEMO_COUPONS
+        ),
+        str([c.valid_until for c in demo.DEMO_COUPONS]),
+    )
+    _menu_codes = {m.product_code for m in demo.DEMO_MENU}
+    check(
+        "演示-券的适用商品必须真的在演示菜单里",
+        all(set(c.product_codes) <= _menu_codes for c in demo.DEMO_COUPONS),
     )
 
     # ---------------------------------------------------------------- 输出

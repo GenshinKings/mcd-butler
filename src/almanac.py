@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from .coupon_engine import Assignment, Budget, CartItem, Coupon, PriceResult
+from .mcd_client import McpFatalError
 
 # ------------------------------------------------------------------ 时段
 # 麦当劳的券大量是时段券（早餐/夜宵），黄历必须先把"现在几点"说清楚，
@@ -193,7 +194,13 @@ def build(
                 covered.add(code)
             elif saved < 0:
                 # 挂了反而更贵：随单购把卡费算进去了，用户自己看不出来
-                reading.note = f"挂券反而贵 ¥{abs(saved) / 100:.2f}（多半是把卡费算进来了）"
+                # 不能写「多半是……」。自己都拿不准的措辞，读者只会更不信。
+                # 挂券变贵的机制是确定的：这张券没到门槛，券本身不生效，
+                # 但"挂券"这个动作会把这件商品从原本更划算的默认折扣里摘出去。
+                reading.note = (
+                    f"挂券反而贵 ¥{abs(saved) / 100:.2f}"
+                    "（门槛没到，券不生效，还把原本的折扣顶掉了）"
+                )
                 traps.append(reading)
                 covered.add(code)
 
@@ -289,12 +296,21 @@ def build(
 
 
 def _call(oracle, budget: Budget, items: list[CartItem], assignment: Assignment):
-    """带预算的算价。预算不足或接口出错都返回 None —— 黄历是锦上添花，
-    某一条算不出来不该让整张黄历崩掉。"""
+    """带预算的算价。预算不足或**业务性**算不出都返回 None —— 黄历是锦上添花，
+    某一条算不出来不该让整张黄历崩掉。
+
+    但**环境故障必须穿透**（McpFatalError）：Token 失效 / 限流 / 断网时，
+    每一条都会返回 None，build() 最终交出一份 `readings=0` 的黄历，
+    屏幕上印的是「这家门店当前没有可挂载的券」。用户会照着这句提示换店、
+    换时段反复重跑，永远查不出真因 —— 把环境问题说成"这家店没券"，
+    比直接崩掉更坏。
+    """
     if budget.remaining <= 0:
         return None
     try:
         price = oracle(items, assignment)
+    except McpFatalError:
+        raise
     except Exception:
         return None
     budget.spend(1)

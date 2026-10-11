@@ -73,6 +73,7 @@ def make_price_oracle(
             raise McpError("算价接口未返回 price 字段，无法判断这一单的价格")
 
         _assert_quantity_kept(payload_items, data)
+        _assert_price_scale(data, items)
 
         return PriceResult(
             price_fen=as_fen(data.get("price")),
@@ -152,4 +153,38 @@ def _assert_quantity_kept(payload_items: list[dict], data: dict) -> None:
         raise McpError(
             f"算价接口没有按请求的数量结算：要了 {want} 件，只返回 {got} 件。"
             "这种情况常见于「挂券后数量被重置」，继续算下去会报出虚假的优惠额。"
+        )
+
+
+def _assert_price_scale(data: dict, items: Sequence[CartItem]) -> None:
+    """核对 `price` 的量纲是「分」，不是「元」。
+
+    这个项目已经在量纲上栽过一次：`query-meals` 返回元字符串、
+    `calculate-price` 返回分整数，所以代码里硬编码了 `as_fen`（按分读）。
+    但**选哪个口径是硬编码的，没有任何检测** —— 哪天接口把 price 改成
+    `"57.00"`，`as_fen("57.00")` 会得到 57，也就是 ¥0.57。
+    优化器会把这个假的最低价选中，报出「裸买 ¥97.50 → 到手 ¥0.57，省了 ¥96.93」，
+    而且屏幕上看不出任何异常。
+
+    判据：到手价不可能超过裸买价 × 一个宽松倍数，也不可能为负；
+    更要紧的是，**带小数点的字符串一定是元**，分口径从来不会写成 "57.00"。
+    """
+    raw = data.get("price")
+    if isinstance(raw, str) and "." in raw:
+        raise McpError(
+            f"算价接口的 price 变成了带小数点的字符串 {raw!r} —— "
+            "本项目按「分」读取金额（as_fen），元口径会让它读成 ¥0.57 这种假价格。"
+            "这是接口改版，请提 issue 或在 src/oracle.py 里切换 as_fen → to_fen。"
+        )
+    price = as_fen(raw)
+    if price < 0:
+        raise McpError(f"算价接口返回了负数价格 {price} 分，不予采信。")
+    # 上界只做很松的兜底（菜单价 ×3 + 100 元），不追求精确：
+    # 随单购会把卡费算进原价，精确上界容易误伤。这里的目的是挡住
+    # 「量纲错了导致价格离谱」这一类，不是挡住贵的订单。
+    menu_total = sum(getattr(it, "price_fen", 0) or 0 for it in items)
+    if menu_total > 0 and price > menu_total * 3 + 10_000:
+        raise McpError(
+            f"算价接口返回的价格 ¥{price / 100:.2f} 远超这单的菜单合计 "
+            f"¥{menu_total / 100:.2f}，金额口径很可能变了，不予采信。"
         )

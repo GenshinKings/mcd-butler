@@ -26,12 +26,52 @@ from .coupon_engine import (
     to_fen,
     valid_until_end,
 )
-from .mcd_client import McpError, load_dotenv
+from .mcd_client import McpError, McpFatalError, load_dotenv
+from .nutrition import MAX_MEAL_SIZE
 from .oracle import make_price_oracle
 from . import demo_data as demo
 
 
 FEN = lambda f: f"{f / 100:.2f}"
+
+# compare 一次要对每家店各打 2 次非算价接口，不设上限会静默吃满配额。
+MAX_COMPARE_STORES = 20
+
+
+def clamp_top(top: int) -> int:
+    """把 compare 的 --top 夹回 1..MAX_COMPARE_STORES。
+
+    给 0 或负数时早先走的 else 分支完全不截断，等于拿全部门店参与比价 ——
+    每家店 2 次非算价接口不计入 Budget，屏幕上「共调用 N 次」跟真实请求数对不上，
+    600 次/分钟的配额却照吃不误。
+    """
+    if top < 1:
+        return 1
+    return min(top, MAX_COMPARE_STORES)
+
+
+def _advise_within(days: int) -> int:
+    """`advise --days N` / `campaign --days N` 往活动日历里传的窗口。
+
+    早先这个数在 campaign 内部写死 7，跟命令行脱钩：用户改了窗口，报告里还是 7 天。
+    """
+    return max(1, days)
+
+
+def _meal_payload(store_code: str, code: str) -> dict:
+    """`query-meal-detail` 的入参。
+
+    两个反直觉的点，都是从报错里试出来的：
+    - 键是 `code` 不是 `productCode`（传 productCode 接口不认）
+    - 到店自取**不能**传 `beCode`（传了会报错）
+    单独成函数，是为了让这两条能被离线断言到。
+    """
+    return {
+        "storeCode": store_code,
+        "orderType": 1,
+        "beType": 1,
+        "code": code,
+    }
 
 
 # ==================================================================== demo
@@ -60,17 +100,47 @@ def run_demo() -> int:
         scope = "、".join(sorted(c.product_codes)) or "通用"
         print(f"  - {c.title:<20} 适用：{scope}")
 
-    optimizer = CouponOptimizer(demo.demo_oracle, max_calls=60)
+    # 40 与 CLI 的 --budget 默认值一致。早先这里写 60，于是演示打出
+    # 「共调用 42 次」，而 README 写的是「默认 40 次」—— 读者会以为程序
+    # 超了自己的上限。演示不联网，但数字口径必须跟真实命令对得上。
+    optimizer = CouponOptimizer(demo.demo_oracle, max_calls=40)
     best = optimizer.optimize(cart, coupons, demo.DEMO_WITH_ORDER_OPTIONS)
 
     print("\n" + "-" * 62)
     print("寻优结果")
     print("-" * 62)
-    for line in best.describe(cart, coupons):
-        print(f"  {line}")
     if best.price is None:
         raise BudgetExhausted("没能算出任何价格")
-    print(f"\n  原价 ¥{FEN(best.price.original_fen)} → 到手 ¥{FEN(best.price.price_fen)}")
+
+    # 逐件列出到手价，并显式写出随单购那一档减了多少。
+    # 没有这段时，屏幕上是「原价 ¥56.00 → 到手 ¥36.00，省下 ¥20.00」，
+    # 而分项加出来只有 ¥42.00 —— 差的 ¥6.00 没有任何一行解释。
+    # 读者按计算器加不出结论，第一反应是"这工具在编数字"。
+    per_item = 0
+    for idx, item in enumerate(cart):
+        ci = best.mapping.get(idx)
+        sub = optimizer.oracle([item], Assignment(mapping={0: ci} if ci is not None else {}))
+        per_item += sub.price_fen
+        title = coupons[ci].title if ci is not None else "（这张没挂券）"
+        print(
+            f"  {item.name:<8} ¥{FEN(item.unit_price_fen):>6} "
+            f"← {title:<24} → ¥{FEN(sub.price_fen)}"
+        )
+    print("  " + "-" * 58)
+    print(f"  挂券后小计 ¥{FEN(per_item)}")
+
+    wo_gain = 0
+    if best.with_order is not None:
+        no_wo = optimizer.oracle(cart, Assignment(mapping=best.mapping, with_order=None))
+        wo_gain = no_wo.price_fen - best.price.price_fen
+        print(f"  随单购「{best.with_order.label}」再减 ¥{FEN(wo_gain)}（卡费另算）")
+        if per_item != no_wo.price_fen:
+            print(
+                f"  （注意：各件单独算合计 ¥{FEN(per_item)}，整单一起算是 "
+                f"¥{FEN(no_wo.price_fen)} —— 券有跨件门槛时不能简单相加）"
+            )
+    print("  " + "-" * 58)
+    print(f"  原价 ¥{FEN(best.price.original_fen)} → 到手 ¥{FEN(best.price.price_fen)}")
     print(f"  省下 ¥{FEN(best.price.saved_fen)}    共调用算价接口 {optimizer.calls} 次")
 
     # 对比：一张券都不用
@@ -116,6 +186,8 @@ def _demo_campaign() -> None:
 
     from .campaign import advise_line, parse_campaign_markdown, render
 
+    # 这里的 days 是解析出来的**活动列表**，不是天数 —— 演示窗口固定 7 天。
+    # （曾因为变量名撞车把列表传进 _advise_within，直接 TypeError 崩掉整段演示。）
     days = parse_campaign_markdown(demo.campaign_demo_markdown())
     print(render(days, today=date.today(), within=7, max_per_day=3))
     for line in advise_line(days, date.today()):
@@ -220,7 +292,9 @@ def _demo_replay() -> None:
             then = snap.get(date)
             flag = ""
             if then is not None and cur.unit_price_fen != then:
-                flag = f"   单价 {(cur.unit_price_fen - then) / 100:+.2f}"
+                # 只印一个 "+1.00" 读者不知道这是什么：涨价？还是比上次贵？
+                # 把「当时多少钱 → 现在多少钱」两端都写出来，才加得起来。
+                flag = f"   当时 ¥{FEN(then)} → 现在 ¥{FEN(cur.unit_price_fen)}"
             print(f"  - {cur.name} ×{p['quantity']}{flag}")
 
         # 今天的最优到手价
@@ -234,11 +308,18 @@ def _demo_replay() -> None:
         verdict = "贵了" if diff > 0 else ("便宜了" if diff < 0 else "持平")
         mark = "  ⚠️" if diff > 0 else ""
 
-        print(f"  上次实付 ¥{FEN(paid_before)}  →  今天最优到手 ¥{FEN(paid_now)}")
+        print(f"  上次实付 ¥{FEN(paid_before)}  →  今天再买一次 ¥{FEN(paid_now)}")
+        # 随单购那一档减了多少必须写出来，否则读者按黄历里的单价自己加，
+        # 加出来的数字跟这里的到手价对不上（¥28 vs ¥26），会以为工具在编。
+        extra = ""
+        if best.with_order is not None:
+            no_wo = optimizer.oracle(cart, Assignment(mapping=best.mapping, with_order=None))
+            wo_gain = no_wo.price_fen - paid_now
+            extra = f"，其中「{best.with_order.label}」再减 ¥{FEN(wo_gain)}（卡费另算）"
         print(
             f"  同样的单，{verdict} ¥{FEN(abs(diff))}{mark}"
             f"（已用尽 {len(best.mapping)} 张券"
-            f" + {best.with_order.label if best.with_order else '无随单购'}）"
+            f" + {best.with_order.label if best.with_order else '无随单购'}{extra}）"
         )
     print("\n（演示数据，不代表真实价格）")
 
@@ -480,7 +561,7 @@ def run_advise(
     from .campaign import advise_line, fetch as fetch_campaign
 
     for line in advise_line(
-        fetch_campaign(client), today=server_now(client).date(), within=max(1, days)
+        fetch_campaign(client), today=server_now(client).date(), within=_advise_within(days)
     ):
         print(line)
     print()
@@ -659,15 +740,7 @@ def run_meal(
             print()
 
     # 入参是 `code` 不是 `productCode`；到店自取不传 beCode（传了会报错）。
-    data = client.data(
-        "query-meal-detail",
-        {
-            "storeCode": store_code,
-            "orderType": 1,
-            "beType": 1,
-            "code": target.product_code,
-        },
-    )
+    data = client.data("query-meal-detail", _meal_payload(store_code, target.product_code))
     detail = parse_meal_detail(data)
     if detail is None:
         print(f"「{target.name}」没返回详情（可能是不支持拆分的单品）。")
@@ -780,6 +853,20 @@ def run_optimize(
     print(f"\n裸买价 ¥{FEN(baseline.price_fen)}  →  到手 ¥{FEN(best.price.price_fen)}")
     print(f"真实省下 ¥{FEN(saved)}（接口 discount 报 ¥{FEN(best.price.discount_fen)}，含卡费口径）")
 
+    # 拆开「券省了多少 / 卡省了多少」。挤在一行总数里，用户按菜单价自己算
+    # 加不出这个数，只会以为工具在编 —— 而且办卡是要花钱的，这笔必须单独看见。
+    if best.with_order is not None:
+        no_wo = optimizer.try_evaluate(
+            cart, Assignment(mapping=best.mapping, with_order=None)
+        )
+        if no_wo is None:
+            print("  （预算不足，没能拆出券与随单购各自的贡献，--budget 调大可看到）")
+        else:
+            coupon_gain = baseline.price_fen - no_wo.price_fen
+            wo_gain = no_wo.price_fen - best.price.price_fen
+            print(f"  ├ 券本身省 ¥{FEN(coupon_gain)}")
+            print(f"  └ 「{best.with_order.label}」再省 ¥{FEN(wo_gain)}（卡费另算，买卡前先算这笔）")
+
     extra = 0
     if insights:
         extra = _print_insights(oracle, cart, coupons, best, shared)
@@ -795,7 +882,9 @@ def run_optimize(
                     cart=cart,
                     paid_fen=best.price.price_fen,
                     baseline_fen=baseline.price_fen,
-                    discount_fen=best.price.discount_fen,
+                    # 存"真实节省"而不是接口 discount：后者含卡费口径，
+                    # 会被当成"我这次省了这么多"读出去。
+                    discount_fen=saved,
                     store_code=store_code,
                     store_name=store.get("storeName", ""),
                     city=city,
@@ -874,8 +963,10 @@ def run_compare(
         if isinstance(s.get("distance"), (int, float))
         else 10**9
     )
-    if top > 0:
-        stores = stores[:top]
+    clamped = clamp_top(top)
+    if clamped != top:
+        print(f"--top 需在 1..{MAX_COMPARE_STORES} 之间，已按 {clamped} 处理。")
+    stores = stores[:clamped]
     if not stores:
         print("附近没有正在营业的门店，换个关键词试试。")
         return 1
@@ -1095,7 +1186,12 @@ def run_forget(last: int, all_: bool) -> int:
         n = clear_all()
         print(f"已清空本地账本，共移除 {n} 条记录。")
         return 0
-    n = delete_last(max(last, 1))
+    # max(last, 1) 会把「我一条都不想删」变成「删 1 条」。
+    # --last 0 的语义是明确的：别动我的账本。
+    if last <= 0:
+        print("--last 需要是正整数；一条都不撤回，账本未改动。")
+        return 0
+    n = delete_last(last)
     if n == 0:
         print("账本是空的，没有可撤回的记录。")
         return 1
@@ -1224,15 +1320,22 @@ def run_replay(store_code: str | None, list_only: bool) -> int:
     # 存一份今天的快照，下次就能比
     from .snapshot import entry_from_cart, save as save_snapshot
 
-    label = ""
-    if isinstance(best.with_order, dict):
-        label = best.with_order.label
+    # WithOrderOption 是 frozen dataclass，不是 dict —— 判 isinstance(..., dict)
+    # 恒为 False，标签永远是空串。这个坑在 oracle.py 里踩过一次（随单购一次都没
+    # 真的发出去过），run_optimize 已经改了，run_replay 是第二处残留。
+    label = best.with_order.label if best.with_order is not None else ""
+
+    # 裸买价必须自己算一遍，不能用接口返回的 original_fen：
+    # 一旦最优解选了随单购档位，接口会把卡费算进 originalPrice，
+    # 于是"省下的钱"里凭空多出卡费那部分。实测同一单差 ¥9.90，
+    # 而 brag 是对全量快照求和的 —— 每跑一次 replay，累计节省就被虚高一次。
+    baseline = optimizer.evaluate(cart, Assignment(mapping={}, with_order=None))
     save_snapshot(
         entry_from_cart(
             cart=cart,
             paid_fen=best.price.price_fen,
-            baseline_fen=best.price.original_fen,
-            discount_fen=best.price.discount_fen,
+            baseline_fen=baseline.price_fen,
+            discount_fen=baseline.price_fen - best.price.price_fen,
             store_code=target_store,
             store_name="",
             city="",
@@ -1245,6 +1348,13 @@ def run_replay(store_code: str | None, list_only: bool) -> int:
 
 
 def run_nutrition(city: str, keyword: str, kcal: int, size: int) -> int:
+    # 组合枚举的规模随 size 指数增长，必须夹住。
+    # 早先 --size 是裸 int：nutrition --size 50 会让进程无输出地跑到天荒地老，
+    # 用户只能 Ctrl-C，而且不知道是自己参数给大了。
+    clamped = clamp_size(size)
+    if clamped != size:
+        print(f"--size 需在 1..{MAX_MEAL_SIZE} 之间（再大组合数会爆炸），已按 {clamped} 处理。")
+        size = clamped
     """热量预算搭配：给定热量上限，挑出蛋白质最高的合法组合。"""
     from .mcd_client import McdMcpClient, extract_payload
     from . import nutrition as nut
@@ -1751,13 +1861,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n{exc}")
         print("算价调用预算太小，没算出结果。把 --budget 调大再试，例如 --budget 80。")
         return 3
-    except McpError as exc:
-        # Token 失效、限流、网络错误都走这里。
+    except McpFatalError as exc:
+        # 环境故障：Token 失效 / 限流 / 断网 / 服务端 5xx。
         # 直接抛 traceback 对使用者毫无帮助，给一句能照着做的提示。
         print(f"\n接口调用失败：{exc}")
         print("常见原因：Token 失效（到 https://open.mcd.cn/mcp 重新激活）、")
         print("          网络不通（本机需要代理时请设置 https_proxy）、")
         print("          或触发限流（每 Token 600 次/分钟）。")
+        return 2
+    except McpError as exc:
+        # 业务性拒绝：工具调通了、对面也回答了，只是答案是否定的
+        #（券不适用这家店 / storeCode 与 beCode 不配对 / 门店不支持该券）。
+        # 这时候再印上面那三行「Token 失效」只会误导人去重新激活一个好端端的 Token。
+        print(f"\n接口拒绝了这次请求：{exc}")
+        print("这不是网络或 Token 问题 —— 换一家门店、换个商品，或换张券试试。")
         return 2
 
 
@@ -1774,7 +1891,7 @@ def _dispatch(args) -> int:
     if args.cmd == "advise":
         return run_advise(args.city, args.keyword, args.budget, args.store, args.days)
     if args.cmd == "campaign":
-        return run_campaign(max(1, args.days))
+        return run_campaign(_advise_within(args.days))
     if args.cmd == "audit":
         return run_audit(args.city, args.keyword, args.budget, args.limit, args.store)
     if args.cmd == "meal":

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
@@ -19,6 +20,11 @@ from typing import Any
 
 DEFAULT_BASE_URL = "https://mcp.mcd.cn"
 PROTOCOL_VERSION = "2025-06-18"
+
+# 「读到一半断了」这一类错误的集合。它们**不是** URLError：
+# urlopen() 已经成功返回了 response 对象，错是随后 resp.read() 抛的。
+# 漏掉这一层，用户看到的是一整屏 traceback，而不是「网络错误，请重试」。
+_TRANSIENT = (TimeoutError, http.client.HTTPException, OSError)
 
 
 def load_dotenv() -> None:
@@ -188,7 +194,9 @@ class McdMcpClient:
             req = urllib.request.Request(self.base_url, data=data, headers=headers)
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    raw = resp.read().decode("utf-8")
+                    # errors="replace"：服务端返回一个非 UTF-8 的错误页时，
+                    # 不要让 UnicodeDecodeError 在这里穿透成裸 traceback。
+                    raw = resp.read().decode("utf-8", errors="replace")
                     new_sid = resp.headers.get("Mcp-Session-Id")
                     if new_sid:
                         self.session_id = new_sid
@@ -204,12 +212,25 @@ class McdMcpClient:
                 )
                 if not retryable or attempt >= self.max_retries:
                     raise last_exc from exc
-            except urllib.error.URLError as exc:
-                last_exc = McpFatalError(f"网络错误: {exc.reason}")
+            except _TRANSIENT as exc:
+                # 这几类都发生在「读到一半」：响应头到了但 body 没来。
+                # 它们**不是** URLError —— urlopen() 已经成功返回了，
+                # 是随后的 read() 抛的。漏掉这一层，用户看到的就是一整屏
+                # traceback 而不是「网络错误，请重试」。
+                #   http.client.RemoteDisconnected  代理掐断 / Connection reset
+                #   TimeoutError (builtins)         读超时（socket.timeout 的别名）
+                #   http.client.HTTPException      响应头畸形 / IncompleteRead
+                #   OSError                        连接被重置等底层错误
+                last_exc = McpFatalError(f"网络错误: {exc}")
                 if attempt >= self.max_retries:
                     raise last_exc from exc
 
-            time.sleep(self.backoff_base * (2**attempt))
+            # 429 用的是 60 秒窗口，0.5s/1s 的退避必然还是 429。退避必须按
+            # 限流窗口量级来，否则"重试"只是把限流窗口拖得更长。
+            backoff = self.backoff_base * (2**attempt)
+            if last_exc is not None and "触发限流" in str(last_exc):
+                backoff = min(max(backoff, 5.0), 30.0)
+            time.sleep(backoff)
 
         raise last_exc if last_exc else McpFatalError("请求失败")
 

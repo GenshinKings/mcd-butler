@@ -104,7 +104,12 @@ class MealDetail:
             if base is None:
                 continue
             for c in r.choices:
-                if c.code == base.code:
+                # 按**身份**跳过默认项，不能按 code 相等：
+                # 实测 choices 里 code 这个字段是可能缺失的，那时所有项的
+                # code 都是空串、彼此相等，于是整环被全部跳过 ——
+                # 「换成这些反而更便宜」这一段会整个消失，用户拿不到唯一
+                # 那个能直接少付钱的信息。
+                if c is base:
                     continue
                 if c.diff_fen < 0:
                     out.append((base, c))

@@ -22,7 +22,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-SNAPSHOT_DIR = Path.home() / ".mcd-butler"
+def _home_dir() -> Path:
+    """家目录。不能放在模块级求值 —— HOME 未设置时 Path.home() 会抛
+    RuntimeError，而且是 **import 阶段** 就炸，用户连「读不到家目录」
+    这句提示都来不及看到（brag / forget / replay --list 会一起死）。"""
+    try:
+        return Path.home()
+    except RuntimeError:
+        return Path.cwd()
+
+
+SNAPSHOT_DIR = _home_dir() / ".mcd-butler"
 SNAPSHOT_FILE = SNAPSHOT_DIR / "snapshots.json"
 
 FMT = "%Y-%m-%d %H:%M"

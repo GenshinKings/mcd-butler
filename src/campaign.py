@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date
+from typing import Sequence
 
 # 日期标题。级别用 `#{2,6}` 而不是写死 `####`：
 # 同一份报文里「### 当前时间」「### 活动列表」已经是三级标题了，

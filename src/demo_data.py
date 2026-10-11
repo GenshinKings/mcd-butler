@@ -87,7 +87,7 @@ DEMO_COUPONS: list[Coupon] = [
     Coupon(
         coupon_id="C4",
         coupon_code="DEMO-C4",
-        title="饮料免费升杯",
+        title="中杯可乐立减 3 元",
         product_codes=frozenset({"D005"}),
         valid_until=_days(20),
     ),
@@ -109,10 +109,9 @@ _DEMO_DISCOUNT = {"C1": 500, "C2": 400, "C3": 1200, "C4": 300, "C5": -100}
 # 演示里 payload 没有真实含义，但保持跟线上同构，离线才能测到线上会走的代码路径。
 DEMO_WITH_ORDER_OPTIONS = [
     None,
-    WithOrderOption(payload={"membershipCode": "DEMO-BREAKFAST"}, label="早餐卡（随单购）"),
     WithOrderOption(payload={"membershipCode": "DEMO-GOLD"}, label="麦金卡（随单购）"),
 ]
-_DEMO_WITH_ORDER_DISCOUNT = {"": 0, "早餐卡（随单购）": 200, "麦金卡（随单购）": 600}
+_DEMO_WITH_ORDER_DISCOUNT = {"": 0, "麦金卡（随单购）": 600}
 
 
 # ---------------------------------------------------------------- 演示算价器

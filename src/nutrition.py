@@ -124,6 +124,22 @@ def match_menu(menu: list, nutrition: dict[str, dict]) -> list[tuple]:
 # 参考量级：C(150,4) ≈ 2000 万，实测要跑 30 秒；收到 3 万以内是零点几秒。
 MAX_COMBOS = 30_000
 
+# size 的硬上限。没有它，`--size 50` 会让组合枚举跑到 9e15 量级；
+# _trim_pool 只是裁剪候选池的兜底，真正的闸门必须在入口就夹住。
+MAX_MEAL_SIZE = 5
+
+
+def clamp_size(size: int) -> int:
+    """把 --size 夹回可枚举的范围。
+
+    单独成函数而不是写在 CLI 里：`_trim_pool` 是按「传进来的 size」算枚举量的，
+    只要 size 够大，它自己也会把池子裁到近乎不裁（size=50 时直接留 50 个候选）。
+    所以闸门必须在入口，而且要能被离线断言到。
+    """
+    if size < 1:
+        return 1
+    return min(size, MAX_MEAL_SIZE)
+
 
 def _trim_pool(cands: list[tuple], size: int) -> list[tuple]:
     """把候选池收窄到「组合数不超过上限」的规模。
@@ -141,12 +157,22 @@ def _trim_pool(cands: list[tuple], size: int) -> list[tuple]:
     n = len(cands)
     budget = MAX_COMBOS
     pool = n
-    # 逐步缩小候选数，直到组合数落回上限内
+    # 逐步缩小候选数，直到组合数落回上限内。
+    #
+    # 注意：这里算的是 **全部枚举量** sum(C(pool, i), i=1..size)，不是 C(pool, size)。
+    # 早先只算 C(pool, size)，于是 --size 50 时被裁到 53 个候选就认为"安全"了 ——
+    # 但 plan() 枚举的是 i=1..size 的每一档，真实规模由最大的那一项决定：
+    # C(53, 26) ≈ 9.0e15。进程无输出、无进度、无警告地跑到天荒地老，
+    # 用户只能 Ctrl-C。二项式系数在中间最大，只看端点等于没看。
     while pool > size:
+        total = 0
         combos = 1
         for i in range(1, min(size, pool) + 1):
             combos = combos * (pool - i + 1) // i
-        if combos <= budget:
+            total += combos
+            if total > budget:
+                break
+        if total <= budget:
             break
         pool -= 1
     pool = max(pool, size)
