@@ -484,12 +484,11 @@ def render(
     head = "券包体检"
     if store_name:
         head += f" · {store_name}"
-    lines.append("═" * 58)
     lines.append(f"  {head}")
-    lines.append("═" * 58)
+    lines.append("")
 
     scope = f"在售 {menu_count} 件 · 券池 {total_coupons or len(verdicts)} 张"
-    lines.append(f"  {scope} · 本次体检 {len(verdicts)} 张（真打 {calls} 次算价接口）")
+    lines.append(f"  {scope} · 本次体检 {len(verdicts)} 张")
     lines.append("")
 
     worth, dud, dead = health_score(verdicts)
@@ -519,7 +518,7 @@ def render(
         [v for v in verdicts if v.status == WORTH], key=lambda v: -v.value_fen
     )[:3]
     if good:
-        lines.append("── 最值钱的券 " + "─" * 44)
+        lines.extend(["", "  ── 最值钱的券"])
         for v in good:
             lines.append(f"  ¥{yuan(v.value_fen)}  {v.coupon.title}")
             if v.best_item is not None:
@@ -532,9 +531,9 @@ def render(
     # ── 试出来的门槛：接口从不说门槛在哪，只能靠「便宜的挂不上、贵的挂得上」反推
     thresholds = [v for v in verdicts if v.threshold_note()]
     if thresholds:
-        lines.append("── 试出来的门槛 " + "─" * 43)
+        lines.extend(["", "  ── 试出来的门槛"])
         for v in thresholds:
-            lines.append(f"  ? {v.coupon.title}　{v.threshold_note()}")
+            lines.append(f"  · {v.coupon.title}\n      {v.threshold_note()}")
         lines.append("")
 
     # ── 面额 vs 真实价值：这条最容易让人「哦原来如此」
@@ -544,7 +543,7 @@ def render(
         if v.status == WORTH and v.face_fen > 0 and v.gap_fen >= 100
     ]
     if boasters:
-        lines.append("── 券面额 ≠ 券价值 " + "─" * 40)
+        lines.extend(["", "  ── 券面额 ≠ 券价值"])
         for v in sorted(boasters, key=lambda v: -v.gap_fen):
             lines.append(
                 f"  ! {v.coupon.title}　标着减 ¥{yuan(v.face_fen)}，"
@@ -555,7 +554,7 @@ def render(
     # ── 废券
     duds = [v for v in verdicts if v.status == DUD]
     if duds:
-        lines.append("── 看着挺猛，其实没用 " + "─" * 37)
+        lines.extend(["", "  ── 看着挺猛，其实没用"])
         for v in duds:
             face = f"（标着减 ¥{yuan(v.face_fen)}）" if v.face_fen > 0 else ""
             lines.append(f"  × {v.coupon.title}{face}")
@@ -577,7 +576,7 @@ def render(
     # ── 死券
     deads = [v for v in verdicts if v.status == DEAD]
     if deads:
-        lines.append("── 这家店用不上 " + "─" * 42)
+        lines.extend(["", "  ── 这家店用不上"])
         for v in deads:
             lines.append(f"  · {v.coupon.title}")
             if v.note:
@@ -593,7 +592,7 @@ def render(
         if label:
             due.append((days, v))
     if due:
-        lines.append("── 快过期 " + "─" * 48)
+        lines.extend(["", "  ── 快过期"])
         for days, v in sorted(due, key=lambda x: x[0]):
             _, label = _due_note(v.coupon, now)
             worth_txt = (

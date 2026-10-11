@@ -323,9 +323,7 @@ def render(
     """渲染活动日历。"""
     base = today or date.today()
     lines: list[str] = []
-    lines.append("═" * 58)
     lines.append("  麦门活动日历")
-    lines.append("═" * 58)
     lines.append(f"  今天 {base.isoformat()} {_WEEKDAYS[base.weekday()]}")
     lines.append("")
 

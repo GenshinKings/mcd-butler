@@ -120,6 +120,8 @@ def redundant_coupons(
             break  # 全局预算见底，剩下的券这次不查了
         reduced = {k: v for k, v in best.mapping.items() if k != item_idx}
         cand = Assignment(mapping=reduced, with_order=best.with_order)
+        _stats = getattr(oracle, "calls", None)
+        _before = _stats["calls"] if isinstance(_stats, dict) else None
         try:
             price = oracle(cart, cand)
         except (TypeError, ValueError, KeyError):
@@ -127,7 +129,10 @@ def redundant_coupons(
             # 网络/鉴权故障必须往上抛，否则会把故障伪装成「没有冗余券」。
             continue
         # 先算价、成功后才扣预算：失败时不会白白吃掉一次调用额度。
-        if budget is not None:
+        # 命中共享缓存时同样不扣 —— 那一趟只是查表，没有真的打扰麦当劳。
+        # 「已挂的最优解去掉某张券」这个候选，爬山过程的邻域 1（删除）极可能
+        # 已经算过，这一步是纯粹的白捡。
+        if budget is not None and (not isinstance(_stats, dict) or _before != _stats["calls"]):
             budget.spend()
         if price.price_fen == best.price.price_fen:
             out.append((cart[item_idx], coupons[ci]))

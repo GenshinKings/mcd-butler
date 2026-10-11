@@ -566,6 +566,179 @@ def run() -> int:
         f"平均差 {avg_gap / 100:.2f} 元",
     )
 
+    # 15b. 算价缓存：跨求解器共享 + 键必须带上购物车
+    # 起因是一次 advise 会建十几个 CouponOptimizer（求边际成本每件一个、
+    # 拆单每件两个），各自持一份互不相通的缓存，同样的方案被反复付费重算。
+    from .oracle import cached_oracle, cart_fingerprint, real_calls as _real_calls
+
+    _net = {"n": 0}
+
+    def _counting(items, assignment):
+        _net["n"] += 1
+        _base = sum(i.unit_price_fen * i.quantity for i in items)
+        return PriceResult(price_fen=_base - len(assignment.mapping) * 300,
+                           original_fen=_base)
+
+    _co = cached_oracle(_counting)
+    _cA = [CartItem(product_code="P1", quantity=1, unit_price_fen=1000)]
+    _same = Assignment(mapping={0: 0})
+    _r1 = _co(_cA, _same)
+    _r2 = _co(_cA, _same)
+    check(
+        "缓存-同一个购物车+同一个方案只真正算一次",
+        _net["n"] == 1 and _real_calls(_co) == 1,
+        f"发了 {_net['n']} 次",
+    )
+    check(
+        "缓存-命中返回的价格与首次完全一致（纯记忆化，不改变结果）",
+        _r2.price_fen == _r1.price_fen,
+        f"{_r1.price_fen} vs {_r2.price_fen}",
+    )
+    # 键漏掉 cart 是会咬人的：有人把求解器提到循环外复用，下一个购物车
+    # 就会静默地用上一个购物车的价格，且查不出来。
+    _cB = [CartItem(product_code="P9", quantity=1, unit_price_fen=9900)]
+    _co(_cB, _same)
+    check(
+        "缓存-换一份购物车必须重新算价（缓存键含购物车指纹）",
+        _net["n"] == 2 and cart_fingerprint(_cA) != cart_fingerprint(_cB),
+        f"发了 {_net['n']} 次",
+    )
+
+    # 15b-2. 缓存命中不该扣预算：预算保护的是真实网络请求，
+    # 一次 advise 会新建十几个求解器，候选高度重叠；如果查表也算钱，
+    # 用户设的 --budget 等于被自己的缓存吃掉一半。
+    _net2 = {"n": 0}
+
+    def _counting2(items, assignment):
+        _net2["n"] += 1
+        _base = sum(i.unit_price_fen * i.quantity for i in items)
+        return PriceResult(price_fen=_base - len(assignment.mapping) * 300,
+                           original_fen=_base)
+
+    _shared_budget = Budget(50)
+    _co2 = cached_oracle(_counting2)
+    _optA = CouponOptimizer(_co2, max_calls=50, budget=_shared_budget)
+    _optB = CouponOptimizer(_co2, max_calls=50, budget=_shared_budget)
+    _a15 = Assignment(mapping={0: 0})
+    _optA.evaluate(_cA, _a15)
+    _after_first = _shared_budget.used
+    _optB.evaluate(_cA, _a15)  # 同一个购物车 + 同一个方案 → 应命中共享缓存
+    check(
+        "缓存-第二个求解器命中共享缓存时不扣预算也没发请求",
+        _shared_budget.used == _after_first and _net2["n"] == 1,
+        f"预算 {_after_first}→{_shared_budget.used}，实际请求 {_net2['n']} 次",
+    )
+
+    # T5 的源头：未收敛标记本身必须生效（前面的断言测的是 optimize 的收尾，
+    # 那句被抹掉时 `_stopped_early` 还能救回来，所以这里再钉一处）
+    _ce15 = CouponOptimizer(_counting2, max_calls=99)
+    _marked = _ce15._stopped_early(Assignment(mapping={}))
+    check(
+        "收敛-提前收工必须标记未收敛（不能悄悄说是最优）",
+        _marked.converged is False and _ce15._stopped is True,
+        f"converged={_marked.converged}",
+    )
+
+    # T11/T12：报错文案不许把 Python 类型名 / 原始响应体吐给用户
+    from . import oracle as _oracle15
+    from .mcd_client import McpError as _McpError15
+
+    class _BadClient:
+        def data(self, tool, arguments):
+            return ["not", "a", "dict"]  # 触发「非对象结构」那一条
+
+    try:
+        _oracle15.make_price_oracle(_BadClient(), "S1", [])(
+            [CartItem(product_code="P1", unit_price_fen=1000)], Assignment(mapping={})
+        )
+        _t11_msg = ""
+    except _McpError15 as _e15:
+        _t11_msg = str(_e15)
+    check(
+        "错误提示-Python 类型名（NoneType/list…）不许出现在报错里",
+        _t11_msg != "" and "list" not in _t11_msg and "NoneType" not in _t11_msg,
+        repr(_t11_msg),
+    )
+
+    import io as _io15b
+    import urllib.error as _uerr15
+    import urllib.request as _ureq15
+    from . import mcd_client as _mc15
+
+    _SECRET_BODY = b'{"phone":"13800000000","address":"secret"}'
+
+    def _http502(req, timeout=None):
+        raise _uerr15.HTTPError(req.full_url, 502, "err", {}, _io15b.BytesIO(_SECRET_BODY))
+
+    _real_urlopen15 = _ureq15.urlopen
+    try:
+        _ureq15.urlopen = _http502
+        _c502 = _mc15.McdMcpClient("tok", max_retries=0)
+        try:
+            _c502._post({"x": 1})
+            _t12_msg = ""
+        except Exception as _e502:  # noqa: BLE001
+            _t12_msg = str(_e502)
+    finally:
+        _ureq15.urlopen = _real_urlopen15
+    check(
+        "错误提示-HTTP 响应体不许原样透传给用户（可能含个人信息）",
+        '"error":"x"' not in _t12_msg and "502" not in _t12_msg,
+        repr(_t12_msg),
+    )
+
+    # 15c. 「这是最优」和「没算完」必须分开报
+    # 预算花光时爬山只是"邻域里暂时扫不动了"，把它说成最优解，
+    # 用户会拿着这个数字去下单，然后发现柜台那边还能更便宜。
+    import random as _rnd15
+
+    _conv = {"tight": 0, "loose": 0, "n": 0}
+    for _s15 in range(12):
+        _r15 = _rnd15.Random(_s15 * 31)
+        _c15, _k15, _o15, _w15 = _random_case(_r15)
+        try:
+            _tight = CouponOptimizer(_o15, max_calls=8).optimize(_c15, _k15, _w15)
+            _loose = CouponOptimizer(_o15, max_calls=400).optimize(_c15, _k15, _w15)
+        except Exception:  # noqa: BLE001
+            continue
+        if _tight.price is None or _loose.price is None:
+            continue
+        _conv["n"] += 1
+        _conv["tight"] += int(_tight.converged)
+        _conv["loose"] += int(_loose.converged)
+    check(
+        "收敛-预算给足时必须敢说「这就是最优」",
+        _conv["n"] > 0 and _conv["loose"] == _conv["n"],
+        f"{_conv['loose']}/{_conv['n']} 收敛",
+    )
+    check(
+        "收敛-预算卡死时不许假装是最优（那等于骗用户下单）",
+        _conv["tight"] < _conv["n"],
+        f"{_conv['tight']}/{_conv['n']} 标了收敛 —— 预算 8 次不可能全算完",
+    )
+    import io as _io15
+    import contextlib as _ctx15
+    from .cli import _print_search_note
+
+    _b15 = _io15.StringIO()
+    with _ctx15.redirect_stdout(_b15):
+        _quiet15 = _print_search_note(True, 40)
+    check(
+        "收敛-收敛时不啰嗦（不打扰是默认状态）",
+        _quiet15 == [] and _b15.getvalue() == "",
+        repr(_b15.getvalue()[:80]),
+    )
+    _b16 = _io15.StringIO()
+    with _ctx15.redirect_stdout(_b16):
+        _loud15 = _print_search_note(False, 40)
+    check(
+        "收敛-没算完要明确说「不保证最便宜」并给下一步",
+        _loud15 != []
+        and any("不保证" in ln for ln in _loud15)
+        and any("--budget 80" in ln for ln in _loud15),
+        repr(_loud15),
+    )
+
     # 16. 菜单/券名匹配：真实接口两侧命名不一致 + 商标符号的兜底
     # 真实数据：券 productName 写「麦咖啡™冰美式中杯」，菜单品名却是「麦咖啡™美式」，
     # 用户照着券名点「冰美式中杯」必须仍能匹配到正确商品（507411）。
@@ -720,12 +893,16 @@ def run() -> int:
             with _ctx.redirect_stdout(buf):
                 _explain_coupon_scope(n)
             outs.append(buf.getvalue())
-        # 0 张和 1 张必须解释「券码拿不到」这件事；
+        # 0 张和 1 张必须解释「为什么没用上」并且给下一步；
         # 2 张以上时券已经在用了，多说一句是噪音，故意不说。
+        #
+        # 判据是**语义**不是措辞 —— 早先这里钉的是「券码」这个词，
+        # 结果把面向用户的文案锁死在技术黑话上：想改成「限时券这儿用不上」
+        # 就得先改测试，本末倒置。真正要保证的是「解释+去处+该闭嘴时闭嘴」。
         check(
             "券范围-券没用上时要解释清楚，够用时不要啰嗦",
-            "券码" in outs[0]
-            and "券码" in outs[1]
+            outs[0] != outs[1]
+            and all("assets" in o and len(o.strip()) > 20 for o in outs[:2])
             and outs[2] == "",
             f"{outs!r}"[:160],
         )
@@ -1667,7 +1844,9 @@ def run() -> int:
     # 所以拆成了纯函数 `_backoff_for()`。这里既断言算出来的数，也断言真睡了。
     from .mcd_client import _backoff_for
 
-    _rl = McpFatalError("触发限流（每 Token 每分钟 600 次）。")
+    # 构造方式必须是 rate_limited 标记，而不是像以前那样拼一句「触发限流」的
+    # 错误消息去喂给关键词匹配 —— 那样断言跟着文案走，文案一改断言就失去意义。
+    _rl = McpFatalError(_mc._RATE_LIMIT_MSG, rate_limited=True)
     check(
         "传输层-429 退避必须 ≥5 秒（限流窗口 60 秒，退 0.5 秒等于没退）",
         _backoff_for(0, 0.5, _rl) >= 5.0,
@@ -1739,6 +1918,217 @@ def run() -> int:
         not any("重新激活" in l for l in _b_lines)
         and any("换一家门店" in l for l in _b_lines),
         str(_b_lines),
+    )
+
+    # ── 1d-2. 面向用户的文案不许夹带内部实现
+    # 这一版的起因：报错里出现过 `type(data).__name__`、`src/oracle.py`、
+    # `{price} 分`、`mapping[0]=3`，还有经 McpError 原样透传的 HTTP 响应体。
+    # 对写程序的人是线索，对使用者是天书；更糟的是响应体可能带个人信息。
+    from . import mcd_client as _mc
+
+    _internal_words = [
+        "Traceback",
+        "NoneType",
+        "src/oracle.py",
+        "as_fen",
+        "to_fen",
+        "tools/call",
+        "HTTPError",
+        "membershipCode=",
+    ]
+    _all_hints: list[str] = []
+    for _e in (
+        McpFatalError(_mc._RATE_LIMIT_MSG, rate_limited=True),
+        McpFatalError(_mc._HTTP_UNAVAILABLE_MSG.format(code=502)),
+        McpError("麦当劳接口这次没有返回数据，稍后再试。"),
+    ):
+        _all_hints += _error_hint(_e)[1]
+    _leaked = [w for w in _internal_words if any(w in ln for ln in _all_hints)]
+    check(
+        "错误提示-面向用户的文案不许出现 Traceback / 源码路径 / 内部字段名",
+        not _leaked,
+        f"泄漏：{_leaked}",
+    )
+    check(
+        "错误提示-限流单独一支，而不会被当成 Token 问题误导用户",
+        "隔一两分钟" in "\n".join(_error_hint(
+            McpFatalError(_mc._RATE_LIMIT_MSG, rate_limited=True))[1]),
+        str(_error_hint(McpFatalError(_mc._RATE_LIMIT_MSG, rate_limited=True))[1]),
+    )
+
+    # ── 1d-3. 未预料异常必须有人话出口，不能裸抛栈给使用者
+    import os as _os
+    import io as _io9
+    import contextlib as _ctx9
+    from .cli import _unexpected_error
+
+    _initial_debug = _os.environ.get("MCD_BUTLER_DEBUG")
+    try:
+        _os.environ.pop("MCD_BUTLER_DEBUG", None)
+        _buf9 = _io9.StringIO()
+        _err9 = _io9.StringIO()
+        # stdout **和 stderr 都要抓**：诊断信息本就该走 stderr，
+        # 只抓 stdout 的话「忘了关掉调试输出」这种改动一条都抓不到。
+        with _ctx9.redirect_stdout(_buf9), _ctx9.redirect_stderr(_err9):
+            _rc9 = _unexpected_error(RuntimeError("boom"))
+        _quiet = _buf9.getvalue() + _err9.getvalue()
+        _os.environ["MCD_BUTLER_DEBUG"] = "1"
+        _err10 = _io9.StringIO()
+        # stdout 也要重定向，否则这几行提示会真的印在自检的输出里，
+        # 看起来就像"自检运行中出了个 boom 异常"。
+        with _ctx9.redirect_stdout(_io9.StringIO()), _ctx9.redirect_stderr(_err10):
+            _unexpected_error(RuntimeError("boom"))
+        _loud = _err10.getvalue()
+    finally:
+        if _initial_debug is None:
+            _os.environ.pop("MCD_BUTLER_DEBUG", None)
+        else:
+            _os.environ["MCD_BUTLER_DEBUG"] = _initial_debug
+
+    check(
+        "兜底-未预料异常默认不把 traceback 甩给使用者（stdout 和 stderr 都不许）",
+        "Traceback" not in _quiet and "runtimeerror" not in _quiet.lower(),
+        repr(_quiet[:160]),
+    )
+    check(
+        "兜底-未预料异常要给「没碰你的钱」和去哪儿反馈",
+        "支付" in _quiet and "issues" in _quiet,
+        repr(_quiet[:160]),
+    )
+    check(
+        "兜底-设了 MCD_BUTLER_DEBUG 才给栈（排障通道必须留着）",
+        # 查「有没有栈帧」而不是 "Traceback" 字面：没经过 raise 的异常没有
+        # traceback 对象，这时走的是 print_stack()，输出里只有 File "…
+        'File "' in _loud and "boom" in _loud,
+        repr(_loud[-160:]),
+    )
+    check("兜底-异常退出码统一为 4", _rc9 == 4, str(_rc9))
+
+    # ── 1f. 面向用户的输出不许夹带内部实现 / 隐私
+    # 这一组的起因很具体：曾经屏幕上出现过 membershipCode、订单号、
+    # C:\Users\张三\.mcd-butler\、NoneType、tools/call、以及整个 HTTP 响应体。
+    # 其中订单号和响应体是**隐私泄露**（能反查到手机号 / 地址 / 支付流水），
+    # 其余是让用户以为自己把软件装坏了。
+    import pathlib as _pl15
+    import subprocess as _sp15
+
+    _root15 = str(_pl15.Path(__file__).resolve().parent.parent)
+    _screen = ""
+    for _cmd15 in ("demo", "demo --all"):
+        _r15b = _sp15.run(
+            [_sp15.sys.executable, "-m", "src.cli", *_cmd15.split()],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", cwd=_root15,
+        )
+        _screen += (_r15b.stdout or "") + (_r15b.stderr or "")
+
+    _forbidden = [
+        "membershipCode=",          # 会员卡内部编码
+        "storeCode=",               # 接口字段名
+        "Traceback (most recent",   # 给使用者看的裸栈
+        "NoneType",                 # Python 类型名
+        "tools/call",               # RPC 内部方法名
+        "src/oracle.py",            # 源码路径
+        ":\\Users\\",               # 家目录，含本机用户名
+        "算价接口返回了非对象结构",
+        "as_fen",
+    ]
+    _sep15 = [w for w in _forbidden if w in _screen]
+    check(
+        "隐私-面向用户的输出不含内部标识 / 家目录 / 裸 traceback",
+        not _sep15,
+        f"泄漏：{_sep15}",
+    )
+    check(
+        "隐私-演示输出确实抓到了内容（上面的检查不是空跑）",
+        len(_screen.strip()) > 200 and "省下" in _screen,
+        f"只抓到 {len(_screen)} 字符",
+    )
+
+    # 上面那条端到端扫描覆盖不到所有分支（很多路径 demo 走不到），
+    # 所以这几处关键文案再各钉一根钉子 —— 都是抽出来的纯函数。
+    from .cli import (
+        _format_quote_row,
+        _replay_source,
+        _snapshot_saved_note,
+        _with_order_options,
+    )
+
+    _wo15 = _with_order_options([
+        CartItem(product_code="P1", membership_code="SECRET-123",
+                 needs_with_order=True, discount_type="随单购麦金卡优惠")
+    ])
+    check(
+        "隐私-会员卡编码不许出现在任何 label 里（只许留在 payload）",
+        len(_wo15) >= 2
+        and all(o is None or "membershipCode" not in (o.label or "") for o in _wo15)
+        and any("SECRET-123" in str(getattr(o, "payload", {})) for o in _wo15 if o),
+        repr([getattr(o, "label", None) for o in _wo15]),
+    )
+    _src = _replay_source({"orderId": "ORDER-SECRET-9", "createTime": "2026-07-14 12:31:05"})
+    check(
+        "隐私-订单号不许上屏（能在客服系统反查手机号/地址/支付流水）",
+        "ORDER-SECRET-9" not in _src and "2026-07-14" in _src,
+        repr(_src),
+    )
+    check(
+        "隐私-账本路径不许打印绝对路径（家目录含本机用户名）",
+        "Users" not in _snapshot_saved_note("C:\\Users\\张三\\.mcd-butler\\s.json")
+        and ".mcd-butler" in _snapshot_saved_note("/x")
+        and "C:" not in _snapshot_saved_note("C:\\Users\\张三\\x.json"),
+        repr(_snapshot_saved_note("C:\\Users\\张三\\.mcd-butler\\s.json")),
+    )
+
+    # compare 表格：金额必须带 ¥，否则用户分不清 36.00 是元还是分
+    class _Q15:
+        store_name = "人民广场麦当劳餐厅（一号店）超长名字测试"
+        distance_m = 1440
+        paid_fen = 3600
+        total_fen = 3800
+        comparable = True
+        missing: list[str] = []
+
+        class travel:  # noqa: N801
+            minutes = 40
+            money_fen = 200
+
+    # 中文对齐：这一条是用户抱怨过的（"格式不够美观，看得很累"）。
+    # 判据是**金额列的显示列位置**必须一致 —— 只查字符串长度没用，
+    # `:<18` 补出来的字符串长度反而相同，只是显示出来差两格。
+    from .cli import _dw as _dw15, _format_cart_line, _pad as _pad15
+
+    def _col_of_yuan(line: str) -> int:
+        return _dw15(line[: line.index("¥")])
+
+    _l1 = _format_cart_line("巨无霸", 2500)
+    _l2 = _format_cart_line("麦辣鸡腿堡", 1800)
+    _l3 = _format_cart_line("香辣鸡腿堡中份薯条中杯可乐", 3900)
+    _l4 = _format_cart_line("Beef Burger", 2200)
+    check(
+        "版式-中文商品名按显示宽度对齐（金额列必须落在同一列）",
+        len({_col_of_yuan(x) for x in (_l1, _l2, _l3, _l4)}) == 1,
+        f"¥ 的列位置：{[ _col_of_yuan(x) for x in (_l1, _l2, _l3, _l4)]}｜{_l1!r} {_l2!r}",
+    )
+    check(
+        "版式-_pad 按显示宽度补（中文一个字算两列）",
+        _dw15(_pad15("巨无霸", 18)) == 18 and _dw15(_pad15("麦辣鸡腿堡", 18)) == 18,
+        f"{_dw15(_pad15('巨无霸', 18))} / {_dw15(_pad15('麦辣鸡腿堡', 18))}",
+    )
+    check(
+        "版式-购物车行的数量/备注不影响金额列位置",
+        _col_of_yuan(_format_cart_line("巨无霸", 2500, qty="×2  "))
+        == _col_of_yuan(_format_cart_line("巨无霸", 2500, qty="×2  ")),
+    )
+
+    _row15 = _format_quote_row(_Q15(), comparable=True)
+    check(
+        "版式-compare 每行金额都必须带 ¥（裸数字看不出单位）",
+        _row15.count("¥") == 3,
+        repr(_row15),
+    )
+    check(
+        "版式-compare 缺货行也要跟表头对齐，不能裸有没有 ¥ 的混排",
+        "缺货" in _format_quote_row(_Q15(), comparable=False),
     )
 
     # ── 1e. 随单购标签 / 裸买基准（原先埋在 run_replay 里，改坏没人知道）
@@ -2142,7 +2532,7 @@ def run() -> int:
         "挂券后小计 ¥42.00",
         "随单购「麦金卡（随单购）」再减 ¥6.00",
         "到手 ¥6.00（省 ¥6.00，力度 50%）",
-        "菜单标 ¥62.90 是「随单购麦金卡优惠」",
+        "标的 ¥62.90 是「随单购麦金卡优惠」价",
         "标着减 ¥8.00，实测只省 ¥5.00",
         "¥10.00 的商品上不生效，¥25.00 的才生效",
         # 券名也算契约：README 里贴的券名和 demo_data.py 里的必须一致，

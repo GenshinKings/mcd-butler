@@ -197,9 +197,11 @@ def build(
                 # 不能写「多半是……」。自己都拿不准的措辞，读者只会更不信。
                 # 挂券变贵的机制是确定的：这张券没到门槛，券本身不生效，
                 # 但"挂券"这个动作会把这件商品从原本更划算的默认折扣里摘出去。
+                # 控制台 80 列，一句话塞满会到 89 列直接折行 —— 折行位置不在
+                # 句读上，读起来更费劲。所以显式拆成「结果 / 原因」两行。
                 reading.note = (
-                    f"挂券反而贵 ¥{abs(saved) / 100:.2f}"
-                    "（门槛没到，券不生效，还把原本的折扣顶掉了）"
+                    f"挂券反而贵 ¥{abs(saved) / 100:.2f}\n"
+                    "      这张券没到门槛、不会生效，却把原本的默认折扣顶掉了"
                 )
                 traps.append(reading)
                 covered.add(code)
@@ -257,8 +259,9 @@ def build(
                 base_fen=i.list_price_fen,
                 saved_fen=-gap,
                 note=(
-                    f"菜单标 ¥{i.unit_price_fen / 100:.2f} 是「{cond}」，"
-                    f"不满足条件就按 ¥{i.list_price_fen / 100:.2f} 结 —— 差 ¥{gap / 100:.2f}"
+                    f"标的 ¥{i.unit_price_fen / 100:.2f} 是「{cond}」价\n"
+                    f"      不满足条件要按 ¥{i.list_price_fen / 100:.2f} 结账，"
+                    f"差 ¥{gap / 100:.2f}"
                 ),
             )
         )
@@ -324,8 +327,8 @@ def render(day: dict, butler_line: str = "") -> str:
     week = "一二三四五六日"[now.weekday()]
     lines = [
         "",
-        f"════════ 麦门黄历 · {now:%Y-%m-%d} 周{week} · {day['period']} ════════",
-        f"  {day['tip']}　（本张黄历实打实算了 {day['probes']} 次价）",
+        f"  麦门黄历 · {now:%Y-%m-%d} 周{week} · {day['period']}",
+        f"  {day['tip']}",
         "",
     ]
     if not day["readings"]:

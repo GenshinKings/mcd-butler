@@ -104,9 +104,10 @@ def save(entry: dict) -> Path:
         backup = SNAPSHOT_FILE.with_name(f"snapshots.corrupt-{stamp}.json")
         try:
             SNAPSHOT_FILE.replace(backup)
-            print(f"⚠️ 快照文件损坏，已备份到 {backup}，本次将重新开始记录。")
+            # 不打印绝对路径：家目录含本机用户名。文件名本身够了。
+            print(f"⚠️ 账本文件损坏，坏的那份已另存为 {backup.name}，本次从头开始记。")
         except OSError:
-            print(f"⚠️ 快照文件损坏且无法备份（{SNAPSHOT_FILE}），本次将重新开始记录。")
+            print("⚠️ 账本文件损坏且无法备份，本次从头开始记。")
         entries = []
 
     entry = dict(entry)
@@ -120,7 +121,7 @@ def save(entry: dict) -> Path:
 def load_all() -> list[dict]:
     entries, broken = _read()
     if broken:
-        print(f"⚠️ 快照文件读不出来（{SNAPSHOT_FILE}），本次按空处理，未做任何写入。")
+        print("⚠️ 账本文件读不出来，本次按空处理，没有改动原来的文件。")
     return entries
 
 

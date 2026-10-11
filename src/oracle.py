@@ -34,6 +34,65 @@ from .mcd_client import McpError
 PriceOracle = Callable[[list[CartItem], Assignment], PriceResult]
 
 
+def cart_fingerprint(items: Sequence[CartItem]) -> tuple:
+    """购物车指纹：商品码 + 数量 + 单价。
+
+    为什么缓存键里必须有它：`evaluate(cart, assignment)` 的价格同时对购物车
+    和挂券方案两者敏感，而 `Assignment.signature()` 只编码了后者。
+    目前每个求解器恰好只服务一个购物车所以没出事，但只要有人把
+    `CouponOptimizer` 提到循环外复用（很自然的重构），下一个购物车就会静默地
+    用上一个购物车的价格 —— 查错成本极高。
+    """
+    return tuple(
+        (
+            it.product_code,
+            int(it.quantity or 1),
+            it.unit_price_fen,
+            it.list_price_fen,
+            it.needs_with_order,
+        )
+        for it in items
+    )
+
+
+def cached_oracle(oracle: PriceOracle) -> PriceOracle:
+    """给算价器套一层跨调用共享的记忆化。
+
+    为什么必须在这一层：`_cache` 挂在 CouponOptimizer 实例上时，一次 `advise`
+    会新建十几个求解器（求边际成本每件一个、拆单建议每件两个），每个带一份
+    互不相通的缓存。实测 `--budget 500` 时 181 次网络请求只对应 70 个不同的
+    方案，六成在重复计算 —— 而这六成全是付费的网络往返。
+
+    纯记忆化：**不增删任何候选、不改任何一步的搜索轨迹**，结果 100% 一致。
+    省下来的调用额度还给搜索，所以质量只会变好，不会变坏。
+    """
+    cache: dict[tuple, PriceResult] = {}
+    stats = {"calls": 0, "hits": 0}
+
+    def wrapped(items: list[CartItem], assignment: Assignment) -> PriceResult:
+        key = (cart_fingerprint(items), assignment.signature())
+        hit = cache.get(key)
+        if hit is not None:
+            stats["hits"] += 1
+            return hit
+        result = oracle(items, assignment)
+        stats["calls"] += 1
+        cache[key] = result
+        return result
+
+    # 这两个属性给调用方做「这次到底有没有发请求」的判断，
+    # 预算要按真实网络请求计，不能按 evaluate 次数计。
+    wrapped.calls = stats  # type: ignore[attr-defined]
+    wrapped.cache = cache  # type: ignore[attr-defined]
+    return wrapped
+
+
+def real_calls(oracle: PriceOracle) -> int:
+    """取出一个算价器实际发出的网络请求数（被 `cached_oracle` 包过才>0 有意义）。"""
+    stats = getattr(oracle, "calls", None)
+    return int(stats["calls"]) if isinstance(stats, dict) else -1
+
+
 def make_price_oracle(
     client,
     store_code: str,
@@ -65,12 +124,13 @@ def make_price_oracle(
 
         data = client.data("calculate-price", payload)
         if not isinstance(data, dict):
-            raise McpError(f"算价接口返回了非对象结构：{type(data).__name__}")
+            # type().__name__ 是 Python 类型名（list/NoneType），只在内部有意义。
+            raise McpError("麦当劳算价接口这次返回的数据格式不对，请稍后再试。", data)
 
         # price 缺失时必须报错，不能静默当 0 分 ——
         # 0 是最小值，优化器会把「没算出来」当成「最便宜」而选中它。
         if data.get("price") is None or data.get("price") == "":
-            raise McpError("算价接口未返回 price 字段，无法判断这一单的价格")
+            raise McpError("麦当劳算价接口这次没返回价格，请稍后再试。", data)
 
         _assert_quantity_kept(payload_items, data)
         _assert_price_scale(data, items)
@@ -83,7 +143,9 @@ def make_price_oracle(
             packing_fen=as_fen(data.get("packingPrice")),
         )
 
-    return oracle
+    # 套一层记忆化：一次命令行会跑好几路分析（寻优 / 边际成本 / 拆单 / 冗余券），
+    # 彼此的候选高度重叠。没有它，同样的 arrignment 会被反复付费重算。
+    return cached_oracle(oracle)
 
 
 def _expand(
@@ -114,7 +176,9 @@ def _expand(
             # 「假装挂了券却没挂」，算出一个比真实更贵的价，
             # 优化器还会把它当成「挂券方案」采纳 —— 必须报错。
             raise McpError(
-                f"券下标越界：mapping[{idx}]={ci}，但券池只有 {len(coupons)} 张"
+                "这张券挂不上去，已跳过。"
+                f"（第 {idx + 1} 件商品挂了第 {ci + 1} 张券，但这次只取到 {len(coupons)} 张）",
+                {"idx": idx, "coupon_index": ci, "pool": len(coupons)},
             )
         qty = max(1, int(item.quantity or 1))
         for k in range(qty):
@@ -171,20 +235,24 @@ def _assert_price_scale(data: dict, items: Sequence[CartItem]) -> None:
     """
     raw = data.get("price")
     if isinstance(raw, str) and "." in raw:
+        # 原来这里写着「请提 issue 或在 src/oracle.py 里切换 as_fen → to_fen」——
+        # 源码路径和函数名是给维护者看的，打给消费者只会让人以为自己装坏了。
         raise McpError(
-            f"算价接口的 price 变成了带小数点的字符串 {raw!r} —— "
-            "本项目按「分」读取金额（as_fen），元口径会让它读成 ¥0.57 这种假价格。"
-            "这是接口改版，请提 issue 或在 src/oracle.py 里切换 as_fen → to_fen。"
+            "麦当劳算价接口这次返回的金额格式变了（带小数点的 ¥xx.xx），"
+            "为避免算错已停止本次算价。请稍后再试或反馈给本项目。",
+            raw,
         )
     price = as_fen(raw)
     if price < 0:
-        raise McpError(f"算价接口返回了负数价格 {price} 分，不予采信。")
+        raise McpError(f"麦当劳算价接口这次返回的价格是负数（¥{price / 100:.2f}），不予采信。", price)
     # 上界只做很松的兜底（菜单价 ×3 + 100 元），不追求精确：
     # 随单购会把卡费算进原价，精确上界容易误伤。这里的目的是挡住
     # 「量纲错了导致价格离谱」这一类，不是挡住贵的订单。
     menu_total = sum(getattr(it, "price_fen", 0) or 0 for it in items)
     if menu_total > 0 and price > menu_total * 3 + 10_000:
         raise McpError(
-            f"算价接口返回的价格 ¥{price / 100:.2f} 远超这单的菜单合计 "
-            f"¥{menu_total / 100:.2f}，金额口径很可能变了，不予采信。"
+            f"麦当劳算价接口这次报了 ¥{price / 100:.2f}，"
+            f"比这单菜单合计 ¥{menu_total / 100:.2f} 高出太多，"
+            "担心是金额单位变了，已停止本次算价。请稍后再试。",
+            {"price_fen": price, "menu_total_fen": menu_total},
         )

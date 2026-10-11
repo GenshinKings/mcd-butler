@@ -185,7 +185,6 @@ def render(detail: MealDetail, store_name: str = "") -> str:
     lines.append("═" * 58)
     lines.append(f"  {detail.name}"
                  + ("　【可特调】" if detail.support_modify else ""))
-    lines.append(f"  code {detail.code}")
     lines.append("")
 
     if not detail.is_combo:

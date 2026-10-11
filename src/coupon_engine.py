@@ -224,6 +224,13 @@ class Assignment:
     mapping: dict[int, int] = field(default_factory=dict)
     with_order: WithOrderOption | None = None  # None 表示不随单购
     price: PriceResult | None = None
+    #: False 表示「还没找完就停了」（预算用尽），不是「已经找不到更便宜的了」。
+    #
+    # 为什么要区分：默认 --budget 在 6 件商品 8 张券以上就必然花光。
+    # 混成同一件事，用户看到的是一个**没有被否定的最优解**——
+    # 他会拿着这个数字去下单，然后发现柜台那边还能更便宜。
+    # 「我不确定有没有更好的」和「这就是最好的」是两种完全不同的结论。
+    converged: bool = True
 
     def signature(self) -> tuple:
         wo = self.with_order
@@ -277,6 +284,10 @@ class Budget:
     def spend(self, n: int = 1) -> None:
         self.used += n
 
+    def refund(self, n: int = 1) -> None:
+        """退还预扣的次数（缓存命中时用：那一趟没真的发请求）。"""
+        self.used = max(self.used - n, 0)
+
     def __repr__(self) -> str:
         return f"Budget({self.used}/{self.total})"
 
@@ -318,6 +329,8 @@ class CouponOptimizer:
         # 缓存命中就不消耗调用次数 —— 预算是按次计的，省一次是一次。
         self._cache: dict[tuple, PriceResult] = {}
         self._failures = 0
+        # 是否中途收过工（预算见底），决定最终结果的 `converged` 标记
+        self._stopped = False
 
     # ---------- 求值 ----------
 
@@ -332,7 +345,13 @@ class CouponOptimizer:
         return self._budget.used
 
     def evaluate(self, cart: Sequence[CartItem], assignment: Assignment) -> PriceResult:
-        """求值一次；相同方案直接命中缓存，不计入调用次数。"""
+        """求值一次；相同方案直接命中缓存，不计入调用次数。
+
+        为什么要两次记账：本实例的 `_cache` 之外，`self.oracle` 可能还被
+        `cached_oracle` 套了一层**跨求解器共享**的缓存（一次 advise 会建十几个
+        求解器）。命中后者时同样没发生网络往返，预扣的那一次必须退还 ——
+        否则「没花钱的请求」照样吃掉预算，用户设的 `--budget` 又变成了摆设。
+        """
         sig = assignment.signature()
         if sig in self._cache:
             assignment.price = self._cache[sig]
@@ -343,7 +362,16 @@ class CouponOptimizer:
             raise BudgetExhausted(f"本轮求解已达上限 {self.max_calls}")
         self._budget.spend()
         self.calls += 1
+
+        _stats = getattr(self.oracle, "calls", None)
+        _before = _stats["calls"] if isinstance(_stats, dict) else None
         result = self.oracle(list(cart), assignment)
+        if isinstance(_stats, dict) and _before == _stats["calls"]:
+            # 上游缓存命中：把刚才预扣的那一趟还回去。
+            # 预算保护的是真实网络请求，不是 evaluate 的调用次数。
+            self._budget.refund()
+            self.calls -= 1
+
         assignment.price = result
         self._cache[sig] = result
         self._failures = 0
@@ -507,7 +535,24 @@ class CouponOptimizer:
             # 预算真的没了就抛 BudgetExhausted，让上层明确告诉用户调大 --budget。
             best = Assignment(mapping={}, with_order=None)
             best.price = self.evaluate(cart, best)
+
+        # 预算花光意味着计划里的搜索有一部分根本没跑 —— 这时给出的解可以是
+        # 好的，但绝不是「穷举过一遍后最好的」。标注出来，让上层如实相告。
+        # 方向偏保守（宁愿说不确定，也不谎报最优）：max_calls 恰好用尽且其实
+        # 已收敛的情况会被一并标注，代价只是多一句温和的提示。
+        if self._stopped or self.remaining <= 0:
+            best.converged = False
         return best
+
+    def _stopped_early(self, current: Assignment) -> Assignment:
+        """预算见底时收工，并把「没算完」这件事记在结果上。
+
+        诚实比给出一个漂亮的数字更重要：调用方拿到 `converged=False`
+        就必须告诉用户「这里可能还有更便宜的组合」，而不是默认它是最优解。
+        """
+        current.converged = False
+        self._stopped = True
+        return current
 
     def _hill_climb(
         self,
@@ -535,7 +580,7 @@ class CouponOptimizer:
                 )
                 price, reason = self._try_evaluate(cart, candidate)
                 if reason == "budget":
-                    return current  # 预算见底，这时收工是诚实的
+                    return self._stopped_early(current)
                 if price is None:
                     continue  # 抖动/单次失败：跳过这个候选，继续试下一个
                 if price.price_fen < current_price:
@@ -560,7 +605,7 @@ class CouponOptimizer:
                     )
                     price, reason = self._try_evaluate(cart, candidate)
                     if reason == "budget":
-                        return current  # 预算见底，这时收工是诚实的
+                        return self._stopped_early(current)
                     if price is None:
                         continue  # 抖动/单次失败：跳过这个候选，继续试下一个
                     if price.price_fen < current_price:
@@ -597,7 +642,7 @@ class CouponOptimizer:
                     candidate = Assignment(mapping=swapped, with_order=current.with_order)
                     price, reason = self._try_evaluate(cart, candidate)
                     if reason == "budget":
-                        return current  # 预算见底，这时收工是诚实的
+                        return self._stopped_early(current)
                     if price is None:
                         continue  # 抖动/单次失败：跳过这个候选，继续试下一个
                     if price.price_fen < current_price:
@@ -622,7 +667,7 @@ class CouponOptimizer:
                     candidate = Assignment(mapping=moved, with_order=current.with_order)
                     price, reason = self._try_evaluate(cart, candidate)
                     if reason == "budget":
-                        return current  # 预算见底，这时收工是诚实的
+                        return self._stopped_early(current)
                     if price is None:
                         continue  # 抖动/单次失败：跳过这个候选，继续试下一个
                     if price.price_fen < current_price:
@@ -647,7 +692,7 @@ class CouponOptimizer:
                 candidate = Assignment(mapping=swapped, with_order=current.with_order)
                 price, reason = self._try_evaluate(cart, candidate)
                 if reason == "budget":
-                    return current  # 预算见底，这时收工是诚实的
+                    return self._stopped_early(current)
                 if price is None:
                     continue  # 抖动/单次失败：跳过这个候选，继续试下一个
                 if price.price_fen < current_price:

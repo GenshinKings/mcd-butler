@@ -27,6 +27,12 @@ PROTOCOL_VERSION = "2025-06-18"
 _TRANSIENT = (TimeoutError, http.client.HTTPException, OSError)
 
 
+# 面向用户的文案集中在这里：自检会断言它们不含内部术语/原始数据，
+# 也让「改文案」这件事不会意外改坏依赖它的逻辑（比如限流退避）。
+_RATE_LIMIT_MSG = "点太快被限流了，已经自动放慢重试。"
+_HTTP_UNAVAILABLE_MSG = "连不上麦当劳接口（服务暂时不可用）。已经自动重试过了。"
+
+
 def _backoff_for(attempt: int, base: float, last_exc: Exception | None) -> float:
     """第 `attempt` 次重试之前该等多久（秒）。
 
@@ -38,9 +44,13 @@ def _backoff_for(attempt: int, base: float, last_exc: Exception | None) -> float
     所谓「重试」只是把限流窗口拖得更长，越重试越拿不到结果。
     所以踩到限流时退避必须按窗口量级来（至少 5 秒），
     并封顶 30 秒 —— 再久，命令行在用户眼里就是"卡死了"。
+
+    判断依据必须是 `exc.rate_limited` 这个**结构化标记**，不能拿错误消息里的
+    关键词去猜：文案是人写的、随时会改，改一个词就把限流重试降级成 0.5 秒
+    （确确实实发生过一次，被自检逮住了）。
     """
     backoff = base * (2**attempt)
-    if last_exc is not None and "触发限流" in str(last_exc):
+    if getattr(last_exc, "rate_limited", False):
         backoff = min(max(backoff, 5.0), 30.0)
     return backoff
 
@@ -81,9 +91,16 @@ class McpError(RuntimeError):
     调用方遇到它可以换一件商品/换一张券继续。
     """
 
-    def __init__(self, message: str, payload: Any = None):
+    def __init__(self, message: str, payload: Any = None, *, rate_limited: bool = False):
+        """`rate_limited` 由**抛错的地方**标记，绝不靠错误消息里的关键词去猜。
+
+        早先 `_backoff_for` 用 `"触发限流" in str(exc)` 判断要不要等 60 秒窗口：
+        只要有人把 429 的文案改成「点太快了」，退避就悄悄退化成 0.5 秒，
+        于是"重试"变成"更密集地撞限流"。文案是人写的、会改，性质是事实。
+        """
         super().__init__(message)
         self.payload = payload
+        self.rate_limited = rate_limited
 
 
 class McpFatalError(McpError):
@@ -222,12 +239,17 @@ class McdMcpClient:
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", "ignore")
                 if exc.code == 401:
-                    raise McpFatalError("Token 无效或已过期（HTTP 401）。", detail) from exc
+                    raise McpFatalError("Token 不对或已过期，请重新设置 MCP_TOKEN。", detail) from exc
                 retryable = exc.code == 429 or 500 <= exc.code < 600
-                last_exc = McpFatalError(
-                    "触发限流（每 Token 每分钟 600 次）。" if exc.code == 429 else f"HTTP {exc.code}: {detail}",
-                    detail,
-                )
+                if exc.code == 429:
+                    # rate_limited=True 才是退避时长的依据（见 _backoff_for）。
+                    # 响应体 detail 只进 payload，不上屏 —— 里面可能有个人信息。
+                    msg = _RATE_LIMIT_MSG
+                    limited = True
+                else:
+                    msg = _HTTP_UNAVAILABLE_MSG.format(code=exc.code)
+                    limited = False
+                last_exc = McpFatalError(msg, detail, rate_limited=limited)
                 if not retryable or attempt >= self.max_retries:
                     raise last_exc from exc
             except _TRANSIENT as exc:
@@ -264,7 +286,7 @@ class McdMcpClient:
         try:
             return json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise McpFatalError(f"无法解析 MCP 响应: {raw[:200]}") from exc
+            raise McpFatalError("麦当劳接口这次返回的内容读不懂，稍后再试。", raw[:200]) from exc
 
     # ---------- 协议层 ----------
 
@@ -286,7 +308,9 @@ class McdMcpClient:
             }
         )
         if "error" in resp:
-            raise McpFatalError(f"initialize 失败: {resp['error']}", resp)
+            # resp["error"] 是对方返回的原始错误结构，可能含内部单号/个人信息，
+            # 只把它放进 payload 供 --debug 查看，message 里换成一句人话。
+            raise McpFatalError("连不上麦当劳接口，稍后再试。", resp["error"])
         self._initialized = True
         return resp["result"]
 
@@ -305,7 +329,9 @@ class McdMcpClient:
             {"jsonrpc": "2.0", "id": self._next_id(), "method": method, "params": params}
         )
         if "error" in resp:
-            raise McpError(f"{method} 失败: {resp['error']}", resp)
+            # method 是 tools/call 这种 RPC 内部方法名，对用户毫无意义；
+            # resp["error"] 是原始错误字典。两者都不上屏，只留在 payload。
+            raise McpError("麦当劳接口没有返回有效结果，稍后再试。", resp["error"])
         return resp.get("result", {})
 
     # ---------- 业务层 ----------
@@ -334,8 +360,7 @@ class McdMcpClient:
         """调用工具并返回 data 字段；失败抛异常。"""
         payload = self.call_json(tool, arguments)
         if not payload.get("success"):
-            raise McpError(
-                f"{tool} 调用失败: {payload.get('message')} (code={payload.get('code')})",
-                payload,
-            )
+            # tool 是 query-meals 这种内部工具名，code/message 是接口的错误字典。
+            # 都只进 payload；屏幕上只留「这一步没办成」这件事本身。
+            raise McpError("麦当劳接口这次没有返回数据，稍后再试。", payload)
         return payload.get("data")

@@ -65,8 +65,8 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
     (
         "401 降级为业务性失败",
         "mcd_client.py",
-        'raise McpFatalError("Token 无效或已过期（HTTP 401）。", detail) from exc',
-        'raise McpError("Token 无效或已过期（HTTP 401）。", detail) from exc',
+        'raise McpFatalError("Token 不对或已过期，请重新设置 MCP_TOKEN。", detail) from exc',
+        'raise McpError("Token 不对或已过期，请重新设置 MCP_TOKEN。", detail) from exc',
         True,
     ),
     (
@@ -341,13 +341,6 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
     # ---- 以下 19 处是第五轮（变异猎手）自造的 ----
     # A. 先打本轮新引入的代码路径
     (
-        "N1-429 退避判据放宽成「任何错误都退避 5~30s」",
-        "mcd_client.py",
-        '    if last_exc is not None and "触发限流" in str(last_exc):',
-        '    if last_exc is not None:',
-        True,
-    ),
-    (
         "N2-指数退避退化成线性（attempt=0 时一秒都不等）",
         "mcd_client.py",
         "    backoff = base * (2**attempt)",
@@ -477,8 +470,8 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
     (
         "N20-README 的「六段」漂回「七段」（散文里的数字没人管）",
         "README.md",
-        "完整演示一共**六段**",
-        "完整演示一共**七段**",
+        "一共**六段**",
+        "一共**七段**",
         False,
     ),
     (
@@ -643,8 +636,8 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
     (
         "S5-代码地图改回名不符实的「目录」",
         "README.md",
-        "<summary><b>代码地图：想改代码从哪个文件下手</b></summary>",
-        "<summary><b>目录：想改代码从哪个文件下手</b></summary>",
+        "## 代码地图",
+        "## 目录",
         True,
     ),
     (
@@ -659,6 +652,108 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
         "README.md",
         ' [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)',
         "",
+        True,
+    ),
+
+    # ---- 第六轮：全局体检后新增的用户可见保护 ----
+    (
+        "T1-429 退避判据放宽成「任何错误都退避 5~30s」",
+        "mcd_client.py",
+        '    if getattr(last_exc, "rate_limited", False):',
+        "    if last_exc is not None:",
+        True,
+    ),
+    (
+        "T2-限流不再打标记（退避悄悄退化成 0.5 秒）",
+        "mcd_client.py",
+        "                    limited = True",
+        "                    limited = False",
+        True,
+    ),
+    (
+        "T3-缓存键漏掉购物车指纹（换车复用旧价，还会静默算错）",
+        "oracle.py",
+        "        key = (cart_fingerprint(items), assignment.signature())",
+        "        key = (assignment.signature(),)",
+        True,
+    ),
+    (
+        "T4-缓存命中照样扣预算（白拿的请求也吃掉额度）",
+        "coupon_engine.py",
+        "            self._budget.refund()",
+        "            pass",
+        True,
+    ),
+    (
+        # 打得必须是源头：源码里标记未收敛的有两处，只抹掉 optimize 收尾那句
+        # 的话 `_stopped_early` 还在标，断言照样通过 —— 这条变异就形同虚设。
+        "T5-预算花光也谎报「已是最优」（抹掉未收敛标记的源头）",
+        "coupon_engine.py",
+        "        current.converged = False\n        self._stopped = True",
+        "        self._stopped = True",
+        True,
+    ),
+    (
+        "T6-未算完却什么都不说（用户以为自己拿到了最优解）",
+        "cli.py",
+        "    if converged:\n        return []",
+        "    if True:\n        return []",
+        True,
+    ),
+    (
+        "T7-未预料异常直接把 traceback 甩给使用者",
+        "cli.py",
+        '    shown = os.environ.get("MCD_BUTLER_DEBUG", "").strip() not in ("", "0")',
+        "    shown = True",
+        True,
+    ),
+    (
+        "T8-会员卡编码又写回面向用户的标签里",
+        "cli.py",
+        '                label=item.discount_type or "随单购",',
+        '                label=f"{item.discount_type}（membershipCode={item.membership_code}）",',
+        True,
+    ),
+    (
+        "T9-订单号又打回屏幕（能在客服系统反查到手机号/地址）",
+        "cli.py",
+        "    return f\"历史订单（{order.get('createTime', '')[:10]}）\"",
+        "    return f\"历史订单 {order.get('orderId', '')} @ {order.get('createTime', '')}\"",
+        True,
+    ),
+    (
+        "T10-中文对齐退回 :<N（中文列全部错位）",
+        "cli.py",
+        '    return f"{\' \' * indent}- {_pad(_clip(name, 18), 18)}{qty}¥{FEN(price_fen)}{suffix}"',
+        '    return f"{\' \' * indent}- {name:<18}{qty}¥{FEN(price_fen)}{suffix}"',
+        True,
+    ),
+    (
+        "T11-算价接口报错又把 Python 类型名抛给用户",
+        "oracle.py",
+        '            raise McpError("麦当劳算价接口这次返回的数据格式不对，请稍后再试。", data)',
+        '            raise McpError(f"算价接口返回了非对象结构：{type(data).__name__}")',
+        True,
+    ),
+    (
+        "T12-HttpError 的原始响应体又透传上屏（可能含个人信息）",
+        "mcd_client.py",
+        '                    msg = _HTTP_UNAVAILABLE_MSG.format(code=exc.code)\n                    limited = False',
+        '                    msg = f"HTTP {exc.code}: {detail}"\n                    limited = False',
+        True,
+    ),
+    (
+        "T13-敏感信息：快照又打出绝对路径（家目录含本机用户名）",
+        "cli.py",
+        '    return "\\n已存进本机账本（~/.mcd-butler/），下次可用 replay 对比这单的价格变动。"',
+        '    return f"\\n已存快照 → {path}"',
+        True,
+    ),
+    (
+        "T14-compare 表的金额又丢掉 ¥ 符号（看不出是元还是分）",
+        "cli.py",
+        '        + f"¥{q.paid_fen / 100:>8.2f}"',
+        '        + f"{q.paid_fen / 100:>9.2f}"',
         True,
     ),
 ]

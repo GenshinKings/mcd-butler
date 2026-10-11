@@ -51,6 +51,110 @@ def _pad(s: str, width: int) -> str:
     """按**显示宽度**左对齐补空格（f-string 的 :<N> 做不到）。"""
     return s + " " * max(0, width - _dw(s))
 
+
+def _clip(s: str, width: int) -> str:
+    """按显示宽度截断，超出部分收成 `…`。
+
+    为什么必须截：菜单里偶尔会有「香辣鸡腿堡中份薯条中杯可乐」这种超长品名，
+    一个 26 列的名字能把整张表的金额列整体顶到右面去，
+    前九行辛辛苦苦对齐的列全废了。宁可截掉尾巴，也不让表格散架。
+    """
+    if _dw(s) <= width:
+        return s
+    import unicodedata
+
+    out = ""
+    used = 0
+    for ch in s:
+        w = 2 if unicodedata.east_asian_width(ch) in ("F", "W") else 1
+        if used + w > width - 1:  # 留一列给 …
+            break
+        out += ch
+        used += w
+    return out + "…"
+
+
+def _print_search_note(converged: bool, budget: int) -> list[str]:
+    """把「这次到底有没有试遍所有可能」如实告诉用户，顺便给下一步。
+
+    为什么要说这件事：`--budget` 默认 40，购物车 6 件商品 8 张券以上基本
+    必然花光。以前屏幕上只有一句「算价接口共调用 40 次（上限 40）」——
+    那是给开发者的 telemetry：用户既看不懂，也看不出「所以这次没算完」，
+    只会拿着那个数字下单，然后发现柜台那边还能更便宜。
+
+    拆成纯函数是为了能离线断言：埋在某条命令的收尾里时，
+    就算哪天有人把它删了，一条自检都不会红。
+    """
+    if converged:
+        return []
+    lines = [
+        "",
+        "这次没把所有组合都试完 —— 上面是到目前为止找到的最低价，",
+        f"但不保证没有更便宜的了。想试得更全，加 --budget {budget * 2} 再跑一次。",
+    ]
+    for line in lines:
+        print(line)
+    return lines
+
+
+def _snapshot_saved_note(path) -> str:
+    """快照存好后对用户说的那一句。
+
+    只说「存进本机账本」，**不打印路径**：家目录里含 Windows 用户名
+    （C:\\Users\\张三\\.mcd-butler\\），那不是使用者该暴露给别人的信息。
+    抽成纯函数是为了能断言 —— 埋在 try/except 里时没人管得到。
+    """
+    # 不用 `del path` 把它抹掉：那样一旦有人把路径写回文案，函数是直接
+    # NameError 崩掉，而不是安静地打一行含用户名的话 —— 崩溃反而更难查。
+    # 留着不用，让变异测试能「正常地」把它抓出来。
+    _ = path
+    return "\n已存进本机账本（~/.mcd-butler/），下次可用 replay 对比这单的价格变动。"
+
+
+def _replay_source(order: dict) -> str:
+    """「复刻的是哪一单」的人话描述。
+
+    只给日期，**不给订单号**：订单号能在客服系统反查到手机号 / 收货地址 /
+    支付流水，屏幕上多印这一串等于把整单隐私摊开。
+    """
+    return f"历史订单（{order.get('createTime', '')[:10]}）"
+
+
+def _format_quote_row(q, comparable: bool) -> str:
+    """compare 表格的一行数据。
+
+    金额三列一律带 ¥ —— 裸 "%9.2f" 的话用户看不出 36.00 是元还是分。
+    """
+    if not comparable:
+        return (
+            _pad(q.store_name[:22], 24)
+            + f"{q.distance_m:>6}m"
+            + f"{'缺货':>12}"
+            + f"{'—':>9}"
+            + f"{'不参与':>10}"
+        )
+    return (
+        _pad(q.store_name[:22], 24)
+        + f"{q.distance_m:>6}m"
+        + f"{q.travel.minutes:>7}分"
+        + f"¥{q.paid_fen / 100:>8.2f}"
+        + f"¥{q.travel.money_fen / 100:>8.2f}"
+        + f"¥{q.total_fen / 100:>9.2f}"
+    )
+
+
+def _format_cart_line(
+    name: str, price_fen: int, *, qty: str = "", suffix: str = "", indent: int = 2
+) -> str:
+    """购物车/菜单里「一件商品」那一行。
+
+    商品名一律走 `_pad` 按**显示宽度**补空格：f-string 的 `:<18` 按字符数补，
+    中文一个字占两列，于是「巨无霸」和「麦辣鸡腿堡」的价格列永远差两格 ——
+    同一个列表里每一行都错位，看着就累。抽成函数是为了能断言。
+    """
+    return f"{' ' * indent}- {_pad(_clip(name, 18), 18)}{qty}¥{FEN(price_fen)}{suffix}"
+
+
 # compare 一次要对每家店各打 2 次非算价接口，不设上限会静默吃满配额。
 MAX_COMPARE_STORES = 20
 
@@ -136,7 +240,10 @@ def run_demo(show_all: bool = False) -> int:
 
     print("\n怎么挂最省（每张券都真实试算过）")
     if best.price is None:
-        raise BudgetExhausted("没能算出任何价格")
+        # demo 是离线演示，用户没有 --budget 可调。顶层那句「加 --budget」的
+        # 通用提示在这里是错的（照着敲会报「无法识别的参数」），必须本地化。
+        print("\n演示数据这次没算出价格，请把这条反馈到 issue。")
+        return 1
 
     # 逐件列出到手价，并显式写出随单购那一档减了多少。
     # 没有这段时，屏幕上是「原价 ¥56.00 → 到手 ¥36.00，省下 ¥20.00」，
@@ -170,35 +277,30 @@ def run_demo(show_all: bool = False) -> int:
     print("  " + "-" * 46)
     print(
         f"  原价 ¥{FEN(best.price.original_fen)} → 到手 ¥{FEN(best.price.price_fen)}"
-        f"，省下 ¥{FEN(best.price.saved_fen)}（试算 {optimizer.calls} 次）"
+        f"，省下 ¥{FEN(best.price.saved_fen)}"
     )
 
     print("\n复刻上一单（同样的单，今天再买多少钱）")
     _demo_replay()
 
     if not show_all:
-        print("\n  就这两段 —— 购物车 + 券，逐张试出真实价值，挂上去。")
-        print("  黄历 / 券包体检 / 活动日历 / 段位在 --all：python -m src.cli demo --all")
+        print("\n  就这两段：把购物车和券丢进来，算出怎么挂最省。")
+        print("  还有黄历 / 券包体检 / 活动日历 / 段位，想看就跑：")
+        print("    python -m src.cli demo --all")
         return 0
 
-    print("\n" + "=" * 62)
-    print("麦门黄历（almanac）")
-    print("=" * 62)
+    # 不打外层段落标题：黄历/体检/日历各自 render 的第一行就是自己的标题，
+    # 再套一层就变成「麦门黄历 / 麦门黄历 · 2026-10-12」这种重复。
+    # 早年这里还用 ===== 框着，和模块内部的 ═══ 框叠成两套横线，更乱。
     _demo_almanac()
 
-    print("\n" + "=" * 62)
-    print("券包体检（audit）")
-    print("=" * 62)
+    print("\n")
     _demo_audit()
 
-    print("\n" + "=" * 62)
-    print("麦门活动日历（campaign）")
-    print("=" * 62)
+    print("\n")
     _demo_campaign()
 
-    print("\n" + "=" * 62)
-    print("麦门段位（brag）")
-    print("=" * 62)
+    print("\n")
     _demo_ranks()
     return 0
 
@@ -244,7 +346,7 @@ def _demo_almanac() -> None:
     )
     best = max((r.saved_fen for r in day["readings"]), default=0)
     print(render_almanac(day, butler_almanac(best, len(day["expiry"]))))
-    print("  （以上每条宜忌都真的打过算价接口；演示数据，不代表真实价格）")
+    print("  （每一条宜忌都是真的算过价出来的）")
 
 
 def _demo_audit() -> None:
@@ -282,10 +384,11 @@ def _demo_ranks() -> None:
     """段位体系的离线展示。真人跑 `brag` 读的是本机快照。"""
     from .persona import RANKS, progress_bar, rank_of
 
+    print("  麦门段位")
     for need, title, comment in RANKS:
         r = rank_of(need)
         print(
-            f"  ¥{need / 100:>7.0f} 起　{title:<6} {progress_bar(r['index'], r['max_index'])}　{comment}"
+            f"  ¥{need / 100:>7.0f} 起　{_pad(title, 8)}{progress_bar(r['index'], r['max_index'])}　{comment}"
         )
     print("\n  段位来自本机快照累计（~/.mcd-butler/），不联网、不上传。")
     print("  看自己的账本：`python -m src.cli brag`")
@@ -414,7 +517,7 @@ def run_audit(
     store, store_code, menu, coupons = ctx
 
     if not coupons:
-        print("这家门店当前没有可体检的券（券码由 `query-store-coupons` 提供）。")
+        print("这家门店当前没有可体检的券。")
         return 0
 
     shared = Budget(budget)
@@ -449,8 +552,8 @@ def run_audit(
     if len(coupons) <= 2:
         print()
         print("提示：这家店当前可挂载的券只有这几张，不代表你卡包里只有这几张。")
-        print("      卡包接口（`query-my-coupons`）只回 Markdown、不含券码，挂不进算价；")
-        print("      另有部分券受时段限制（如早餐券）。想看全部券和到期日，用 `assets`。")
+        print("      早餐券这类限时的券这里用不上。想看全部券和到期日：")
+        print("        python -m src.cli assets")
 
     print("  门槛和「废券」都不是接口告诉我们的，是拿不同价位的商品一件件试出来的。")
     return 0
@@ -497,7 +600,7 @@ def _locate(client, city: str, keyword: str, store_code: str | None = None):
     if store_code:
         menu, coupons = _load_menu_and_coupons(client, store_code)
         if not menu:
-            print(f"storeCode={store_code} 没查到菜单，请确认编码是否正确。")
+            print("这家店今天没有可点的菜单。换一家店试试，或者换个关键词再搜。")
             return None
         return {"storeCode": store_code, "storeName": f"门店 {store_code}"}, store_code, menu, coupons
 
@@ -554,12 +657,12 @@ def _explain_coupon_scope(n: int) -> None:
     if n > 1:
         return
     if n == 0:
-        print("提示：这家门店当前没有可挂载的券（券码由 `query-store-coupons` 提供）。")
+        print("提示：这家门店当前没有可挂载的券。")
     else:
         print("提示：本次只用到 1 张券，不代表你卡包里只有 1 张。")
     print(
-        "      卡包接口（`query-my-coupons`）只回 Markdown、不含券码，挂不进算价；\n"
-        "      另有部分券受时段限制（如早餐券）。想看全部券和到期日，用 `assets`。"
+        "      早餐券这类限时的券这里用不上。想看全部券和到期日：\n"
+        "        python -m src.cli assets"
     )
 
 
@@ -632,7 +735,14 @@ def run_advise(
     for item in cart:
         note = item.condition_note()
         suffix = f"   ← {note}" if note else ""
-        print(f"   - {item.name or item.product_code:<16} ¥{FEN(item.effective_price_fen())}{suffix}")
+        print(
+            _format_cart_line(
+                item.name or item.product_code,
+                item.effective_price_fen(),
+                suffix=suffix,
+                indent=3,
+            )
+        )
 
     shared = Budget(budget)
     optimizer = CouponOptimizer(oracle, max_calls=budget, budget=shared)
@@ -641,7 +751,8 @@ def run_advise(
     baseline = optimizer.evaluate(cart, Assignment(mapping={}, with_order=None))
     best = optimizer.optimize(cart, coupons, _with_order_options(cart))
     if best.price is None:
-        raise BudgetExhausted("没能算出任何价格")
+        print("\n这单一件商品都没算成价，加 --budget 80 再试一次。")
+        return 1
 
     print("\n最优组合：")
     for line in best.describe(cart, coupons):
@@ -650,7 +761,7 @@ def run_advise(
     print(f"真实省下 ¥{FEN(best.price.saved_vs(baseline.price_fen))}")
 
     extra = _print_insights(oracle, cart, coupons, best, shared)
-    print(f"\n算价接口共调用 {optimizer.budget_used} 次（上限 {budget}）")
+    _print_search_note(best.converged, budget)
     print(f"\n{_butler_close(best.price.saved_vs(baseline.price_fen))}")
     print("\n想换成自己爱吃的：")
     print('  python -m src.cli optimize --items "板烧鸡腿堡三件套,薯条x2"')
@@ -715,8 +826,7 @@ def run_almanac(city: str, keyword: str, budget: int, store_code: str | None = N
     day = build_almanac(menu, coupons, oracle, shared, now=server_now(client))
     best_saved = max((r.saved_fen for r in day["readings"]), default=0)
     print(render_almanac(day, butler_almanac(best_saved, len(day["expiry"]))))
-    print(f"\n算价接口共调用 {shared.used} 次（上限 {budget}）")
-    print("\n想直接照着点：`python -m src.cli advise`")
+    print("\n想直接照着点：python -m src.cli advise")
     return 0
 
 
@@ -746,7 +856,7 @@ def run_meal(
     if code:
         target = next((i for i in menu if i.product_code == code), None)
         if target is None:
-            print(f"菜单里没有 code={code} 的餐品；不加 --code 可以按名字搜。")
+            print("这家店没有这道餐品。不加 --code 可以直接按名字搜。")
             return 1
     else:
         hits = [i for i in menu if name_kw in (i.name or "")]
@@ -761,7 +871,7 @@ def run_meal(
         if len(hits) > 1:
             print(
                 f"（匹配到 {len(hits)} 件，取「{target.name}」；"
-                f"要看别的加 --code {target.product_code}）"
+                f"要看别的请加上它的编号）"
             )
             print()
 
@@ -791,7 +901,7 @@ def run_menu(city: str, keyword: str, filter_kw: str, limit: int, store_code: st
     for c in coupons:
         covered |= set(c.product_codes)
 
-    print(f"门店：{store.get('storeName', '未知门店')}（storeCode={store_code}）")
+    print(f"门店：{store.get('storeName', '未知门店')}")
     print(f"共 {len(menu)} 个品类，{len(coupons)} 张可用券\n")
 
     shown = 0
@@ -831,7 +941,7 @@ def run_optimize(
         print("未找到门店，请换一个关键词。")
         return 1
     store, store_code, menu, coupons = ctx
-    print(f"命中：{store.get('storeName', '未知门店')}（{store.get('address', '未知地址')}）storeCode={store_code}")
+    print(f"命中：{store.get('storeName', '未知门店')}（{store.get('address', '未知地址')}）")
     print(f"菜单载入 {len(menu)} 个品类")
 
     print(f"门店可用券 {len(coupons)} 张")
@@ -859,7 +969,11 @@ def run_optimize(
         price = item.effective_price_fen()
         suffix = f"   ← {note}" if note else ""
         qty = f"×{item.quantity} " if item.quantity > 1 else ""
-        print(f"  - {item.name or item.product_code:<16} {qty}¥{FEN(price)}{suffix}")
+        print(
+            _format_cart_line(
+                item.name or item.product_code, price, qty=qty, suffix=suffix
+            )
+        )
 
     shared = Budget(budget)
     optimizer = CouponOptimizer(oracle, max_calls=budget, budget=shared)
@@ -868,7 +982,8 @@ def run_optimize(
     baseline = optimizer.evaluate(cart, Assignment(mapping={}, with_order=None))
     best = optimizer.optimize(cart, coupons, _with_order_options(cart))
     if best.price is None:
-        raise BudgetExhausted("没能算出任何价格")
+        print("\n这单一件商品都没算成价，加 --budget 80 再试一次。")
+        return 1
     print("\n最优组合：")
     for line in best.describe(cart, coupons):
         print(f"  {line}")
@@ -896,7 +1011,7 @@ def run_optimize(
     extra = 0
     if insights:
         extra = _print_insights(oracle, cart, coupons, best, shared)
-    print(f"\n算价接口共调用 {optimizer.budget_used} 次（上限 {budget}）")
+    _print_search_note(best.converged, budget)
 
     if save:
         from .snapshot import entry_from_cart, save as save_snapshot
@@ -919,10 +1034,11 @@ def run_optimize(
                     with_order_label=label,
                 )
             )
-            print(f"\n已存快照 → {path}（下次可用 `replay` 对比这单的价格变动）")
-        except OSError as exc:
+            print(_snapshot_saved_note(path))
+        except OSError:
             # 快照只是锦上添花：写盘失败（权限/磁盘满）绝不该让已算完的结果崩掉。
-            print(f"\n（快照保存失败，不影响本次结果：{exc}）")
+            # 也不打印裸异常 —— "[Errno 28] No space left" 对路人毫无意义。
+            print("\n（这次的结果没能存进账本，不影响上面的价格。）")
     else:
         print("\n（本次未存快照，账本里不会有这一单）")
 
@@ -1107,26 +1223,27 @@ def run_compare(
     if wage:
         print(f"时间成本：按时薪 ¥{wage:.0f}/小时把等待也折算成钱")
 
-    print("\n" + "-" * 80)
-    print(f"{'门店':<26}{'距离':>8}{'来回':>8}{'到手价':>10}{'路费':>9}{'综合':>10}")
-    print("-" * 80)
+    # 表头和数据行必须都走 _pad：f-string 的 :<N 按**字符数**补空格，
+    # 「人民广场店」(5字/10列) 和「麦当劳XX餐厅」会被补成不同的实际宽度，
+    # 于是中文店名一长表头就和数据错开（实测差 7 列）。
+    # 金额三列统一带 ¥ —— 裸 "%9.2f" 用户看不出 36.00 是元还是分。
+    print("\n" + "-" * 58)
+    print(
+        _pad("门店", 24) + f"{'距离':>8}" + f"{'到手价':>10}"
+        + f"{'路费':>9}" + f"{'综合':>10}"
+    )
+    print("-" * 58)
     for q in ranked:
         if not q.comparable:
-            print(
-                f"{q.store_name[:24]:<26}{q.distance_m:>7}m{'—':>8}"
-                f"{'缺货':>10}{'—':>9}{'不参与':>10}"
-            )
+            print(_format_quote_row(q, comparable=False))
             print(f"    缺少：{'、'.join(q.missing)}")
             continue
-        print(
-            f"{q.store_name[:24]:<26}{q.distance_m:>7}m{q.travel.minutes:>7}分"
-            f"{q.paid_fen / 100:>9.2f}{q.travel.money_fen / 100:>8.2f}{q.total_fen / 100:>9.2f}"
-        )
-    print("-" * 80)
+        print(_format_quote_row(q, comparable=True))
+    print("-" * 58)
+    print("（综合 = 到手价 + 路费）")
 
     print()
     print(verdict(ranked))
-    print(f"\n算价接口共调用 {shared.used} 次（上限 {budget}）")
     return 0
 
 
@@ -1301,7 +1418,7 @@ def run_replay(store_code: str | None, list_only: bool) -> int:
             code = str(p.get("productCode", ""))
             if code:
                 want.append((code, int(p.get("quantity") or 1)))
-        source = f"历史订单 {order.get('orderId', '')} @ {order.get('createTime', '')}"
+        source = _replay_source(order)
 
     # ---- 2. 退回本地快照
     if not want:
@@ -1340,7 +1457,13 @@ def run_replay(store_code: str | None, list_only: bool) -> int:
 
     print("\n复刻购物车：")
     for item in cart:
-        print(f"  - {item.name or item.product_code:<16} ×{item.quantity}  ¥{FEN(item.effective_price_fen())}")
+        print(
+            _format_cart_line(
+                item.name or item.product_code,
+                item.effective_price_fen(),
+                qty=f"×{item.quantity}  ",
+            )
+        )
 
     coupons = _parse_coupons(
         client.data("query-store-coupons", {"storeCode": target_store, "orderType": 1, "beType": 1})
@@ -1353,7 +1476,8 @@ def run_replay(store_code: str | None, list_only: bool) -> int:
     optimizer = CouponOptimizer(oracle, max_calls=40)
     best = optimizer.optimize(cart, coupons, _with_order_options(cart))
     if best.price is None:
-        raise BudgetExhausted("没能算出任何价格")
+        print("\n这单一件商品都没算成价，加 --budget 80 再试一次。")
+        return 1
     print("\n今日最优组合：")
     for line in best.describe(cart, coupons):
         print(f"  {line}")
@@ -1420,7 +1544,7 @@ def run_nutrition(city: str, keyword: str, kcal: int, size: int) -> int:
     if not store_code:
         print("门店缺少 storeCode，无法继续。")
         return 1
-    print(f"门店：{store.get('storeName', '未知门店')}（storeCode={store_code}）")
+    print(f"门店：{store.get('storeName', '未知门店')}")
 
     menu = _parse_menu(
         client.data("query-meals", {"storeCode": store_code, "orderType": 1, "beType": 1})
@@ -1502,7 +1626,7 @@ def _print_insights(oracle, cart, coupons, best, budget) -> int:
             else:
                 tag = "  没享受到优惠"
             print(
-                f"    {name:<18}{qty:<4} 标价 ¥{FEN(m.list_fen):>6}"
+                f"    {_pad(name, 18)}{_pad(qty, 6)}标价 ¥{FEN(m.list_fen):>6}"
                 f"  →  实际 ¥{FEN(m.marginal_fen):>6}{tag}"
             )
 
@@ -1712,7 +1836,9 @@ def _with_order_options(cart: list[CartItem]) -> list:
                     "membershipCode": item.membership_code,
                     "membershipSpecId": item.membership_spec_id,
                 },
-                label=f"{item.discount_type}（membershipCode={item.membership_code}）",
+                # membershipCode 是内部会员卡编码，只留在 payload 里发出去。
+                # 一旦进 label，用户会在「最优组合」里看到一串陌生数字。
+                label=item.discount_type or "随单购",
             )
         )
     return options
@@ -1913,7 +2039,7 @@ def main(argv: list[str] | None = None) -> int:
         # 预算太小，连一次贪心都没跑完。
         # 这时候不该编一个价格出来，明确告诉用户怎么改。
         print(f"\n{exc}")
-        print("算价调用预算太小，没算出结果。把 --budget 调大再试，例如 --budget 80。")
+        print("算价次数设置得太少了，没算出结果。加 --budget 80 再试一次。")
         return 3
     except McpError as exc:
         code, lines = _error_hint(exc)
@@ -1921,6 +2047,46 @@ def main(argv: list[str] | None = None) -> int:
         for line in lines:
             print(line)
         return code
+    except Exception as exc:  # noqa: BLE001
+        # 最后一道兜底。写软件的人习惯看 traceback，普通人不习惯 ——
+        # 屏幕上蹦出几十行 "File ... line ... in ..." 只会让人以为是自己弄坏了。
+        # 给一句人话 + 一个去处；真要排查，设 MCD_BUTLER_DEBUG=1 就能看到原始栈。
+        return _unexpected_error(exc)
+
+
+def _unexpected_error(exc: BaseException) -> int:
+    """未预料异常的统一出口：人话提示 + 可选 traceback。
+
+    拆成纯函数是为了能离线断言。以前这段埋在 except 里，
+    「是否对用户隐藏了 traceback」这件事一条自检都管不到。
+    """
+    shown = os.environ.get("MCD_BUTLER_DEBUG", "").strip() not in ("", "0")
+    kind = exc.__class__.__name__
+    lines = [
+        "",
+        f"出错了：{exc}" if str(exc).strip() else "出错了：程序内部异常。",
+        "这不影响你的账号和余额 —— 没有发出任何下单或支付请求。",
+        "麻烦把上面这行提示和你敲的命令一起提到 "
+        "https://github.com/GenshinKings/mcd-butler/issues",
+    ]
+    for line in lines:
+        print(line)
+    if shown:
+        import traceback
+
+        # 诊断信息走 stderr：正常结果才走 stdout，否则 `>` 重定向出来的
+        # 文件会被调试信息污染，脚本里没法直接用。
+        print("\n---- 调试信息（MCD_BUTLER_DEBUG=1 才会显示）----", file=sys.stderr)
+        if exc.__traceback__ is not None:
+            traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+        else:
+            # 有些异常不是从 try 里 raise 出来的（比如直接构造传入），
+            # 没有 traceback 对象。这时 print_exception 只吐一行、
+            # 看不出在哪发生的 —— 退而求其次打当前调用栈，总比没有强。
+            print("（这个异常没有携带调用栈，下面是发生位置）", file=sys.stderr)
+            traceback.print_stack(file=sys.stderr)
+        print(f"（异常类型：{kind}）", file=sys.stderr)
+    return 4
 
 
 def _error_hint(exc: Exception) -> tuple[int, list[str]]:
@@ -1936,14 +2102,23 @@ def _error_hint(exc: Exception) -> tuple[int, list[str]]:
     单独拆出来是因为：埋在 `main()` 的 except 里时没法离线断言，
     哪天有人把两个分支合并回一句，一条自检都不会红。
     """
+    if getattr(exc, "rate_limited", False):
+        # 限流单独一支：McpFatalError 现在自带 rate_limited 标记，不用猜文案。
+        # 限流的正确动作只有一个：**等**。让用户去检查 Token 或代理是误导，
+        # 而且重试循环已经退避过了，这里只交代结果。
+        return 2, [
+            f"{exc}",
+            "同一时间请求太多，麦当劳那边暂时不给应答了。",
+            "这不是命令的问题，隔一两分钟重跑一次就好。",
+        ]
     if isinstance(exc, McpFatalError):
-        # 环境故障：Token 失效 / 限流 / 断网 / 服务端 5xx。
+        # 环境故障：Token 失效 / 断网 / 服务端 5xx。
         # 直接抛 traceback 对使用者毫无帮助，给一句能照着做的提示。
         return 2, [
             f"接口调用失败：{exc}",
-            "常见原因：Token 失效（到 https://open.mcd.cn/mcp 重新激活）、",
+            "常见原因：Token 失效或过期（到 https://open.mcd.cn/mcp 重新领取）、",
             "          网络不通（本机需要代理时请设置 https_proxy）、",
-            "          或触发限流（每 Token 600 次/分钟）。",
+            "          或同一时间请求太多被限流（隔一两分钟再试）。",
         ]
     # 业务性拒绝：工具调通了、对面也回答了，只是答案是否定的
     #（券不适用这家店 / storeCode 与 beCode 不配对 / 门店不支持该券）。
