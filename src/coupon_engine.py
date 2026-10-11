@@ -113,6 +113,7 @@ class Coupon:
     coupon_code: str
     title: str = ""
     product_codes: frozenset[str] = frozenset()
+    product_names: frozenset[str] = frozenset()
     valid_until: str = ""
 
     def applies_to(self, product_code: str) -> bool:

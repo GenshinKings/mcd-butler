@@ -366,7 +366,7 @@ def run_optimize(
         )
 
     if items:
-        cart, missed = _pick_cart(menu, items)
+        cart, missed = _pick_cart(menu, items, coupons)
         if missed:
             print("\n⚠️ 下列餐品在菜单里没找到，已跳过：")
             for m in missed:
@@ -789,7 +789,25 @@ def _build_cart(menu: list[CartItem], coupons: list[Coupon], size: int = 4) -> l
     return picked
 
 
-def _pick_cart(menu: list[CartItem], wants: list[str]) -> tuple[list[CartItem], list[str]]:
+_SYMBOL_STRIP = "™®©Ⓡ"
+
+
+def _norm_name(s: str) -> str:
+    """归一化餐品名用于模糊匹配：去掉 ™®© 等商标符号与首尾空白。
+
+    真实菜单里「麦咖啡™冰美式中杯」带 ™，用户打字通常不带，
+    朴素子串匹配会被商标符号整段切断而失配，导致券挂不上。
+    """
+    if not s:
+        return ""
+    for ch in _SYMBOL_STRIP:
+        s = s.replace(ch, "")
+    return s.strip()
+
+
+def _pick_cart(
+    menu: list[CartItem], wants: list[str], coupons: list[Coupon] | None = None
+) -> tuple[list[CartItem], list[str]]:
     """按用户给的餐品名挑购物车。
 
     支持两种写法：
@@ -800,7 +818,20 @@ def _pick_cart(menu: list[CartItem], wants: list[str]) -> tuple[list[CartItem], 
     匹配不上就原样报回来，绝不拿一个不相干的商品凑数。
     """
     by_code = {i.product_code: i for i in menu}
-    by_name = {(i.name or "").strip(): i for i in menu}
+    by_name = {_norm_name(i.name or ""): i for i in menu}
+    # 券名 → 菜单商品编码：接口两侧命名常不一致
+    # （券上写「麦咖啡™冰美式中杯」，菜单里却叫「麦咖啡™美式」），
+    # 用户照着券名点单时，菜单名匹配不上，需回退到券名解析。
+    menu_codes = set(by_code)
+    by_coupon_name: dict[str, str] = {}
+    for c in coupons or []:
+        code = next((cc for cc in c.product_codes if cc in menu_codes), None)
+        if not code:
+            continue
+        for pn in c.product_names:
+            n = _norm_name(pn)
+            if n:
+                by_coupon_name.setdefault(n, code)
 
     cart: list[CartItem] = []
     missed: list[str] = []
@@ -821,10 +852,18 @@ def _pick_cart(menu: list[CartItem], wants: list[str]) -> tuple[list[CartItem], 
         if not token:
             continue
 
-        item = by_code.get(token) or by_name.get(token)
+        item = by_code.get(token) or by_name.get(_norm_name(token))
         if item is None:
-            hits = [i for i in menu if token and token in (i.name or "")]
+            ntok = _norm_name(token)
+            hits = [i for i in menu if ntok and ntok in _norm_name(i.name or "")]
             item = hits[0] if hits else None
+        if item is None:
+            # 菜单名仍失配 → 回退到券名（接口两侧命名不一致的兜底）
+            ntok = _norm_name(token)
+            for cn, code in by_coupon_name.items():
+                if ntok and (ntok in cn or cn in ntok):
+                    item = by_code.get(code)
+                    break
         if item is None:
             missed.append(raw)
             continue
@@ -874,12 +913,14 @@ def _parse_coupons(raw) -> list[Coupon]:
     for entry in raw:
         products = entry.get("products") or []
         codes = {p.get("productCode") for p in products if p.get("productCode")}
+        names = {p.get("productName") for p in products if p.get("productName")}
         out.append(
             Coupon(
                 coupon_id=str(entry.get("couponId", "")),
                 coupon_code=str(entry.get("couponCode", "")),
                 title=entry.get("title", ""),
                 product_codes=frozenset(codes),
+                product_names=frozenset(names),
                 valid_until=str(entry.get("tradeDateTime", "")),
             )
         )

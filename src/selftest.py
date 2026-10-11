@@ -422,6 +422,41 @@ def run() -> int:
         f"平均差 {avg_gap / 100:.2f} 元",
     )
 
+    # 16. 菜单/券名匹配：真实接口两侧命名不一致 + 商标符号的兜底
+    # 真实数据：券 productName 写「麦咖啡™冰美式中杯」，菜单品名却是「麦咖啡™美式」，
+    # 用户照着券名点「冰美式中杯」必须仍能匹配到正确商品（507411）。
+    from .cli import _pick_cart
+
+    menu_match = [
+        CartItem(product_code="507411", name="麦咖啡™美式", unit_price_fen=1190),
+        CartItem(product_code="9900016073", name="龙焰鸡腿堡三件套", unit_price_fen=2690),
+    ]
+    cp_match = [
+        Coupon(
+            coupon_id="C1",
+            coupon_code="X",
+            title="9.9元中杯冰美式",
+            product_codes=frozenset({"507411"}),
+            product_names=frozenset({"麦咖啡™冰美式中杯"}),
+        )
+    ]
+    cart_a, missed_a = _pick_cart(menu_match, ["冰美式中杯"], cp_match)
+    check(
+        "匹配-券名回退命中商品",
+        len(cart_a) == 1 and cart_a[0].product_code == "507411",
+        f"missed={missed_a}",
+    )
+    cart_b, _ = _pick_cart(menu_match, ["麦咖啡美式"], cp_match)  # 用户不打™
+    check(
+        "匹配-忽略商标符号",
+        len(cart_b) == 1 and cart_b[0].product_code == "507411",
+    )
+    cart_c, _ = _pick_cart(menu_match, ["龙焰鸡腿堡三件套"], cp_match)
+    check(
+        "匹配-普通名称仍可用",
+        len(cart_c) == 1 and cart_c[0].product_code == "9900016073",
+    )
+
     # ---------------------------------------------------------------- 输出
     passed = sum(1 for _, ok, _ in _RESULTS if ok)
     total = len(_RESULTS)
