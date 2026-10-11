@@ -553,6 +553,17 @@ def run() -> int:
         [s["storeName"] for s in open_stores] == ["A", "C"],
     )
 
+    # 19. 券范围解释：卡包接口只有 Markdown、没有券码，必须向用户说清楚
+    # 「我明明有 4 张券为什么只用 1 张」，否则用户会以为引擎算漏了。
+    from .cli import _explain_coupon_scope
+
+    try:
+        for n in (0, 1, 2):
+            _explain_coupon_scope(n)
+        check("券范围-解释函数不崩（0/1/2 张）", True)
+    except Exception as exc:  # noqa: BLE001
+        check("券范围-解释函数不崩（0/1/2 张）", False, repr(exc))
+
     # ---------------------------------------------------------------- 输出
     passed = sum(1 for _, ok, _ in _RESULTS if ok)
     total = len(_RESULTS)

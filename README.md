@@ -30,7 +30,7 @@
   - 9.9元中杯冰美式  ← 挂在「麦咖啡™rhit
 cd mcd-butler
 python -m src.cli demo        # 离线演示，无需 Token
-python -m src.cli selftest    # 离线自检，63 项，几秒跑完
+python -m src.cli selftest    # 离线自检，64 项，几秒跑完
 ```
 
 零第三方依赖（只用标准库），Python 3.10+。
@@ -380,7 +380,7 @@ MCP_INTEGRATION.md   使用的 MCP Server、Tool、调用流程与业务价值
 - [x] 自选购物车（`--items`，支持数量）与菜单浏览（`menu`）
 - [x] 省钱洞察：真实成本 / 冗余券检测 / 拆单建议
 - [x] 一键顾问 `advise`（到期提醒 + 最优一单 + 洞察）
-- [x] 离线自检 `selftest`（63 项，覆盖三种返回体格式、接口异常结构守卫、匹配回归与路程模型）
+- [x] 离线自检 `selftest`（64 项，覆盖三种返回体格式、接口异常结构守卫、匹配回归与路程模型）
 - [x] 多门店比价 + 路程性价比 `compare`（距离取接口 `distance` 真值）
 - [ ] 定时领券（配合系统 cron / 计划任务）
 - [ ] 外卖（麦乐送）测算：需 `delivery-query-addresses` 有收货地址才能取真值

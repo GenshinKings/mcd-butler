@@ -183,6 +183,29 @@ def _locate(client, city: str, keyword: str):
     return store, store_code, menu, coupons
 
 
+def _explain_coupon_scope(n: int) -> None:
+    """解释「我卡包里明明有券，为什么这里没用上」。
+
+    这是实测出来的接口事实，不是猜测：
+    - `query-my-coupons`（卡包）返回的是**纯 Markdown**，里面**没有 couponId/couponCode**
+    - 而 `calculate-price` 挂券必须靠券码，只有 `query-store-coupons` 会给
+    所以卡包里的券不是"算漏了"，是程序上拿不到券码、挂不上去；
+    还有一部分是时段限制（比如早餐券只在 05:00-10:29 可用）。
+
+    不点破这一句，用户会以为引擎算错了 —— 这跟项目「把账算明白」的初衷相悖。
+    """
+    if n > 1:
+        return
+    if n == 0:
+        print("提示：这家门店当前没有可挂载的券（券码由 `query-store-coupons` 提供）。")
+    else:
+        print("提示：本次只用到 1 张券，不代表你卡包里只有 1 张。")
+    print(
+        "      卡包接口（`query-my-coupons`）只回 Markdown、不含券码，挂不进算价；\n"
+        "      另有部分券受时段限制（如早餐券）。想看全部券和到期日，用 `assets`。"
+    )
+
+
 def run_advise(city: str, keyword: str, budget: int) -> int:
     """一键顾问：今天该怎么点。
 
@@ -217,6 +240,7 @@ def run_advise(city: str, keyword: str, budget: int) -> int:
         return 1
     store, store_code, menu, coupons = ctx
     print(f"门店：{store.get('storeName', '未知门店')}　可用券 {len(coupons)} 张")
+    _explain_coupon_scope(len(coupons))
 
     if not coupons:
         print("\n当前时段这张门店没有可用券。")
@@ -342,8 +366,7 @@ def run_optimize(
     print(f"菜单载入 {len(menu)} 个品类")
 
     print(f"门店可用券 {len(coupons)} 张")
-    if not coupons:
-        print("提示：卡包为空时先执行领券，或改用 --demo 查看离线演示。")
+    _explain_coupon_scope(len(coupons))
 
     def oracle(items: list[CartItem], assignment: Assignment) -> PriceResult:
         payload_items = []
@@ -759,6 +782,7 @@ def run_replay(store_code: str | None, list_only: bool) -> int:
         client.data("query-store-coupons", {"storeCode": target_store, "orderType": 1, "beType": 1})
     )
     print(f"\n今日可用券 {len(coupons)} 张")
+    _explain_coupon_scope(len(coupons))
 
     def oracle(items: list[CartItem], assignment: Assignment) -> PriceResult:
         payload_items = []
