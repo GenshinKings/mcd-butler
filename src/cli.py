@@ -12,6 +12,7 @@ import argparse
 import os
 import re
 import sys
+from datetime import datetime
 
 from .coupon_engine import (
     Assignment,
@@ -25,6 +26,7 @@ from .coupon_engine import (
     to_fen,
 )
 from .mcd_client import McpError, load_dotenv
+from .oracle import make_price_oracle
 from . import demo_data as demo
 
 
@@ -95,7 +97,6 @@ def run_demo() -> int:
 
 def _demo_almanac() -> None:
     """黄历的离线演示：每一条宜忌都来自 demo_oracle 的真实算价。"""
-    from datetime import datetime
 
     from .almanac import build as build_almanac
     from .almanac import render as render_almanac
@@ -202,15 +203,67 @@ def run_assets(claim: bool) -> int:
     return 0
 
 
-def _locate(client, city: str, keyword: str):
-    """定位门店 + 载入菜单 + 拉券池。三个真实命令都要用这一段。"""
+def server_now(client) -> datetime:
+    """取服务端时间；拿不到就退回本机时间。
+
+    为什么不能只用 `datetime.now()`：黄历的「时段」和「今日到期」都依赖现在几点。
+    本机时区设错或系统时间不准时（换个设备、挂个 VPN、虚拟机跑），
+    整份黄历都会错，而且错得很隐蔽 —— 用户只会觉得"这券明明还没到期"。
+    服务端时间是唯一可信的基准，实测返回带 `timezone: GMT+08:00`。
+    """
+    try:
+        data = client.data("now-time-info", {})
+        text = (data or {}).get("datetime") if isinstance(data, dict) else None
+        if text:
+            return datetime.fromisoformat(str(text)[:26])
+    except Exception:
+        pass
+    return datetime.now()
+
+
+def _load_menu_and_coupons(client, store_code: str):
+    """给定 storeCode，载入菜单与券池。"""
+    meals = client.data("query-meals", {"storeCode": store_code, "orderType": 1, "beType": 1})
+    menu = _parse_menu(meals)
+    coupons = _parse_coupons(
+        client.data("query-store-coupons", {"storeCode": store_code, "orderType": 1, "beType": 1})
+    )
+    return menu, coupons
+
+
+def _locate(client, city: str, keyword: str, store_code: str | None = None):
+    """定位门店 + 载入菜单 + 拉券池。
+
+    两条必须守住的规矩：
+
+    1. **不许静默换店。** 接口按关键词搜不到时仍会返回一串"最接近"的门店，
+       而门店决定了菜单、券池和最终价格。静默取第一条，用户拿着 A 店的价格
+       跑到 B 店结账，只会得出一个结论：这软件骗人。所以匹配不上时必须明说。
+    2. 给了 `store_code` 就直接用它，不再猜 —— 用户已经知道自己去哪家店。
+    """
+    if store_code:
+        menu, coupons = _load_menu_and_coupons(client, store_code)
+        if not menu:
+            print(f"storeCode={store_code} 没查到菜单，请确认编码是否正确。")
+            return None
+        return {"storeCode": store_code, "storeName": f"门店 {store_code}"}, store_code, menu, coupons
+
     stores = client.data(
         "query-nearby-stores", {"beType": 1, "searchType": 2, "city": city, "keyword": keyword}
     )
     if not isinstance(stores, list) or not stores:
         print("未找到门店，请换一个城市/关键词。")
         return None
-    store = stores[0]
+    # 先找名字/地址里真带关键词的那家；找不到才退回第一条。
+    # 无脑取第一条会出现「搜 A 店却按 B 店的价格算」这种最难发现的错。
+    store = None
+    if keyword:
+        for s in stores:
+            if isinstance(s, dict) and keyword in f"{s.get('storeName', '')}{s.get('address', '')}":
+                store = s
+                break
+    if store is None:
+        store = stores[0]
     if not isinstance(store, dict):
         print("门店数据格式异常。")
         return None
@@ -218,11 +271,19 @@ def _locate(client, city: str, keyword: str):
     if not store_code:
         print("门店缺少 storeCode，无法继续。")
         return None
-    meals = client.data("query-meals", {"storeCode": store_code, "orderType": 1, "beType": 1})
-    menu = _parse_menu(meals)
-    coupons = _parse_coupons(
-        client.data("query-store-coupons", {"storeCode": store_code, "orderType": 1, "beType": 1})
-    )
+
+    # 只有「关键词没匹配上」且「最近的店也远得离谱」时才警告。
+    # 搜地标（如"人民广场"）返回的店名里本就不含地标名，那是正常使用，不该报警。
+    dist = store.get("distance")
+    far = isinstance(dist, (int, float)) and dist > 1000
+    if keyword and far and keyword not in f"{store.get('storeName', '')}{store.get('address', '')}":
+        print(f"⚠️ 没有名字里带「{keyword}」的门店，最接近的一家也在 {int(dist)} 米外。")
+        print(f"   实际用的是：{store.get('storeName', '未知门店')}")
+        print(f"   下面算出来的价格、券和菜单**都是这一家的**。")
+        print(f"   想换一家：把 --store 换成别的编码（本店就是 {store_code}）")
+        print(f"   想看附近还有哪些店：python -m src.cli compare")
+
+    menu, coupons = _load_menu_and_coupons(client, store_code)
     return store, store_code, menu, coupons
 
 
@@ -249,7 +310,7 @@ def _explain_coupon_scope(n: int) -> None:
     )
 
 
-def run_advise(city: str, keyword: str, budget: int) -> int:
+def run_advise(city: str, keyword: str, budget: int, store_code: str | None = None) -> int:
     """一键顾问：今天该怎么点。
 
     把几件事合成一条命令 —— 大多数人不会去记八个子命令，
@@ -257,7 +318,6 @@ def run_advise(city: str, keyword: str, budget: int) -> int:
     """
     from .assets import fetch_my_coupons
     from .mcd_client import McdMcpClient
-    from datetime import datetime
 
     client = McdMcpClient()
     client.initialize()
@@ -277,7 +337,7 @@ def run_advise(city: str, keyword: str, budget: int) -> int:
         print(f"卡包 {len(mine)} 张，没有今天到期的。\n")
 
     # 2. 再算最优一单
-    ctx = _locate(client, city, keyword)
+    ctx = _locate(client, city, keyword, store_code)
     if ctx is None:
         print("未找到门店，请换一个关键词。")
         return 1
@@ -291,31 +351,7 @@ def run_advise(city: str, keyword: str, budget: int) -> int:
         print("      或先跑 `python -m src.cli assets --claim` 把能领的领了。")
         return 0
 
-    def oracle(items: list[CartItem], assignment: Assignment) -> PriceResult:
-        payload_items = []
-        for idx, item in enumerate(items):
-            entry = {"productCode": item.product_code, "quantity": item.quantity}
-            ci = assignment.mapping.get(idx)
-            if ci is not None:
-                entry["couponId"] = coupons[ci].coupon_id
-                entry["couponCode"] = coupons[ci].coupon_code
-            payload_items.append(entry)
-        payload: dict = {
-            "storeCode": store_code,
-            "orderType": 1,
-            "beType": 1,
-            "items": payload_items,
-        }
-        if isinstance(assignment.with_order, dict):
-            payload["withOrder"] = assignment.with_order.payload
-        d = client.data("calculate-price", payload)
-        return PriceResult(
-            price_fen=int(d.get("price", 0)),
-            original_fen=int(d.get("originalPrice", 0)),
-            discount_fen=int(d.get("discount", 0)),
-            delivery_fen=int(d.get("deliveryPrice", 0)),
-            packing_fen=int(d.get("packingPrice", 0)),
-        )
+    oracle = make_price_oracle(client, store_code, coupons)
 
     cart = _build_cart(menu, coupons)
     if not cart:
@@ -375,14 +411,13 @@ def _butler_close(saved_fen: int) -> str:
     return "\n".join(lines)
 
 
-def run_almanac(city: str, keyword: str, budget: int) -> int:
+def run_almanac(city: str, keyword: str, budget: int, store_code: str | None = None) -> int:
     """麦门黄历：今天宜吃什么、忌吃什么。
 
     和别的"趣味黄历"唯一的区别是 —— 这里的每一条宜忌都真的打过算价接口。
     宜：挂这张券，接口真的给便宜了这么多钱。
     忌：要么没券可挂（白付原价），要么挂上去反而更贵（随单购把卡费算进来了）。
     """
-    from datetime import datetime
 
     from .almanac import build as build_almanac
     from .almanac import render as render_almanac
@@ -393,7 +428,7 @@ def run_almanac(city: str, keyword: str, budget: int) -> int:
     client.initialize()
 
     print(f"定位门店：{city} / {keyword}")
-    ctx = _locate(client, city, keyword)
+    ctx = _locate(client, city, keyword, store_code)
     if ctx is None:
         print("未找到门店，请换一个关键词。")
         return 1
@@ -404,32 +439,10 @@ def run_almanac(city: str, keyword: str, budget: int) -> int:
         print("小的不编 —— 换个时间或换家门店再来。")
         return 1
 
-    def oracle(items: list[CartItem], assignment: Assignment) -> PriceResult:
-        payload_items = []
-        for idx, item in enumerate(items):
-            entry = {"productCode": item.product_code, "quantity": item.quantity}
-            ci = assignment.mapping.get(idx)
-            if ci is not None:
-                entry["couponId"] = coupons[ci].coupon_id
-                entry["couponCode"] = coupons[ci].coupon_code
-            payload_items.append(entry)
-        data = client.data(
-            "calculate-price",
-            {
-                "storeCode": store_code,
-                "orderType": 1,
-                "beType": 1,
-                "items": payload_items,
-            },
-        )
-        return PriceResult(
-            price_fen=int(data.get("price", 0)),
-            original_fen=int(data.get("originalPrice", 0)),
-            discount_fen=int(data.get("discount", 0)),
-        )
+    oracle = make_price_oracle(client, store_code, coupons)
 
     shared = Budget(budget)
-    day = build_almanac(menu, coupons, oracle, shared, now=datetime.now())
+    day = build_almanac(menu, coupons, oracle, shared, now=server_now(client))
     best_saved = max((r.saved_fen for r in day["readings"]), default=0)
     print(render_almanac(day, butler_almanac(best_saved, len(day["expiry"]))))
     print(f"\n算价接口共调用 {shared.used} 次（上限 {budget}）")
@@ -437,13 +450,13 @@ def run_almanac(city: str, keyword: str, budget: int) -> int:
     return 0
 
 
-def run_menu(city: str, keyword: str, filter_kw: str, limit: int) -> int:
+def run_menu(city: str, keyword: str, filter_kw: str, limit: int, store_code: str | None = None) -> int:
     """列出门店菜单。带券的商品会被标出来——那是真正值得点的。"""
     from .mcd_client import McdMcpClient
 
     client = McdMcpClient()
     client.initialize()
-    ctx = _locate(client, city, keyword)
+    ctx = _locate(client, city, keyword, store_code)
     if ctx is None:
         print("未找到门店，请换一个关键词。")
         return 1
@@ -480,6 +493,7 @@ def run_optimize(
     save: bool = True,
     items: list[str] | None = None,
     insights: bool = True,
+    store_code: str | None = None,
 ) -> int:
     from .mcd_client import McdMcpClient
 
@@ -487,7 +501,7 @@ def run_optimize(
     client.initialize()
 
     print(f"定位门店：{city} / {keyword}")
-    ctx = _locate(client, city, keyword)
+    ctx = _locate(client, city, keyword, store_code)
     if ctx is None:
         print("未找到门店，请换一个关键词。")
         return 1
@@ -498,31 +512,7 @@ def run_optimize(
     print(f"门店可用券 {len(coupons)} 张")
     _explain_coupon_scope(len(coupons))
 
-    def oracle(items: list[CartItem], assignment: Assignment) -> PriceResult:
-        payload_items = []
-        for idx, item in enumerate(items):
-            entry = {"productCode": item.product_code, "quantity": item.quantity}
-            ci = assignment.mapping.get(idx)
-            if ci is not None:
-                entry["couponId"] = coupons[ci].coupon_id
-                entry["couponCode"] = coupons[ci].coupon_code
-            payload_items.append(entry)
-        payload: dict = {
-            "storeCode": store_code,
-            "orderType": 1,
-            "beType": 1,
-            "items": payload_items,
-        }
-        if isinstance(assignment.with_order, dict):
-            payload["withOrder"] = assignment.with_order.payload
-        data = client.data("calculate-price", payload)
-        return PriceResult(
-            price_fen=int(data.get("price", 0)),
-            original_fen=int(data.get("originalPrice", 0)),
-            discount_fen=int(data.get("discount", 0)),
-            delivery_fen=int(data.get("deliveryPrice", 0)),
-            packing_fen=int(data.get("packingPrice", 0)),
-        )
+    oracle = make_price_oracle(client, store_code, coupons)
 
     if items:
         cart, missed = _pick_cart(menu, items, coupons)
@@ -737,31 +727,7 @@ def run_compare(
             print(f"\n（已达 --budget {budget} 上限，「{st.get('storeName', '')}」及之后未测算）")
             break
 
-        def oracle(items_, assignment, _code=code, _coupons=coupons):
-            payload_items = []
-            for idx, item in enumerate(items_):
-                entry = {"productCode": item.product_code, "quantity": item.quantity}
-                ci = assignment.mapping.get(idx)
-                if ci is not None:
-                    entry["couponId"] = _coupons[ci].coupon_id
-                    entry["couponCode"] = _coupons[ci].coupon_code
-                payload_items.append(entry)
-            payload: dict = {
-                "storeCode": _code,
-                "orderType": 1,
-                "beType": 1,
-                "items": payload_items,
-            }
-            if isinstance(assignment.with_order, dict):
-                payload["withOrder"] = assignment.with_order.payload
-            data = client.data("calculate-price", payload)
-            return PriceResult(
-                price_fen=int(data.get("price", 0)),
-                original_fen=int(data.get("originalPrice", 0)),
-                discount_fen=int(data.get("discount", 0)),
-                delivery_fen=int(data.get("deliveryPrice", 0)),
-                packing_fen=int(data.get("packingPrice", 0)),
-            )
+        oracle = make_price_oracle(client, code, coupons)
 
         optimizer = CouponOptimizer(oracle, max_calls=budget, budget=shared)
         try:
@@ -821,13 +787,16 @@ def run_compare(
     return 0
 
 
-def run_brag() -> int:
+def run_brag(with_link: bool = False) -> int:
     """麦门账单：段位 + 能直接晒出去的卡片。
 
     不需要 Token，也不联网 —— 数据全部来自本机快照（~/.mcd-butler/）。
 
     为什么要有这个命令：省钱这件事，**能跟朋友说的那一刻才有快感**。
     一个只能自己看的省钱工具，是传播不出去的。
+
+    但卡片里绝不把"测算"说成"已省"：快照里绝大多数条目只是引擎算出的
+    省钱空间，用户根本没下单。混着报出去，等于给用户一张他自己圆不上的成绩单。
     """
     from .persona import brag_card, butler_total, progress_bar, rank_of, summarize
     from .snapshot import load_all
@@ -843,7 +812,12 @@ def run_brag() -> int:
     r = rank_of(s["saved_fen"])
 
     print("\n麦门账单（全部来自本机快照，不联网、不上传）\n")
-    print(f"  累计省下   ¥{s['saved_fen'] / 100:.2f}　　共 {s['orders']} 单")
+    print(f"  累计测算可省   ¥{s['saved_fen'] / 100:.2f}　　共 {s['orders']} 次测算")
+    if s["real_orders"] == 0:
+        # 这行必须说：否则用户把「测算」当「已省」，晒出去会被朋友问住。
+        print("  ⚠️ 其中 0 笔是真实成交 —— 这是「这么点能省多少」，不是已经省下的钱。")
+    else:
+        print(f"  其中 {s['real_orders']} 笔为真实成交订单")
     if s["top_store"]:
         print(f"  最常光顾   {s['top_store']}")
     if s["top_coupon"]:
@@ -859,7 +833,7 @@ def run_brag() -> int:
     else:
         print("  已满级 —— 您就是麦门本身。")
 
-    print(f"\n  {butler_total(s['saved_fen'], s['orders'])}")
+    print(f"\n  {butler_total(s['saved_fen'], s['orders'], s['real_orders'])}")
     print()
     print(
         brag_card(
@@ -869,9 +843,37 @@ def run_brag() -> int:
             s["top_store"],
             s["top_coupon"],
             s["first_at"],
+            real_orders=s["real_orders"],
+            with_link=with_link,
         )
     )
     print("\n（上面这段可以直接复制粘贴去晒）")
+    if not with_link:
+        print("（默认不带仓库链接——朋友圈里裸链接容易被判广告；"
+              "发 CSDN/知乎时用 `brag --with-link`）")
+    print("\n不想要的记录可以撤回：`python -m src.cli forget --last`")
+    return 0
+
+
+def run_forget(last: int, all_: bool) -> int:
+    """撤回账本里的记录。
+
+    为什么必须有：optimize 默认把每一次测算都写进账本，于是
+    「输错店名随手一跑」「--budget 1 探测一下」也被记成了省钱记录。
+    用户要晒卡片之前，得能把自己不认的条目删掉 —— 否则那张卡片
+    是一份他自己都解释不清的假成绩单。
+    """
+    from .snapshot import clear_all, delete_last
+
+    if all_:
+        n = clear_all()
+        print(f"已清空本地账本，共移除 {n} 条记录。")
+        return 0
+    n = delete_last(max(last, 1))
+    if n == 0:
+        print("账本是空的，没有可撤回的记录。")
+        return 1
+    print(f"已撤回最近 {n} 条记录。用 `python -m src.cli brag` 看看现在的账本。")
     return 0
 
 
@@ -972,31 +974,7 @@ def run_replay(store_code: str | None, list_only: bool) -> int:
     print(f"\n今日可用券 {len(coupons)} 张")
     _explain_coupon_scope(len(coupons))
 
-    def oracle(items: list[CartItem], assignment: Assignment) -> PriceResult:
-        payload_items = []
-        for idx, item in enumerate(items):
-            entry = {"productCode": item.product_code, "quantity": item.quantity}
-            ci = assignment.mapping.get(idx)
-            if ci is not None:
-                entry["couponId"] = coupons[ci].coupon_id
-                entry["couponCode"] = coupons[ci].coupon_code
-            payload_items.append(entry)
-        payload: dict = {
-            "storeCode": target_store,
-            "orderType": 1,
-            "beType": 1,
-            "items": payload_items,
-        }
-        if isinstance(assignment.with_order, dict):
-            payload["withOrder"] = assignment.with_order.payload
-        d = client.data("calculate-price", payload)
-        return PriceResult(
-            price_fen=int(d.get("price", 0)),
-            original_fen=int(d.get("originalPrice", 0)),
-            discount_fen=int(d.get("discount", 0)),
-            delivery_fen=int(d.get("deliveryPrice", 0)),
-            packing_fen=int(d.get("packingPrice", 0)),
-        )
+    oracle = make_price_oracle(client, target_store, coupons)
 
     optimizer = CouponOptimizer(oracle, max_calls=40)
     best = optimizer.optimize(cart, coupons, _with_order_options(cart))
@@ -1366,9 +1344,23 @@ def _parse_coupons(raw) -> list[Coupon]:
         return []
     out: list[Coupon] = []
     for entry in raw:
+        # 券条目本身可能是 str/None（接口换形态时遇到过），products[] 里的元素
+        # 同理。主链路上一个 AttributeError 就能让整单算不出来，所以逐个守卫。
+        if not isinstance(entry, dict):
+            continue
         products = entry.get("products") or []
-        codes = {p.get("productCode") for p in products if p.get("productCode")}
-        names = {p.get("productName") for p in products if p.get("productName")}
+        if not isinstance(products, (list, tuple)):
+            products = []
+        codes = {
+            str(p.get("productCode"))
+            for p in products
+            if isinstance(p, dict) and p.get("productCode")
+        }
+        names = {
+            str(p.get("productName"))
+            for p in products
+            if isinstance(p, dict) and p.get("productName")
+        }
         out.append(
             Coupon(
                 coupon_id=str(entry.get("couponId", "")),
@@ -1401,6 +1393,7 @@ def main(argv: list[str] | None = None) -> int:
     p_adv.add_argument("--city", default=city_default)
     p_adv.add_argument("--keyword", default=kw_default)
     p_adv.add_argument("--budget", type=int, default=40, help="算价接口调用上限")
+    p_adv.add_argument("--store", default=None, help="直接指定 storeCode，跳过关键词搜索")
 
     p_assets = sub.add_parser("assets", help="麦门资产周报（默认只读）")
     p_assets.add_argument(
@@ -1412,6 +1405,7 @@ def main(argv: list[str] | None = None) -> int:
     p_menu.add_argument("--keyword", default=kw_default)
     p_menu.add_argument("--filter", default="", help="只显示名称包含该关键词的餐品")
     p_menu.add_argument("--limit", type=int, default=40, help="最多显示多少条")
+    p_menu.add_argument("--store", default=None, help="直接指定 storeCode，跳过关键词搜索")
 
     p_opt = sub.add_parser("optimize", help="真实账号券价寻优")
     p_opt.add_argument("--city", default=city_default)
@@ -1430,6 +1424,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="跳过省钱洞察（会少算若干次价，快一些）",
     )
+    p_opt.add_argument("--store", default=None, help="直接指定 storeCode，跳过关键词搜索")
 
     p_rep = sub.add_parser("replay", help="历史订单复刻与价格变动")
     p_rep.add_argument("--store", default=None, help="指定门店编码，默认用最近快照")
@@ -1454,12 +1449,20 @@ def main(argv: list[str] | None = None) -> int:
     p_cmp.add_argument("--wage", type=float, default=None, help="时薪（元/小时），把等待时间也折算成钱")
     p_cmp.add_argument("--top", type=int, default=3, help="最多比几家店")
 
-    sub.add_parser("brag", help="麦门账单：段位 + 可晒的卡片（读本地快照，无需 Token）")
+    p_brag = sub.add_parser("brag", help="麦门账单：段位 + 可晒的卡片（读本地快照，无需 Token）")
+    p_brag.add_argument(
+        "--with-link", action="store_true", help="卡片里带上仓库链接（发 CSDN/知乎时用）"
+    )
+
+    p_forget = sub.add_parser("forget", help="撤回本地账本里的记录（不联网）")
+    p_forget.add_argument("--last", type=int, default=1, help="撤回最近几条，默认 1 条")
+    p_forget.add_argument("--all", action="store_true", help="清空整本账")
 
     p_alm = sub.add_parser("almanac", help="麦门黄历：今天宜吃什么忌吃什么（每条都真算过价）")
     p_alm.add_argument("--city", default=city_default)
     p_alm.add_argument("--keyword", default=kw_default)
     p_alm.add_argument("--budget", type=int, default=40, help="算价接口调用上限")
+    p_alm.add_argument("--store", default=None, help="直接指定 storeCode，跳过关键词搜索")
 
     p_nut = sub.add_parser("nutrition", help="热量预算搭配")
     p_nut.add_argument("--city", default=city_default)
@@ -1501,9 +1504,9 @@ def _dispatch(args) -> int:
         print("离线自检（无需 Token）\n")
         return run_selftest()
     if args.cmd == "advise":
-        return run_advise(args.city, args.keyword, args.budget)
+        return run_advise(args.city, args.keyword, args.budget, args.store)
     if args.cmd == "menu":
-        return run_menu(args.city, args.keyword, args.filter, args.limit)
+        return run_menu(args.city, args.keyword, args.filter, args.limit, args.store)
     if args.cmd == "assets":
         return run_assets(args.claim)
     if args.cmd == "replay":
@@ -1520,9 +1523,11 @@ def _dispatch(args) -> int:
             args.top,
         )
     if args.cmd == "brag":
-        return run_brag()
+        return run_brag(getattr(args, "with_link", False))
+    if args.cmd == "forget":
+        return run_forget(getattr(args, "last", 1), getattr(args, "all", False))
     if args.cmd == "almanac":
-        return run_almanac(args.city, args.keyword, args.budget)
+        return run_almanac(args.city, args.keyword, args.budget, args.store)
     if args.cmd == "nutrition":
         return run_nutrition(args.city, args.keyword, args.kcal, args.size)
     if args.cmd == "optimize":
@@ -1534,6 +1539,7 @@ def _dispatch(args) -> int:
             save=not args.no_save,
             items=picked,
             insights=not args.no_insights,
+            store_code=args.store,
         )
     return 1
 

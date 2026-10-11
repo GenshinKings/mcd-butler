@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcd-butler"
+version = "0.3.0"
+description = "麦门管家：把麦当劳优惠券挂到最划算的商品上，并告诉你这趟值不值得跑"
+readme = "README.md"
+requires-python = ">=3.10"
+# 零第三方依赖是本项目的一条硬原则：只靠标准库，clone 下来就能跑。
+dependencies = []
+
+[project.scripts]
+mcd-butler = "src.cli:main"
+
+[tool.setuptools]
+packages = ["src"]

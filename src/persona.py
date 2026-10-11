@@ -83,15 +83,24 @@ def butler_saved(saved_fen: int) -> str:
     return f"省下 {yuan(saved_fen)}。小的斗胆说一句：这单的券，算是物尽其用了。"
 
 
-def butler_total(saved_fen: int, orders: int) -> str:
-    """管家对「累计账单」的点评（区别于单笔的 butler_saved）。"""
+def butler_total(saved_fen: int, orders: int, real_orders: int = 0) -> str:
+    """管家对「累计账单」的点评（区别于单笔的 butler_saved）。
+
+    措辞上必须守住一条：这是**测算**出来的省钱空间，不等于已经省下的钱。
+    管家可以讨喜，但不能替主人吹牛 —— 吹出去的牛，主人得自己圆。
+    """
     if orders <= 0 or saved_fen <= 0:
         return "账上还是空的。先让小的办一单，才有得记。"
-    avg = saved_fen // orders
+    avg = saved_fen // max(orders, 1)
     tail = "积少成多，这就是麦门的算法。"
     if avg >= 2000:
         tail = "您这手气，小的服气。"
-    return f"共 {orders} 单，替您省下 {yuan(saved_fen)}，平均每单 {yuan(avg)}。{tail}"
+    base = f"共测算 {orders} 次，替您找出 {yuan(saved_fen)} 的省钱空间，平均每单 {yuan(avg)}。{tail}"
+    if real_orders == 0:
+        base += "（这些都是测算，不是已成交的省钱 —— 小的不敢替您记虚账。）"
+    else:
+        base += f"（其中 {real_orders} 笔是您的真实订单。）"
+    return base
 
 
 def butler_almanac(best_saved_fen: int, today_expiry: int) -> str:
@@ -134,11 +143,20 @@ def brag_card(
     top_store: str = "",
     top_coupon: str = "",
     first_at: str = "",
+    real_orders: int = 0,
+    with_link: bool = False,
 ) -> str:
     """生成一段能直接粘进朋友圈/群里的文本卡片。
 
     为什么要能晒：省钱这件事，跟朋友说的那一刻才有快感。
     一个只能自己看的省钱工具，传播不出去。
+
+    两条克制：
+    1. **不说谎** —— 绝大多数记录是"测算"，不是真实成交。
+       把测算说成"我累计省了 ¥XX"，用户会被朋友一句"你哪单省的"问住。
+       所以金额写「累计测算可省」，并单独标出真实成交笔数。
+    2. **默认不带链接** —— 朋友圈/小红书里裸链接会被判广告而限流。
+       想带链接发 CSDN/知乎时用 `brag --with-link`。
     """
     lines = [
         "┌──────────────────────────────────┐",
@@ -146,8 +164,8 @@ def brag_card(
         "└──────────────────────────────────┘",
         "",
         f"  段位：{rank_title}",
-        f"  累计省下：{yuan(saved_fen)}",
-        f"  经手单数：{orders} 单",
+        f"  累计测算可省：{yuan(saved_fen)}",
+        f"  经手：{orders} 次测算 / {real_orders} 笔真实成交",
     ]
     if top_store:
         lines.append(f"  最常光顾：{top_store}")
@@ -155,16 +173,20 @@ def brag_card(
         lines.append(f"  最常用券：{top_coupon}")
     if first_at:
         lines.append(f"  记账起始：{first_at[:10]}")
-    lines += [
-        "",
-        "  账单由 mcd-butler 生成（本地快照，不上传）",
-        "  https://github.com/GenshinKings/mcd-butler",
-    ]
+    lines.append("")
+    lines.append("  账单由 mcd-butler 在本地生成，不上传任何数据")
+    if with_link:
+        lines.append("  https://github.com/GenshinKings/mcd-butler")
     return "\n".join(lines)
 
 
 def summarize(entries: list[dict]) -> dict:
-    """从本地快照汇总出账单数据。字段缺失一律当 0，绝不因脏数据崩。"""
+    """从本地快照汇总出账单数据。字段缺失一律当 0，绝不因脏数据崩。
+
+    `real_orders` 单独计数：绝大多数快照是"测算"（引擎算出来能省多少），
+    不是真实成交。把两者混成一个"累计省下 ¥XX"拿出去晒，
+    用户会被朋友问住 —— 那不是他省的钱。所以数量与金额都必须分开报。
+    """
     saved = 0
     for e in entries:
         base = e.get("baseline_fen") or 0
@@ -180,8 +202,10 @@ def summarize(entries: list[dict]) -> dict:
             if t:
                 coupons[t] += 1
     times = sorted(e.get("saved_at") or "" for e in entries)
+    real_orders = sum(1 for e in entries if e.get("kind") == "order")
     return {
         "orders": len(entries),
+        "real_orders": real_orders,
         "saved_fen": saved,
         "top_store": stores.most_common(1)[0][0] if stores else "",
         "top_coupon": coupons.most_common(1)[0][0] if coupons else "",

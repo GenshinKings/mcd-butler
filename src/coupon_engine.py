@@ -58,6 +58,26 @@ def to_fen(value: Any) -> int:
         return 0
 
 
+def as_fen(value: Any) -> int:
+    """接口**已经是「分」**的字段 → 整数分。
+
+    和 `to_fen` 的区别必须说清楚，混用会差 100 倍：
+        `to_fen`  元 → 分（乘 100），用于菜单价（实测 `currentPrice` 是元字符串）
+        `as_fen`  分 → 分（不乘），用于算价结果（实测 `price` 是分整数）
+
+    两者都要容忍脏数据：同一个字段在不同工具里可能返回
+    `5700` / `"5700"` / `None` / `""`，任何一种都不该让整条链路崩掉。
+    """
+    if value is None or value == "":
+        return 0
+    try:
+        return int(
+            Decimal(str(value).strip()).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        )
+    except (InvalidOperation, ValueError, TypeError, ArithmeticError):
+        return 0
+
+
 @dataclass(frozen=True)
 class CartItem:
     """购物车条目。
@@ -315,19 +335,35 @@ class CouponOptimizer:
         最后报出一个「没找到更好的组合」——把真正的故障伪装成正常结果。
         所以连续失败到一定次数就原样抛出，让上层看见真实原因。
         """
+        price, _ = self._try_evaluate(cart, candidate)
+        return price
+
+    def _try_evaluate(
+        self, cart: Sequence[CartItem], candidate: Assignment
+    ) -> tuple[PriceResult | None, str]:
+        """返回 `(价格, 原因)`，原因三种：
+
+            "ok"      算出来了
+            "budget"  预算耗尽 —— 必须停止搜索，这时收工是诚实的
+            "error"   单次失败（网络抖动 / 接口报错）—— 该**跳过这个候选继续试**
+
+        为什么非得分开：爬山里如果只看 `price is None`，
+        一次网络抖动就会被当成「邻域内没有更便宜的」，于是只爬两步就收工，
+        最后报一个「已是最优」，实际上用户多付了钱，而且全程没有任何报错。
+        """
         from .mcd_client import McpError  # 局部导入，避免模块级循环依赖
 
         try:
-            return self.evaluate(cart, candidate)
+            return self.evaluate(cart, candidate), "ok"
         except BudgetExhausted:
-            return None
+            return None, "budget"
         except (McpError, TimeoutError, OSError) as exc:
             self._failures += 1
             if self._failures >= 3:
                 raise
             if self.verbose:
                 print(f"  （一次算价失败，跳过该候选：{exc}）")
-            return None
+            return None, "error"
 
     # ---------- 构造 ----------
 
@@ -473,9 +509,11 @@ class CouponOptimizer:
                     mapping={k: v for k, v in current.mapping.items() if k != item_idx},
                     with_order=current.with_order,
                 )
-                price = self.try_evaluate(cart, candidate)
+                price, reason = self._try_evaluate(cart, candidate)
+                if reason == "budget":
+                    return current  # 预算见底，这时收工是诚实的
                 if price is None:
-                    return current
+                    continue  # 抖动/单次失败：跳过这个候选，继续试下一个
                 if price.price_fen < current_price:
                     current, current_price = candidate, price.price_fen
                     improved = True
@@ -496,9 +534,11 @@ class CouponOptimizer:
                         mapping={**current.mapping, item_idx: ci},
                         with_order=current.with_order,
                     )
-                    price = self.try_evaluate(cart, candidate)
+                    price, reason = self._try_evaluate(cart, candidate)
+                    if reason == "budget":
+                        return current  # 预算见底，这时收工是诚实的
                     if price is None:
-                        return current
+                        continue  # 抖动/单次失败：跳过这个候选，继续试下一个
                     if price.price_fen < current_price:
                         current, current_price = candidate, price.price_fen
                         improved = True
@@ -531,9 +571,11 @@ class CouponOptimizer:
                     swapped = dict(current.mapping)
                     swapped[item_idx] = cj
                     candidate = Assignment(mapping=swapped, with_order=current.with_order)
-                    price = self.try_evaluate(cart, candidate)
+                    price, reason = self._try_evaluate(cart, candidate)
+                    if reason == "budget":
+                        return current  # 预算见底，这时收工是诚实的
                     if price is None:
-                        return current
+                        continue  # 抖动/单次失败：跳过这个候选，继续试下一个
                     if price.price_fen < current_price:
                         current, current_price = candidate, price.price_fen
                         improved = True
@@ -554,9 +596,11 @@ class CouponOptimizer:
                     del moved[item_idx]
                     moved[target] = ci
                     candidate = Assignment(mapping=moved, with_order=current.with_order)
-                    price = self.try_evaluate(cart, candidate)
+                    price, reason = self._try_evaluate(cart, candidate)
+                    if reason == "budget":
+                        return current  # 预算见底，这时收工是诚实的
                     if price is None:
-                        return current
+                        continue  # 抖动/单次失败：跳过这个候选，继续试下一个
                     if price.price_fen < current_price:
                         current, current_price = candidate, price.price_fen
                         improved = True
@@ -577,9 +621,11 @@ class CouponOptimizer:
                 swapped = dict(current.mapping)
                 swapped[i1], swapped[i2] = c2, c1
                 candidate = Assignment(mapping=swapped, with_order=current.with_order)
-                price = self.try_evaluate(cart, candidate)
+                price, reason = self._try_evaluate(cart, candidate)
+                if reason == "budget":
+                    return current  # 预算见底，这时收工是诚实的
                 if price is None:
-                    return current
+                    continue  # 抖动/单次失败：跳过这个候选，继续试下一个
                 if price.price_fen < current_price:
                     current, current_price = candidate, price.price_fen
                     improved = True

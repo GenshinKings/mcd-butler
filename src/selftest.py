@@ -26,6 +26,8 @@ from .coupon_engine import (
     CouponOptimizer,
     PriceResult,
     WithOrderOption,
+    as_fen,
+    to_fen,
 )
 from .mcd_client import extract_payload
 from .nutrition import parse_nutrition
@@ -561,8 +563,31 @@ def run() -> int:
         for n in (0, 1, 2):
             _explain_coupon_scope(n)
         check("券范围-解释函数不崩（0/1/2 张）", True)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa:BLE001
         check("券范围-解释函数不崩（0/1/2 张）", False, repr(exc))
+
+    # 券池是主链路：接口把 products[] 换成字符串、或条目本身不是对象时，
+    # 一个 AttributeError 就能让整单算不出来，必须优雅跳过。
+    from .cli import _parse_coupons
+
+    try:
+        dirty = [
+            {"couponId": "1", "couponCode": "k", "title": "正常券",
+             "products": [{"productCode": "A", "productName": "甲"}]},
+            {"couponId": "2", "couponCode": "k2", "title": "脏products",
+             "products": ["不是对象", None, {"productCode": "B"}]},
+            "整条都不是对象",
+            None,
+        ]
+        got = _parse_coupons(dirty)
+        check(
+            "券解析-脏数据逐条跳过而非整单崩",
+            len(got) == 2 and "A" in got[0].product_codes and "B" in got[1].product_codes,
+            str([c.product_codes for c in got]),
+        )
+        check("券解析-非列表返回空", _parse_coupons(None) == [] and _parse_coupons("x") == [])
+    except Exception as exc:  # noqa: BLE001
+        check("券解析-脏数据逐条跳过而非整单崩", False, repr(exc))
 
     # 20. 麦门黄历：这是项目的门面，每一条宜忌都必须是真算出来的
     from datetime import datetime
@@ -669,10 +694,109 @@ def run() -> int:
     check("账单-最常光顾与最常用券", s["top_store"] == "人民广场店" and s["top_coupon"] == "板烧立减")
     check("账单-脏数据不崩", summarize([{}, {"baseline_fen": None}])["saved_fen"] == 0)
     card = brag_card(500, 2, "麦门学徒", "X店", "Y券")
+    card_link = brag_card(500, 2, "麦门学徒", with_link=True)
     check(
-        "晒单-卡片含段位与仓库地址",
-        "麦门学徒" in card and "github.com" in card and "¥5.00" in card,
+        "晒单-卡片默认不带链接（朋友圈里裸链接会被判广告）",
+        "github.com" not in card and "麦门学徒" in card and "¥5.00" in card,
         card,
+    )
+    check("晒单---with-link 才带仓库地址", "github.com" in card_link)
+    check(
+        "晒单-卡片区分测算与真实成交（不能把测算说成已省）",
+        "测算" in card and "真实成交" in card,
+        card,
+    )
+    check(
+        "口吻-累计点评不替用户吹牛",
+        "测算" in butler_total(5000, 3, 0) and "真实订单" in butler_total(5000, 3, 2),
+    )
+
+    # 22. 算价 oracle：随单购必须真的发出去
+    # 这是本项目最贵的一个 bug —— with_order 早已从裸 dict 改成 WithOrderOption
+    # （frozen dataclass，不是 dict 子类），而五处 oracle 仍在写
+    # `isinstance(with_order, dict)`，结果 withOrder 一次都没进过请求：
+    # 实测同一件商品不带 ¥57.00、带上 ¥37.90，差 ¥19.10。
+    # 更阴的是离线测不出来（demo_oracle 直接读 .label，不校验 payload），
+    # 所以这里必须用假 client 把真实 payload 抓出来断言。
+    from .oracle import make_price_oracle
+
+    class _RecClient:
+        def __init__(self, reply):
+            self.payloads: list[dict] = []
+            self._reply = reply
+
+        def data(self, tool, payload):
+            self.payloads.append(payload)
+            return self._reply
+
+    coupon = Coupon(coupon_id="c1", coupon_code="k1", title="立减")
+    item = CartItem(product_code="P1", name="测试品")
+    wo = WithOrderOption(payload={"membershipCode": "106"}, label="麦金卡（随单购）")
+
+    rc = _RecClient({"price": 3790, "originalPrice": 6690, "discount": 2900})
+    orc = make_price_oracle(rc, "S1", [coupon])
+    pr = orc([item], Assignment(mapping={0: 0}, with_order=wo))
+    sent = rc.payloads[-1]
+    check("oracle-随单购真的进了请求", sent.get("withOrder", {}).get("membershipCode") == "106", str(sent))
+    check("oracle-券码进了请求", sent["items"][0].get("couponId") == "c1", str(sent["items"]))
+    check("oracle-算价结果按分读取不放大100倍", pr.price_fen == 3790, str(pr))
+
+    # 不带随单购时不能凭空塞一个 withOrder 进去
+    rc2 = _RecClient({"price": 5700})
+    make_price_oracle(rc2, "S1", [coupon])([item], Assignment(mapping={}, with_order=None))
+    check("oracle-不随单购时不带 withOrder", "withOrder" not in rc2.payloads[-1], str(rc2.payloads[-1]))
+
+    # price 缺失必须报错：0 分是最小值，静默返回等于告诉优化器「这单最便宜」
+    rc3 = _RecClient({"originalPrice": 5700})
+    raised = False
+    try:
+        make_price_oracle(rc3, "S1", [coupon])([item], Assignment(mapping={}, with_order=None))
+    except Exception:
+        raised = True
+    check("oracle-price缺失时报错而非当成0元", raised)
+
+    # 金额换算两套口径不能混：菜单是元字符串、算价是分整数
+    check(
+        "金额-两套口径不混用",
+        to_fen("33.5") == 3350 and as_fen(5700) == 5700 and as_fen("5700") == 5700,
+        f'{to_fen("33.5")} / {as_fen(5700)} / {as_fen("5700")}',
+    )
+    check("金额-as_fen脏数据不崩", as_fen(None) == 0 and as_fen("") == 0 and as_fen("abc") == 0)
+
+    # 23. 网络抖动不能被当成「已经收敛」
+    # 爬山里若只看 price is None，一次抖动等于告诉它「邻域里没有更便宜的」，
+    # 于是只爬两步就收工，最后报「已是最优」，用户多付钱且全程无报错。
+    # 这里造一个 25% 概率抛错的 oracle（刻意不让它连续失败 3 次，
+    # 否则会走 _failures>=3 的抛错兜底，测不到我们要的行为）。
+    from .mcd_client import McpError
+
+    class _FlakyOracle:
+        """和 demo_oracle 完全同一个世界，只在第 2、6 次调用上抖一下。
+
+        只在固定的两次上失败（而不是按概率），是因为连续失败 3 次会触发
+        `_failures >= 3` 的抛错兜底 —— 那就测不到"跳过候选继续搜"这个行为了。
+        """
+
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, items, assignment):
+            self.calls += 1
+            if self.calls in (2, 6):
+                raise McpError("模拟网络抖动")
+            return demo.demo_oracle(items, assignment)
+
+    flaky = _FlakyOracle()
+    eng = CouponOptimizer(flaky, max_calls=200)
+    jitter_price = eng.optimize(demo.DEMO_MENU[:3], demo.DEMO_COUPONS[:3], [None]).price.price_fen
+
+    clean = CouponOptimizer(demo.demo_oracle, max_calls=200)
+    clean_price = clean.optimize(demo.DEMO_MENU[:3], demo.DEMO_COUPONS[:3], [None]).price.price_fen
+
+    check(
+        "抖动-不因网络抖动给出更贵的结果",
+        jitter_price <= clean_price,
+        f"抖动下 {jitter_price} vs 正常 {clean_price}",
     )
 
     # ---------------------------------------------------------------- 输出

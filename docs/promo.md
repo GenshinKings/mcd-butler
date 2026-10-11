@@ -182,7 +182,7 @@ python -m src.cli compare --items "龙焰鸡腿堡三件套,美式" --top 3 --mo
 git clone https://github.com/GenshinKings/mcd-butler.git
 cd mcd-butler
 
-# 没 Token 也能先玩（离线演示 + 87 项自检）
+# 没 Token 也能先玩（离线演示 + 100 项自检）
 python -m src.cli demo
 python -m src.cli selftest
 

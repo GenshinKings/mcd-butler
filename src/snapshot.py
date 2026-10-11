@@ -129,7 +129,36 @@ def describe(entry: dict) -> str:
     paid = entry.get("paid_fen")
     paid_str = f"¥{paid / 100:.2f}" if isinstance(paid, int) else "?"
     n = len(entry.get("items") or [])
-    return f"{when}　{store}　{n} 件　成交 {paid_str}"
+    tag = "成交" if entry.get("kind") == "order" else "测算"
+    return f"{when}　{store}　{n} 件　{tag} {paid_str}"
+
+
+# ---------------------------------------------------------------- 撤回
+def delete_last(n: int = 1) -> int:
+    """撤回最近 n 条快照，返回实际删除条数。
+
+    为什么要有这个：optimize 默认会把每一次测算写进账本，
+    于是「输错店名随手一跑」「--budget 1 探测一下」也都被记成省钱记录。
+    用户把 brag 生成的卡片发朋友圈之前，必须能把自己不认的条目删掉 ——
+    否则那张卡片是一份他自己都解释不清的假成绩单。
+    """
+    entries, broken = _read()
+    if broken or not entries:
+        return 0
+    n = max(int(n), 0)
+    keep = entries[:-n] if 0 < n < len(entries) else ([] if n >= len(entries) else entries)
+    removed = len(entries) - len(keep)
+    if removed:
+        _write_atomic(keep)
+    return removed
+
+
+def clear_all() -> int:
+    """清空整本账，返回被清掉的条数。"""
+    entries, _ = _read()
+    if entries:
+        _write_atomic([])
+    return len(entries)
 
 
 def entry_from_cart(
@@ -143,11 +172,18 @@ def entry_from_cart(
     keyword: str,
     coupon_titles: list[str],
     with_order_label: str,
+    kind: str = "estimate",
 ) -> dict:
-    """把 optimize 的结果打包成快照条目。"""
+    """把 optimize 的结果打包成快照条目。
+
+    `kind` 区分两种性质完全不同的记录，混在一起就是撒谎：
+        "estimate" 测算 —— 引擎算出「这么点能省多少」，用户未必真买了
+        "order"    成交 —— 真实下单记录（来自 `order-list` 的历史订单）
+    """
     return {
         "saved_at": datetime.now().strftime(FMT),
         "source": "optimize",
+        "kind": kind,
         "store_code": str(store_code),
         "store_name": store_name,
         "city": city,

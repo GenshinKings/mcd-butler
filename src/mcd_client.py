@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -121,7 +122,9 @@ class McdMcpClient:
         self,
         token: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
-        timeout: int = 60,
+        timeout: int = 15,
+        max_retries: int = 2,
+        backoff_base: float = 0.5,
     ):
         load_dotenv()
         self.token = token or os.environ.get("MCD_MCP_TOKEN", "")
@@ -131,7 +134,11 @@ class McdMcpClient:
                 "然后设置环境变量 MCD_MCP_TOKEN。"
             )
         self.base_url = base_url.rstrip("/")
+        # 实测单次算价 < 1 秒。超时设 60 秒只会让 CLI 看起来"卡死了"，
+        # 用户等不到结果也等不到报错；15 秒足够，且失败后还能重试。
         self.timeout = timeout
+        self.max_retries = max_retries
+        self.backoff_base = backoff_base
         self.session_id: str | None = None
         self._seq = 0
         self._initialized = False
@@ -148,24 +155,39 @@ class McdMcpClient:
         if self.session_id:
             headers["Mcp-Session-Id"] = self.session_id
 
-        req = urllib.request.Request(self.base_url, data=data, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                raw = resp.read().decode("utf-8")
-                new_sid = resp.headers.get("Mcp-Session-Id")
-                if new_sid:
-                    self.session_id = new_sid
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "ignore")
-            if exc.code == 401:
-                raise McpError("Token 无效或已过期（HTTP 401）。", detail) from exc
-            if exc.code == 429:
-                raise McpError("触发限流（每 Token 每分钟 600 次）。", detail) from exc
-            raise McpError(f"HTTP {exc.code}: {detail}", detail) from exc
-        except urllib.error.URLError as exc:
-            raise McpError(f"网络错误: {exc.reason}") from exc
+        # 只对「值得重试」的失败退避重试：限流 429 和服务端 5xx。
+        # 401 是 Token 问题，重试一百次也不会变对，立刻失败让用户去换 Token。
+        # 为什么必须退避：麦当劳限流 600 次/分钟，而 compare 一次就能打几十次；
+        # 踩到 429 还全速重打，只会把限流窗口越拖越长。
+        last_exc: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            req = urllib.request.Request(self.base_url, data=data, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    raw = resp.read().decode("utf-8")
+                    new_sid = resp.headers.get("Mcp-Session-Id")
+                    if new_sid:
+                        self.session_id = new_sid
+                return self._parse(raw)
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", "ignore")
+                if exc.code == 401:
+                    raise McpError("Token 无效或已过期（HTTP 401）。", detail) from exc
+                retryable = exc.code == 429 or 500 <= exc.code < 600
+                last_exc = McpError(
+                    "触发限流（每 Token 每分钟 600 次）。" if exc.code == 429 else f"HTTP {exc.code}: {detail}",
+                    detail,
+                )
+                if not retryable or attempt >= self.max_retries:
+                    raise last_exc from exc
+            except urllib.error.URLError as exc:
+                last_exc = McpError(f"网络错误: {exc.reason}")
+                if attempt >= self.max_retries:
+                    raise last_exc from exc
 
-        return self._parse(raw)
+            time.sleep(self.backoff_base * (2**attempt))
+
+        raise last_exc if last_exc else McpError("请求失败")
 
     @staticmethod
     def _parse(raw: str) -> dict:

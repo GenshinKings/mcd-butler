@@ -16,20 +16,24 @@
 
 ## 调用的工具
 
+> 口径说明：官方共暴露 35 个工具。本表列出的是**实际在用的**（11 个），
+> 另有若干已核对入参但尚未接入的，均明确标注「预留」——
+> 不把「试过」写成「用过」。
+
 | 工具 | 用途 | 在本项目中的角色 |
 |---|---|---|
 | `query-nearby-stores` | 按城市+关键词检索到店/得来速门店 | 管线第一步，产出 `storeCode` |
 | `query-meals` | 门店在售餐品与价格 | 构建可选池 |
-| `query-meal-detail` | 餐品组成、套餐替换项、特调选项 | 复刻历史订单时替换下架品 |
+| `query-meal-detail` | 餐品组成、套餐替换项、特调选项 | **预留未接入**（入参是 `code` 不是 `productCode`，后续用于套餐替换与券名↔菜单名对齐） |
 | `query-store-coupons` | **指定门店+订单类型**下可用券 | 券价引擎的券池来源 |
 | `calculate-price` | 含券实算价格 | 券价引擎的**黑盒求值器** |
 | `order-list` | 历史订单 | replay 的输入 |
 | `available-coupons` / `auto-bind-coupons` | 可领券列表 / 一键领取 | 资产管理（P1） |
 | `query-my-account` | 积分账户（含"本月将过期"） | 过期提醒（P1） |
-| `campaign-calendar` | 当月营销活动日历 | 搭配器的活动上下文 |
+| `campaign-calendar` | 当月营销活动日历 | **预留未接入**（后续用于「今天有什么活动」） |
 | `query-my-coupons` | 卡包内的券 | 仅做展示；**不做渠道校验**，故不用于决策 |
 | `list-nutrition-foods` | 餐品营养信息 | 减脂模式（P2） |
-| `now-time-info` | 服务器当前时间 | 日期感知兜底 |
+| `now-time-info` | 服务器当前时间 | 黄历的时段判定与「今日到期」基准——本机时区错了整份黄历会错，故以服务端时间为准 |
 
 其余工具（派对预约、麦麦商城、抽奖、订单查询/取消、配送地址、团餐）已核对入参，预留接口位。
 
@@ -40,7 +44,6 @@ query-nearby-stores ──► storeCode
         │
         ├─► query-meals ──────────► 可选池
         ├─► query-store-coupons ──► 券池（couponId / couponCode / products[])
-        └─► campaign-calendar ────► 活动上下文
                     │
                     ▼
         ┌───────────────────────────────┐
