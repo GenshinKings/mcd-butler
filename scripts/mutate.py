@@ -219,14 +219,109 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
         "title='过期的券', product_codes=frozenset(), valid_until='2020-01-01')",
         False,
     ),
+    # ---- 以下 10 处是第四轮补的：专打本轮 A–L 里 mutate.py 还没覆盖的点 ----
+    (
+        "C-读到一半的错缩回只认 URLError",
+        "mcd_client.py",
+        "            except _TRANSIENT as exc:",
+        "            except urllib.error.URLError as exc:",
+        True,
+    ),
+    (
+        "C-429 退避退回 0.5s（限流窗口是 60s）",
+        "mcd_client.py",
+        "        backoff = min(max(backoff, 5.0), 30.0)",
+        "        backoff = backoff",
+        True,
+    ),
+    (
+        "C-429 退避不封顶（把命令行拖成卡死）",
+        "mcd_client.py",
+        "        backoff = min(max(backoff, 5.0), 30.0)",
+        "        backoff = max(backoff, 5.0)",
+        True,
+    ),
+    (
+        "C-resp.read() 去掉 errors=replace",
+        "mcd_client.py",
+        'raw = resp.read().decode("utf-8", errors="replace")',
+        'raw = resp.read().decode("utf-8")',
+        True,
+    ),
+    (
+        "E-run_replay 随单购标签退回判 dict",
+        "cli.py",
+        '    return with_order.label if with_order is not None else ""',
+        '    return with_order.label if isinstance(with_order, dict) else ""',
+        True,
+    ),
+    (
+        "E-裸买价退回接口 original（把卡费算成省下的钱）",
+        "cli.py",
+        "    return optimizer.evaluate(cart, Assignment(mapping={}, with_order=None)).price_fen",
+        "    return optimizer.evaluate(cart, Assignment(mapping={}, with_order=None)).original_fen",
+        True,
+    ),
+    (
+        "E-main 不再分开提示 McpFatalError",
+        "cli.py",
+        "    if isinstance(exc, McpFatalError):",
+        "    if False:",
+        True,
+    ),
+    (
+        "E-run_demo 删掉随单购单独一行",
+        "cli.py",
+        '        print(f"  随单购「{best.with_order.label}」再减 ¥{FEN(wo_gain)}（卡费另算）")',
+        "        pass",
+        True,
+    ),
+    (
+        "I-snapshot 退回模块级 Path.home()",
+        "snapshot.py",
+        'SNAPSHOT_DIR = _home_dir() / ".mcd-butler"',
+        'SNAPSHOT_DIR = Path.home() / ".mcd-butler"',
+        True,
+    ),
+    (
+        "K-演示券「中杯可乐立减 3 元」改名",
+        "demo_data.py",
+        '        title="中杯可乐立减 3 元",',
+        '        title="中杯可乐立减 2 元",',
+        False,
+    ),
+    (
+        "L-selftest run() 不再清空 _RESULTS",
+        "selftest.py",
+        "    _RESULTS.clear()",
+        "    pass",
+        True,
+    ),
+    (
+        "M-演示求价器不看券有效期（时钟一歪就印假账）",
+        "demo_data.py",
+        "        if _expired(DEMO_COUPONS[coupon_idx].valid_until):\n            continue\n",
+        "",
+        False,
+    ),
 ]
 
 
-def run_selftest() -> tuple[int, int]:
-    """跑一次自检，返回 (通过数, 总数)。"""
+def run_selftest() -> tuple[int, int, int]:
+    """跑一次自检，返回 (通过数, 总数, 退出码)。
+
+    为什么连退出码一起返回：早先只看数字，自检**崩掉**时返回 (-1, -1)，
+    于是 `red = -1 - (-1) = 0`，会被误报成「P0 无防护」。
+    崩是崩，无防护是无防护 —— 崩说明改动被**发现**了（只是方式很难看），
+    两者必须分开报，否则修的人会朝错误的方向使劲。
+
+    `--twice`：连跑两轮并比对断言总数，用来验证自检本身可重入。
+    `selftest` 单跑一轮是发现不了「结果列表没清空」的 ——
+    污染会同时放大分子和分母，打印出来的还是「N/N 通过」且全绿。
+    """
     env = {"PYTHONIOENCODING": "utf-8"}
     proc = subprocess.run(
-        [sys.executable, "-m", "src.cli", "selftest"],
+        [sys.executable, "-m", "src.cli", "selftest", "--twice"],
         cwd=str(ROOT),
         capture_output=True,
         env={**__import__("os").environ, **env},
@@ -237,46 +332,56 @@ def run_selftest() -> tuple[int, int]:
         if line.endswith("通过") and "/" in line:
             left, right = line.replace("通过", "").strip().split("/")
             try:
-                return int(left), int(right)
+                return int(left), int(right), proc.returncode
             except ValueError:
                 break
-    return -1, -1
+    return -1, -1, proc.returncode
 
 
 def main() -> int:
     quick = "--quick" in sys.argv
     mutations = [m for m in MUTATIONS if m[4]] if quick else MUTATIONS
 
-    baseline_pass, baseline_total = run_selftest()
+    baseline_pass, baseline_total, baseline_rc = run_selftest()
     if baseline_total <= 0:
         print("跑不出自检结果，先修好项目再跑变异测试。")
         return 1
     print(f"基线：{baseline_pass}/{baseline_total} 通过\n")
-    if baseline_pass != baseline_total:
+    if baseline_pass != baseline_total or baseline_rc != 0:
         print("基线就是红的，先修红再跑变异测试。")
         return 1
 
     failures: list[str] = []
-    print(f"{'变异':<38} {'变红':>4}  判定")
-    print("-" * 62)
+    print(f"{'变异':<40} {'变红':>4}  判定")
+    print("-" * 66)
     for name, rel, old, new, _q in mutations:
         # src/ 下的文件写相对名即可，根目录文件（README）写全名
         path = (SRC / rel) if (SRC / rel).is_file() else (ROOT / rel)
         original = path.read_text(encoding="utf-8")
         if old not in original:
-            print(f"{name:<38} {'—':>4}  跳过（原文已变，需更新 mutate.py）")
+            print(f"{name:<40} {'?':>4}  跳过（原文已变，需更新 mutate.py）")
             failures.append(name)
             continue
         try:
             path.write_text(original.replace(old, new, 1), encoding="utf-8")
-            passed, total = run_selftest()
+            passed, total, rc = run_selftest()
         finally:
             path.write_text(original, encoding="utf-8")
+
+        if total <= 0:
+            # 自检整个崩了：改动确实被发现了，但方式是「一整屏 traceback」，
+            # 对用户毫无帮助。算抓住，但单独标出来督促补一条体面的断言。
+            print(f"{name:<40} {'崩':>4}  崩溃（算抓住，但提示很难看）")
+            continue
         red = total - passed
-        verdict = "P0 无防护" if red == 0 else "OK"
-        print(f"{name:<38} {red:>4}  {verdict}")
-        if red == 0:
+        if red == 0 and rc == 0:
+            verdict = "P0 无防护"
             failures.append(name)
+        elif red == 0:
+            verdict = "OK（退出码非 0）"
+        else:
+            verdict = "OK"
+        print(f"{name:<40} {red:>4}  {verdict}")
 
     print()
     if failures:

@@ -1199,6 +1199,32 @@ def run_forget(last: int, all_: bool) -> int:
     return 0
 
 
+def _with_order_label(with_order) -> str:
+    """随单购档位的名字；没选档位时返回空串。
+
+    `WithOrderOption` 是 **frozen dataclass，不是 dict** ——
+    判 `isinstance(x, dict)` 恒为 False。这个坑在 `oracle.py` 里踩过一次
+    （随单购一次都没真的发出去过）；`run_replay` 是第二处残留：
+    标签永远是空串，快照的 `with_order_label` 一栏永远空白，
+    于是 `brag` 生成的卡片说不清这单到底靠什么省的钱。
+    """
+    return with_order.label if with_order is not None else ""
+
+
+def _replay_baseline_fen(optimizer, cart: list[CartItem]) -> int:
+    """这一单「一件券都不挂、也不买随单购」的裸买价（分）。
+
+    不能拿接口返回的 `original_fen` 当裸买价：最优解一旦选了随单购档位，
+    接口会把 **卡费** 算进 `originalPrice`，于是「省下的钱」凭空多出卡费那一截。
+    实测同一单差 ¥9.90，而 `brag` 是对全量快照求和的 ——
+    每跑一次 `replay`，累计节省就被虚高一次，而且用户看不出来。
+
+    单独拆出来是因为：这段逻辑埋在 `run_replay` 里时没法离线断言，
+    改回「拿接口的 original 当基准」也不会有任何一条自检变红。
+    """
+    return optimizer.evaluate(cart, Assignment(mapping={}, with_order=None)).price_fen
+
+
 def run_replay(store_code: str | None, list_only: bool) -> int:
     """历史订单复刻：把这单按今天的菜单和券重算一遍，报价格变动。
 
@@ -1320,22 +1346,14 @@ def run_replay(store_code: str | None, list_only: bool) -> int:
     # 存一份今天的快照，下次就能比
     from .snapshot import entry_from_cart, save as save_snapshot
 
-    # WithOrderOption 是 frozen dataclass，不是 dict —— 判 isinstance(..., dict)
-    # 恒为 False，标签永远是空串。这个坑在 oracle.py 里踩过一次（随单购一次都没
-    # 真的发出去过），run_optimize 已经改了，run_replay 是第二处残留。
-    label = best.with_order.label if best.with_order is not None else ""
-
-    # 裸买价必须自己算一遍，不能用接口返回的 original_fen：
-    # 一旦最优解选了随单购档位，接口会把卡费算进 originalPrice，
-    # 于是"省下的钱"里凭空多出卡费那部分。实测同一单差 ¥9.90，
-    # 而 brag 是对全量快照求和的 —— 每跑一次 replay，累计节省就被虚高一次。
-    baseline = optimizer.evaluate(cart, Assignment(mapping={}, with_order=None))
+    label = _with_order_label(best.with_order)
+    baseline_fen = _replay_baseline_fen(optimizer, cart)
     save_snapshot(
         entry_from_cart(
             cart=cart,
             paid_fen=best.price.price_fen,
-            baseline_fen=baseline.price_fen,
-            discount_fen=baseline.price_fen - best.price.price_fen,
+            baseline_fen=baseline_fen,
+            discount_fen=baseline_fen - best.price.price_fen,
             store_code=target_store,
             store_name="",
             city="",
@@ -1745,7 +1763,12 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("demo", help="离线演示，无需 Token")
     sub.add_parser("tools", help="列出 MCP 工具")
-    sub.add_parser("selftest", help="离线自检解析器与引擎，无需 Token")
+    p_self = sub.add_parser("selftest", help="离线自检解析器与引擎，无需 Token")
+    p_self.add_argument(
+        "--twice",
+        action="store_true",
+        help="连跑两轮并比对断言总数（验证自检本身可重入，供 scripts/mutate.py 使用）",
+    )
 
     p_adv = sub.add_parser("advise", help="一键顾问：今天该怎么点最划算")
     p_adv.add_argument("--city", default=city_default)
@@ -1861,21 +1884,42 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n{exc}")
         print("算价调用预算太小，没算出结果。把 --budget 调大再试，例如 --budget 80。")
         return 3
-    except McpFatalError as exc:
+    except McpError as exc:
+        code, lines = _error_hint(exc)
+        print("")
+        for line in lines:
+            print(line)
+        return code
+
+
+def _error_hint(exc: Exception) -> tuple[int, list[str]]:
+    """把接口异常翻译成「用户能照着做」的提示，返回 (退出码, 要印的行)。
+
+    为什么必须分开：Token 失效和业务性拒绝 **长得很像** —— 都只是一句错误消息。
+    混着印有两种后果，而且都不轻：
+      · 502 / 断网被印成「换一家门店试试」→ 用户在一台根本连不上网的机器上
+        反复换店换商品，折腾一整天也想不到是代理的问题；
+      · 「该券不适用于此门店」被印成「Token 失效，请重新激活」→ 用户去重新
+        激活一个好端端的 Token，激活完还是一样的错。
+
+    单独拆出来是因为：埋在 `main()` 的 except 里时没法离线断言，
+    哪天有人把两个分支合并回一句，一条自检都不会红。
+    """
+    if isinstance(exc, McpFatalError):
         # 环境故障：Token 失效 / 限流 / 断网 / 服务端 5xx。
         # 直接抛 traceback 对使用者毫无帮助，给一句能照着做的提示。
-        print(f"\n接口调用失败：{exc}")
-        print("常见原因：Token 失效（到 https://open.mcd.cn/mcp 重新激活）、")
-        print("          网络不通（本机需要代理时请设置 https_proxy）、")
-        print("          或触发限流（每 Token 600 次/分钟）。")
-        return 2
-    except McpError as exc:
-        # 业务性拒绝：工具调通了、对面也回答了，只是答案是否定的
-        #（券不适用这家店 / storeCode 与 beCode 不配对 / 门店不支持该券）。
-        # 这时候再印上面那三行「Token 失效」只会误导人去重新激活一个好端端的 Token。
-        print(f"\n接口拒绝了这次请求：{exc}")
-        print("这不是网络或 Token 问题 —— 换一家门店、换个商品，或换张券试试。")
-        return 2
+        return 2, [
+            f"接口调用失败：{exc}",
+            "常见原因：Token 失效（到 https://open.mcd.cn/mcp 重新激活）、",
+            "          网络不通（本机需要代理时请设置 https_proxy）、",
+            "          或触发限流（每 Token 600 次/分钟）。",
+        ]
+    # 业务性拒绝：工具调通了、对面也回答了，只是答案是否定的
+    #（券不适用这家店 / storeCode 与 beCode 不配对 / 门店不支持该券）。
+    return 2, [
+        f"接口拒绝了这次请求：{exc}",
+        "这不是网络或 Token 问题 —— 换一家门店、换个商品，或换张券试试。",
+    ]
 
 
 def _dispatch(args) -> int:
@@ -1884,9 +1928,11 @@ def _dispatch(args) -> int:
     if args.cmd == "tools":
         return run_tools()
     if args.cmd == "selftest":
-        from .selftest import run as run_selftest
+        from .selftest import run as run_selftest, run_repeat
 
         print("离线自检（无需 Token）\n")
+        if getattr(args, "twice", False):
+            return run_repeat(2)
         return run_selftest()
     if args.cmd == "advise":
         return run_advise(args.city, args.keyword, args.budget, args.store, args.days)

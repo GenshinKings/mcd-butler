@@ -27,6 +27,24 @@ PROTOCOL_VERSION = "2025-06-18"
 _TRANSIENT = (TimeoutError, http.client.HTTPException, OSError)
 
 
+def _backoff_for(attempt: int, base: float, last_exc: Exception | None) -> float:
+    """第 `attempt` 次重试之前该等多久（秒）。
+
+    为什么单独拆成一个纯函数：这段逻辑原本埋在 `_post` 的重试循环里，
+    想断言它就必须真的发一次 HTTP 请求再挂钟计时 —— 没人会写这种测试，
+    于是「429 的退避改回 0.5 秒」这种改动改坏了，一条自检都不会红。
+
+    429 用的是 **60 秒窗口**：0.5 秒 / 1 秒的退避必然还是 429，
+    所谓「重试」只是把限流窗口拖得更长，越重试越拿不到结果。
+    所以踩到限流时退避必须按窗口量级来（至少 5 秒），
+    并封顶 30 秒 —— 再久，命令行在用户眼里就是"卡死了"。
+    """
+    backoff = base * (2**attempt)
+    if last_exc is not None and "触发限流" in str(last_exc):
+        backoff = min(max(backoff, 5.0), 30.0)
+    return backoff
+
+
 def load_dotenv() -> None:
     """读取项目根目录的 `.env`（若存在），填进 os.environ。
 
@@ -225,12 +243,7 @@ class McdMcpClient:
                 if attempt >= self.max_retries:
                     raise last_exc from exc
 
-            # 429 用的是 60 秒窗口，0.5s/1s 的退避必然还是 429。退避必须按
-            # 限流窗口量级来，否则"重试"只是把限流窗口拖得更长。
-            backoff = self.backoff_base * (2**attempt)
-            if last_exc is not None and "触发限流" in str(last_exc):
-                backoff = min(max(backoff, 5.0), 30.0)
-            time.sleep(backoff)
+            time.sleep(_backoff_for(attempt, self.backoff_base, last_exc))
 
         raise last_exc if last_exc else McpFatalError("请求失败")
 

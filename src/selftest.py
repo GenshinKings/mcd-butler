@@ -201,6 +201,31 @@ def check(name: str, cond: bool, detail: str = "") -> None:
     _RESULTS.append((name, bool(cond), detail))
 
 
+def run_repeat(times: int = 2) -> int:
+    """连跑若干轮 `run()`，用来证明自检本身是**可重入**的。
+
+    为什么单跑一轮证明不了：`_RESULTS` 是模块级列表，`run()` 不清空的话
+    第二轮会在 190 条后面再追加 190 条，打印出「380/380」并且**全绿** ——
+    污染同时放大了分子和分母，光看「N/M 通过」永远看不出来。
+    必须连跑两轮、拿两轮的**总数**互相比，这个洞才现形。
+
+    `scripts/mutate.py` 正是靠这个入口跑变异测试的。
+    """
+    times = max(1, int(times))
+    totals: list[int] = []
+    rc = 0
+    for _ in range(times):
+        rc = run()
+        totals.append(len(_RESULTS))
+    stable = len(set(totals)) == 1
+    if not stable:
+        print(f"\n❌ 自检不可重入：连跑 {times} 轮得到的断言数是 {totals}，本应一致。")
+        print("   （`_RESULTS` 是模块级列表，`run()` 开头必须清空它。）")
+        return 1
+    print(f"\n连跑 {times} 轮，每轮 {totals[0]} 条断言 —— 自检可重入 ✅")
+    return rc
+
+
 def run() -> int:
     # 必须清空：_RESULTS 是模块级列表，run() 跑两次会输出「294/294」，
     # 而且上一次的失败记录会被继承。单条 CLI 调用掩盖了这个问题，
@@ -381,8 +406,12 @@ def run() -> int:
 
     red = ins.redundant_coupons(demo.demo_oracle, cart, demo.DEMO_COUPONS, best)
     # 只断言 isinstance(list) 是注水：返回 [] 也通过。
-    # 演示的最优解挂了 3 张券、随单购是麦金卡档，必须真能挑出「白挂」的那张。
-    check("洞察-冗余券返回的是 (商品, 券) 列表", isinstance(red, list))
+    # 改为断言**内容**：演示的最优解里不该有白挂的券，有就得点名。
+    check(
+        "洞察-演示最优解里没有白挂的券",
+        not red,
+        str([(i.product_code, c.title) for i, c in red]),
+    )
     # demo 场景里恰好没有冗余券，返回 [] 是正确的 —— 所以真断言不能指望 demo。
     # 自己造一个：oracle 完全无视券（挂不挂同价），那这张券必然是摆设。
     _flat_item = CartItem(product_code="X1", name="测试品", unit_price_fen=2000)
@@ -1577,6 +1606,172 @@ def run() -> int:
     check("错误类型-McpFatalError 是 McpError 的子类（老代码才能照常接住）",
           issubclass(McpFatalError, McpError))
 
+    # ── 1b. 429 的退避必须按限流窗口量级来
+    # 这段逻辑埋在 _post 的重试循环里时没法断言（要真发一次 HTTP 再挂钟计时），
+    # 所以拆成了纯函数 `_backoff_for()`。这里既断言算出来的数，也断言真睡了。
+    from .mcd_client import _backoff_for
+
+    _rl = McpFatalError("触发限流（每 Token 每分钟 600 次）。")
+    check(
+        "传输层-429 退避必须 ≥5 秒（限流窗口 60 秒，退 0.5 秒等于没退）",
+        _backoff_for(0, 0.5, _rl) >= 5.0,
+        f"{_backoff_for(0, 0.5, _rl)}",
+    )
+    check(
+        "传输层-429 退避要封顶 30 秒（再久命令行在用户眼里就是卡死了）",
+        _backoff_for(20, 0.5, _rl) == 30.0,
+        f"{_backoff_for(20, 0.5, _rl)}",
+    )
+    check(
+        "传输层-普通失败仍按指数退避（别把 5xx 也一起拖成 5 秒）",
+        _backoff_for(0, 0.5, McpFatalError("HTTP 503")) == 0.5,
+        f"{_backoff_for(0, 0.5, McpFatalError('HTTP 503'))}",
+    )
+
+    _slept: list[float] = []
+    _real_sleep = _mc.time.sleep
+    _mc.time.sleep = lambda s: _slept.append(s)
+    try:
+        _ureq.urlopen = _http_error(429)
+        try:
+            _mc.McdMcpClient("tok", max_retries=1)._post({"x": 1})
+        except Exception:  # noqa: BLE001, S110
+            pass
+    finally:
+        _ureq.urlopen = _real_urlopen
+        _mc.time.sleep = _real_sleep
+    check(
+        "传输层-真踩到 429 时，重试前确实等了 ≥5 秒（不是只算出来好看）",
+        bool(_slept) and max(_slept) >= 5.0,
+        f"slept={_slept}",
+    )
+
+    # ── 1c. 非 UTF-8 的响应体不能被 UnicodeDecodeError 穿透成裸 traceback
+    # 服务端返回一个 GBK 的错误页、或半截 gzip 时就会遇到。
+    class _Gibberish:
+        headers: dict = {}
+
+        def read(self):
+            return b"\xff\xfe\x00 not utf8 at all"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    def _gibberish(req, timeout=None):
+        return _Gibberish()
+
+    check(
+        "传输层-非 UTF-8 响应体必须收成 McpFatalError，不能裸抛 UnicodeDecodeError",
+        _fatal_type(_gibberish) is McpFatalError,
+    )
+
+    # ── 1d. main() 的两类错误提示必须分开
+    from .cli import _error_hint, _replay_baseline_fen, _with_order_label
+
+    _f_rc, _f_lines = _error_hint(McpFatalError("Token 无效或已过期（HTTP 401）。"))
+    _b_rc, _b_lines = _error_hint(McpError("促销规则不支持该商品"))
+    check(
+        "错误提示-环境故障要指到 Token / 网络 / 限流",
+        any("Token" in l for l in _f_lines) and any("限流" in l for l in _f_lines),
+        str(_f_lines),
+    )
+    check(
+        "错误提示-业务性拒绝不能再让人去重新激活一个好端端的 Token",
+        not any("重新激活" in l for l in _b_lines)
+        and any("换一家门店" in l for l in _b_lines),
+        str(_b_lines),
+    )
+
+    # ── 1e. 随单购标签 / 裸买基准（原先埋在 run_replay 里，改坏没人知道）
+    _wo = WithOrderOption(payload={"membershipCode": "X"}, label="麦金卡（随单购）")
+    check(
+        "随单购-标签必须取得到（WithOrderOption 不是 dict，判 dict 恒假）",
+        _with_order_label(_wo) == "麦金卡（随单购）",
+        repr(_with_order_label(_wo)),
+    )
+    check("随单购-没选档位时标签是空串，不是 None", _with_order_label(None) == "")
+
+    class _FakeOptimizer:
+        """什么都不挂才给真裸买价 2600；一旦挂券/随单购，接口会把卡费算进
+        original（3300）—— 这正是当初 brag 账本被虚高的原因。"""
+
+        def evaluate(self, cart, a):
+            if a.mapping or a.with_order is not None:
+                return PriceResult(price_fen=2000, original_fen=3300)
+            return PriceResult(price_fen=2600, original_fen=3300)
+
+    check(
+        "复刻-裸买价必须自己重算一遍（拿接口 original 会把卡费算成省下的钱）",
+        _replay_baseline_fen(_FakeOptimizer(), [CartItem("Z", "测试")]) == 2600,
+        str(_replay_baseline_fen(_FakeOptimizer(), [CartItem("Z", "测试")])),
+    )
+
+    # ── 1f. snapshot 不能在 import 阶段就炸（HOME 未设置时 Path.home() 抛错）
+    # 在独立命名空间里重跑一遍模块源码，模拟「读不到家目录」的机器。
+    import pathlib as _pathlib
+    from pathlib import Path as _PathProbe
+
+    from . import snapshot as _snap
+
+    # 让 Path.home() 抛错，模拟「HOME 未设置」的机器（容器 / CI / 精简环境常见）。
+    # 注意不能靠往命名空间里塞一个假 Path：模块源码自己 `from pathlib import Path`
+    # 会把它覆盖掉。必须改真正的 pathlib.Path。
+    def _no_home():
+        raise RuntimeError("Can't determine home directory.")
+
+    _real_home = _pathlib.Path.home
+    _probe_ns: dict = {"__name__": "snapshot_probe"}
+    _probe_ok = False
+    _probe_got: object = None
+    try:
+        _pathlib.Path.home = staticmethod(_no_home)
+        exec(
+            compile(
+                _PathProbe(_snap.__file__).read_text(encoding="utf-8"),
+                "snapshot_probe",
+                "exec",
+            ),
+            _probe_ns,
+        )
+        _probe_got = _probe_ns.get("SNAPSHOT_DIR")
+        _probe_ok = _probe_got == _PathProbe.cwd() / ".mcd-butler"
+    except Exception as _exc:  # noqa: BLE001
+        # 崩在这里正是要防的事：模块级直接 Path.home() 会在 import 阶段炸
+        _probe_got = f"{type(_exc).__name__}: {_exc}"
+    finally:
+        _pathlib.Path.home = _real_home
+    check(
+        "快照-HOME 读不到时退回当前目录，不能让 import 阶段就把 brag/forget 一起炸掉",
+        _probe_ok,
+        str(_probe_got),
+    )
+
+    # ── 1g. 演示世界也必须讲券有效期
+    # 原先 demo_oracle 完全不看 valid_until：时钟一歪（或有人手滑写 _days(-1)），
+    # 演示会平静地印出「用一张昨天就过期的券省了 ¥20」—— 假账，且无提示。
+    import dataclasses as _dc
+
+    _saved_c1 = demo.DEMO_COUPONS[0]
+    _before = demo.demo_oracle([demo.DEMO_MENU[0]], Assignment(mapping={0: 0})).price_fen
+    try:
+        demo.DEMO_COUPONS[0] = _dc.replace(_saved_c1, valid_until="2020-01-01")
+        _after = demo.demo_oracle([demo.DEMO_MENU[0]], Assignment(mapping={0: 0})).price_fen
+    finally:
+        demo.DEMO_COUPONS[0] = _saved_c1
+    check(
+        "演示-过期的券一分钱都不能减（演示世界也得讲有效期）",
+        _after == demo.DEMO_MENU[0].unit_price_fen,
+        f"过期券仍减到了 {_after}",
+    )
+    check(
+        "演示-没过期的券照常生效（上一条不能是靠「永远返回 0」蒙对的）",
+        _before == demo.DEMO_MENU[0].unit_price_fen - 500,
+        f"{_before}",
+    )
+
     # ── 2. 黄历不能把环境故障吞成「这家店没券」
     from .almanac import _call
 
@@ -1884,6 +2079,10 @@ def run() -> int:
         "菜单标 ¥62.90 是「随单购麦金卡优惠」",
         "标着减 ¥8.00，实测只省 ¥5.00",
         "¥10.00 的商品上不生效，¥25.00 的才生效",
+        # 券名也算契约：README 里贴的券名和 demo_data.py 里的必须一致，
+        # 否则读者照着 README 跑 demo 会看到另一张券。
+        "中杯可乐立减 3 元",
+        "巨无霸立减 5 元",
     ]
     _missing_demo = [s for s in _must_appear if s not in _demo_out]
     _missing_doc = [s for s in _must_appear if s not in _readme]

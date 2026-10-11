@@ -132,6 +132,12 @@ def demo_oracle(items: list[CartItem], assignment) -> PriceResult:
         cid = _cid(coupon_idx)
         if not cid:
             continue
+        # 演示世界也必须讲有效期。原先这里完全不看 valid_until，
+        # 于是只要有人把 _days(20) 手滑写成 _days(-1)，或者系统时钟往前跳，
+        # 演示就会 **平静地** 印出「用一张昨天就过期的券省了 ¥20」——
+        # 一份算错的账，而且没有任何提示，看着跟真的一样。
+        if _expired(DEMO_COUPONS[coupon_idx].valid_until):
+            continue
         unit = _DEMO_DISCOUNT.get(cid, 0)
         # 「买一送一」这类券按件数生效：买 1 件省半价、买 2 件省一件的钱。
         # 不按件数算会出现「一件商品挂买一送一券 → 到手 ¥0」这种假得离谱的演示。
@@ -160,6 +166,19 @@ def demo_oracle(items: list[CartItem], assignment) -> PriceResult:
 
 def _cid(coupon_idx: int) -> str:
     return DEMO_COUPONS[coupon_idx].coupon_id
+
+
+def _expired(valid_until: str) -> bool:
+    """这张券到期了吗。没写到期日的按「不过期」处理（真实券里大量不写）。"""
+    if not valid_until:
+        return False
+    from datetime import date
+
+    try:
+        return date.fromisoformat(valid_until[:10]) < date.today()
+    except ValueError:
+        # 解析不出来的日期按「不知道」处理，不能反过来当成已过期把券全废掉
+        return False
 
 
 # ---------------------------------------------------------------- 演示历史订单（replay 用）
