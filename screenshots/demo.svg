@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 420" font-family="'Cascadia Code','Consolas','SF Mono',monospace">
+  <rect width="760" height="420" rx="14" fill="#1e1e2e"/>
+  <rect width="760" height="40" rx="14" fill="#181825"/>
+  <rect y="26" width="760" height="14" fill="#181825"/>
+  <circle cx="24" cy="20" r="6" fill="#ff5f56"/>
+  <circle cx="44" cy="20" r="6" fill="#ffbd2e"/>
+  <circle cx="64" cy="20" r="6" fill="#27c93f"/>
+  <text x="380" y="25" fill="#a6accd" font-size="13" text-anchor="middle">mcd-butler · 离线演示（无需 Token）</text>
+
+  <text x="28" y="74" fill="#a6e3a1" font-size="14">购物车：</text>
+  <text x="48" y="98" fill="#cdd6f4" font-size="14">巨无霸      ¥25.00</text>
+  <text x="48" y="120" fill="#cdd6f4" font-size="14">中份薯条    ¥12.00</text>
+  <text x="48" y="142" fill="#cdd6f4" font-size="14">中杯可乐    ¥9.00</text>
+  <text x="48" y="164" fill="#cdd6f4" font-size="14">麦旋风      ¥10.00</text>
+  <text x="48" y="188" fill="#f9e2af" font-size="14">原价合计：¥56.00</text>
+
+  <text x="28" y="222" fill="#89b4fa" font-size="14">寻优结果</text>
+  <text x="48" y="246" fill="#cdd6f4" font-size="14">巨无霸    ← 巨无霸立减 5 元</text>
+  <text x="48" y="268" fill="#cdd6f4" font-size="14">中份薯条  ← 小食买一送一（薯条）</text>
+  <text x="48" y="290" fill="#cdd6f4" font-size="14">中杯可乐  ← 饮料免费升杯</text>
+  <text x="48" y="312" fill="#cdd6f4" font-size="14">随单购：麦金卡（随单购）</text>
+
+  <rect x="28" y="334" width="704" height="52" rx="8" fill="#313244"/>
+  <text x="44" y="358" fill="#94e2d5" font-size="15" font-weight="bold">原价 ¥56.00 → 到手 ¥30.00</text>
+  <text x="372" y="358" fill="#fab387" font-size="15" font-weight="bold">省下 ¥26.00</text>
+  <text x="540" y="358" fill="#6c7086" font-size="13">共调用算价接口 42 次</text>
+
+  <text x="28" y="404" fill="#585b70" font-size="12">python -m src.cli demo</text>
+</svg>

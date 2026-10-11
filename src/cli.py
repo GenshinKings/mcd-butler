@@ -256,11 +256,14 @@ def run_advise(city: str, keyword: str, budget: int) -> int:
 
     shared = Budget(budget)
     optimizer = CouponOptimizer(oracle, max_calls=budget, budget=shared)
+    # 裸买基准必须先算：optimize 会把预算吃光，若放后面 try_evaluate 拿到 None 会崩溃
+    baseline = optimizer.try_evaluate(cart, Assignment(mapping={}, with_order=None))
+    if baseline is None:
+        raise BudgetExhausted("预算不足以计算裸买基准，请调大 --budget")
     best = optimizer.optimize(cart, coupons, _with_order_options(cart))
     if best.price is None:
         raise BudgetExhausted("没能算出任何价格")
 
-    baseline = optimizer.try_evaluate(cart, Assignment(mapping={}, with_order=None))
     print("\n最优组合：")
     for line in best.describe(cart, coupons):
         print(f"   {line}")
@@ -386,17 +389,19 @@ def run_optimize(
 
     shared = Budget(budget)
     optimizer = CouponOptimizer(oracle, max_calls=budget, budget=shared)
+    # 裸买基准先算（占 1 次调用），否则 optimize 吃光预算后这里拿到 None 会崩溃
+    baseline = optimizer.try_evaluate(cart, Assignment(mapping={}, with_order=None))
+    if baseline is None:
+        raise BudgetExhausted("预算不足以计算裸买基准，请调大 --budget")
     best = optimizer.optimize(cart, coupons, _with_order_options(cart))
+    if best.price is None:
+        raise BudgetExhausted("没能算出任何价格")
     print("\n最优组合：")
     for line in best.describe(cart, coupons):
         print(f"  {line}")
-    if best.price is None:
-        raise BudgetExhausted("没能算出任何价格")
-
     # 真实节省必须以「裸买价」为基准。
     # 不能用接口返回的 discount：随单购会把卡费计入 originalPrice
     # （实测 97.50 → 107.40，多出的 9.90 就是卡费），导致 discount 虚高。
-    baseline = optimizer.try_evaluate(cart, Assignment(mapping={}, with_order=None))
     saved = baseline.price_fen - best.price.price_fen
     print(f"\n裸买价 ¥{FEN(baseline.price_fen)}  →  到手 ¥{FEN(best.price.price_fen)}")
     print(f"真实省下 ¥{FEN(saved)}（接口 discount 报 ¥{FEN(best.price.discount_fen)}，含卡费口径）")
@@ -633,7 +638,7 @@ def run_nutrition(city: str, keyword: str, kcal: int, size: int) -> int:
         print(f"在 {kcal} kcal 预算内凑不出任何组合，试试提高预算。")
         return 1
 
-    print(f"\n热量预算 {kcal} kcal 内的最优搭配（按蛋白质降序）：")
+    print(f"\n热量预算 {kcal} kcal 内推荐搭配（按蛋白质降序）：")
     for i, combo in enumerate(combos, 1):
         s = nut.summarize(combo)
         names = " + ".join(p[0].name or p[0].product_code for p in combo)
@@ -652,11 +657,6 @@ def _print_insights(oracle, cart, coupons, best, budget) -> int:
     `budget` 是**全局共享**的预算对象，不是数字 ——
     洞察里每一路都会新建求解器，只有共用同一个计数器，
     才能保证「用户设了 --budget 40，就绝不会打出第 41 次」。
-    """
-    """把「钱是怎么省下来的」讲明白。
-
-    只给一个到手价，跟 App 的结算页没区别。真正值钱的是这三件事：
-    每件东西实际花了我多少、哪张券是摆设、分开买会不会更便宜。
     """
     from . import insights as ins
 

@@ -20,6 +20,7 @@ import random
 from .assets import parse_claimable_markdown, parse_coupon_markdown, fmt_num, _num
 from .coupon_engine import (
     Assignment,
+    Budget,
     CartItem,
     Coupon,
     CouponOptimizer,
@@ -311,6 +312,26 @@ def run() -> int:
     except Exception as exc:  # noqa: BLE001
         check("引擎-预算耗尽不崩", False, repr(exc))
 
+    # 8b. 契约锁定（修复「裸买基准在 optimize 后崩溃」的 P0）：
+    # optimize 会把共享预算吃光，之后再 try_evaluate(裸买) 必然返回 None；
+    # 因此调用方必须在 optimize 之前先算裸买基准。这里断言该契约成立，
+    # 防止 cli 把 baseline 写回 optimize 之后导致 AttributeError。
+    opt_budget = Budget(40)
+    eng = CouponOptimizer(demo.demo_oracle, max_calls=40, budget=opt_budget)
+    eng.optimize(cart, demo.DEMO_COUPONS, demo.DEMO_WITH_ORDER_OPTIONS)
+    late = eng.try_evaluate(list(cart), Assignment(mapping={}, with_order=None))
+    check(
+        "契约-optimize吃光预算后裸买基准为None",
+        late is None,
+        f"应返回 None 以提醒调用方『基准须先算』，实际 {late!r}",
+    )
+    # 反过来：先算基准则能拿到价格（cli 的正确写法）
+    early_budget = Budget(40)
+    eng2 = CouponOptimizer(demo.demo_oracle, max_calls=40, budget=early_budget)
+    early = eng2.try_evaluate(list(cart), Assignment(mapping={}, with_order=None))
+    eng2.optimize(cart, demo.DEMO_COUPONS, demo.DEMO_WITH_ORDER_OPTIONS)
+    check("契约-裸买基准先于optimize可正常算出", early is not None and early.price_fen >= 0)
+
     # 9. 真实节省口径：必须以裸买价为基准，不能用 discount
     pr = PriceResult(price_fen=7030, original_fen=10740, discount_fen=3710)
     check("口径-真实节省用裸买基准", pr.saved_vs(9750) == 2720, str(pr.saved_vs(9750)))
@@ -377,8 +398,6 @@ def run() -> int:
     check("随单购-标签独立", wo.label == "麦金卡")
 
     # 14. 全局预算：洞察也必须计入，绝不超支
-    from .coupon_engine import Budget
-
     shared = Budget(30)
     o14 = CouponOptimizer(demo.demo_oracle, max_calls=30, budget=shared)
     o14.optimize(cart, demo.DEMO_COUPONS, demo.DEMO_WITH_ORDER_OPTIONS)

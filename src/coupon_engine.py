@@ -19,7 +19,7 @@
 这里用「贪心构造 + 局部搜索（爬山）」而不是穷举：
 
     1. 贪心：按「可挂商品数」升序安排券（最受约束的先占坑）
-    2. 爬山：交替执行 删除 / 新增 / 交换 三种邻域动作，
+    2. 爬山：交替执行 删除 / 新增 / 换券 / 挪动 / 对调 五种邻域动作，
        每步都用真实算价接口验证，接受任何变便宜的改动
     3. 预算耗尽或收敛即停
 
@@ -269,7 +269,6 @@ class CouponOptimizer:
         self.max_restarts = max(0, max_restarts)
         self.restart_seed = restart_seed
         self.calls = 0
-        self.trace: list[int] = []
         # 同一个方案会被不同的邻域动作重复生成（例如先删后加绕回原点），
         # 缓存命中就不消耗调用次数 —— 预算是按次计的，省一次是一次。
         self._cache: dict[tuple, PriceResult] = {}
@@ -302,7 +301,6 @@ class CouponOptimizer:
         result = self.oracle(list(cart), assignment)
         assignment.price = result
         self._cache[sig] = result
-        self.trace.append(result.price_fen)
         self._failures = 0
         return result
 
@@ -401,7 +399,12 @@ class CouponOptimizer:
             start = self.greedy(cart, coupons)
             start.with_order = with_order
             if self.try_evaluate(cart, start) is None:
-                break  # 预算一次都不剩了
+                # 区分「预算见底」和「瞬时网络抖动」：
+                # 只有前者才真正停；后者跳到下一个随单购档位再试，
+                # 否则一次超时就会静默跳过「要不要随单购」这个最值钱的决策。
+                if self.remaining <= 0:
+                    break
+                continue
             screened.append(start)
             if best is None or start.price.price_fen < best.price.price_fen:
                 best = start
@@ -426,10 +429,12 @@ class CouponOptimizer:
                 alt = self.greedy(cart, coupons, shuffle=self.restart_seed + restart)
                 alt.with_order = start.with_order
                 # 起点跟当前最优一样的话，重启没有意义，省下这次调用
-                if alt.mapping == best.mapping:
+                if alt.signature() == best.signature():
                     continue
                 if self.try_evaluate(cart, alt) is None:
-                    break
+                    if self.remaining <= 0:
+                        break
+                    continue
                 alt = self._hill_climb(cart, coupons, table, alt)
                 if alt.price is not None and alt.price.price_fen < best.price.price_fen:
                     best = alt
