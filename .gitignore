@@ -24,3 +24,6 @@ screenshots/*.gif
 # pip install -e . 的构建产物
 mcd_butler.egg-info/
 *.egg-info/
+
+# 提交信息暂存文件（含内部评审措辞，不进仓库）
+.commitmsg.txt

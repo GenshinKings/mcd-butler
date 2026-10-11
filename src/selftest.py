@@ -196,9 +196,56 @@ NUTRITION_STR = """[3]{productName,nutritionDescription,energyKj,energyKcal,prot
 
 _RESULTS: list[tuple[str, bool, str]] = []
 
+# 「今天」的运行时缓存：`run()` 每轮开头清空一次。
+_TODAY: dict = {}
+
+
+def _today():
+    """这一轮自检里的「今天」，取一次就钉死。
+
+    散在各处各取一次的话，跨零点的那一次运行会前后拿到两个日期，
+    于是「演示输出的日期 == 今天」这类断言随机翻红 ——
+    一条只在半夜 00:00 前后一秒才红的断言，比没有还糟：它教会人忽略红条。
+    """
+    from datetime import date
+
+    if "d" not in _TODAY:
+        _TODAY["d"] = date.today()
+    return _TODAY["d"]
+
 
 def check(name: str, cond: bool, detail: str = "") -> None:
     _RESULTS.append((name, bool(cond), detail))
+
+
+def _failure_lines(results: list[tuple[str, bool, str]]) -> list[str]:
+    """把失败项汇总成几行，供 `run()` 在结尾再印一遍。
+
+    为什么要有这一段：失败项混在两百多行 PASS 里滚过去了，用户只看最后一行
+    「201/203 通过」很可能根本没注意到有红的。一份自称「验证你环境没装坏」
+    的自检，翻红了必须让人一眼看见 —— 悄悄红了等于没红。
+
+    为什么单独成函数：写成 `run()` 里的一段 `for` 循环的话，删掉它不会有任何
+    一条断言变红（自检自己是绿的，永远不会走到这段）。抽出来才能离线断言。
+    """
+    bad = [(n, d) for n, ok, d in results if not ok]
+    if not bad:
+        return []
+    out = [f"❌ 有 {len(bad)} 条没过："]
+    out += [f"   - {n}" + (f"   → {d}" if d else "") for n, d in bad]
+    out.append("   自检不过 = 项目当前状态与预期不符。请不要跳过这几条。")
+    return out
+
+
+def _reentrant(totals: list[int]) -> bool:
+    """连跑若干轮得到的断言总数是否一致（自检可重入的判据）。
+
+    为什么单独成函数：写死 `stable = True` 之后，`--twice` 会永远打印
+    「自检可重入 ✅」，而 `--twice` 是 mutate.py 发现「_RESULTS 没清空」
+    这类污染的唯一手段 —— 判据失效等于把守门的换成了个摆设。
+    抽成纯函数，这条判据才能被离线断言到。
+    """
+    return len(set(totals)) == 1
 
 
 def run_repeat(times: int = 2) -> int:
@@ -217,7 +264,7 @@ def run_repeat(times: int = 2) -> int:
     for _ in range(times):
         rc = run()
         totals.append(len(_RESULTS))
-    stable = len(set(totals)) == 1
+    stable = _reentrant(totals)
     if not stable:
         print(f"\n❌ 自检不可重入：连跑 {times} 轮得到的断言数是 {totals}，本应一致。")
         print("   （`_RESULTS` 是模块级列表，`run()` 开头必须清空它。）")
@@ -231,6 +278,8 @@ def run() -> int:
     # 而且上一次的失败记录会被继承。单条 CLI 调用掩盖了这个问题，
     # 任何复用进程的做法（pytest 化、批量校验）都会拿到污染后的分子分母。
     _RESULTS.clear()
+
+    _TODAY.clear()  # 每一轮重新钉一次「今天」
     # 1. A 类解析：必须跳过占位符，拿到真正的报文
     p = extract_payload(MIXED)
     check("A类-能抽出报文", p is not None)
@@ -1318,7 +1367,7 @@ def run() -> int:
     # 2026年10月11日/12日/15日），于是本机时钟越过那几天之后
     # `upcoming()` 直接返回空、三条用例集体变红，而代码一行没错。
     # 自检里写死时间 = 在测日历而不是测代码，是个定时炸弹。
-    _T0 = _date.today()
+    _T0 = _today()
     _BREAKFAST = "超值\U0001d7e1.\U0001d7e1元早餐两件套陪你开工啦"
     _CARD = "学生专属！49元150天麦金学期卡"
     _NIGHT = "麦麦夜市回归"
@@ -1848,7 +1897,7 @@ def run() -> int:
     # ── 6. 活动日历：label() 不接受报文里的「今日」标记
     from .campaign import Campaign, CampaignDay, advise_line, upcoming
 
-    _T1 = _date.today()
+    _T1 = _today()
     check(
         "日历-标了「今日」但不是今天就不能叫今天",
         CampaignDay(day=_T1 + _td(days=30), is_today=True).label(_T1) != "今天",
@@ -2101,8 +2150,284 @@ def run() -> int:
     # （黄历标题会印日期，必须等于 date.today()）
     check(
         "演示-黄历标题印的是真今天，不是写死的日期",
-        f"{_date.today().isoformat()}" in _demo_out,
+        f"{_today().isoformat()}" in _demo_out,
         "README/demo 与真时钟脱节了",
+    )
+
+    # ================================================================ 23.
+    # 变异猎手（第五轮）补的断言：下面每一条都对应一处「改坏后自检全绿」的变异。
+    _fl = _failure_lines([("甲", True, ""), ("乙", False, "差 1")])
+    check(
+        "自检-失败时必须把失败项汇总再印一遍（几百行 PASS 里悄悄红了等于没红）",
+        len(_fl) >= 3 and any("乙" in l for l in _fl) and any("差 1" in l for l in _fl),
+        str(_fl),
+    )
+    check("自检-全绿时不要印失败汇总", _failure_lines([("甲", True, "")]) == [])
+    # ── N5：变异脚本必须把「自检崩了」和「改坏没被抓到」分开判
+    _mut_src = (_Path(__file__).resolve().parent.parent / "scripts" / "mutate.py").read_text(
+        encoding="utf-8"
+    )
+    check(
+        "工具-变异脚本必须区分「自检崩了」与「无防护」（只看变红条数会把崩误报成 P0）",
+        'if red == 0 and rc == 0:\n            verdict = "P0 无防护"' in _mut_src,
+        "mutate.py 的崩溃判定被改掉了",
+    )
+
+    # ── N4：可重入判据本身要站得住（写死 True 会让 --twice 永远绿）
+    _self_src = _Path(__file__).read_text(encoding="utf-8")
+    # 判据字符串必须拼出来，不能原样写：写原样的话，变异之后它仍存在于这条
+    # 断言自己的字面量里，`in` 恒为真 —— 断言就成了装饰品。
+    _needle = "stable = _re" + "entrant(totals)"
+    check(
+        "自检-run_repeat 必须用 _reentrant(totals) 判可重入（写死 True 会让 --twice 白跑）",
+        _reentrant([203, 203])
+        and not _reentrant([203, 406])
+        and _needle in _self_src,
+        "run_repeat 的可重入判据被改掉了",
+    )
+
+    # ── N6：券的到期日是「含当天」的，今天到期今天还能用
+    _saved_c2 = demo.DEMO_COUPONS[0]
+    try:
+        demo.DEMO_COUPONS[0] = _dc.replace(
+            _saved_c2, valid_until=_today().isoformat()
+        )
+        _due_today = demo.demo_oracle([demo.DEMO_MENU[0]], Assignment(mapping={0: 0})).price_fen
+    finally:
+        demo.DEMO_COUPONS[0] = _saved_c2
+    check(
+        "演示-券在到期日当天仍然有效（valid_until 含当天，不能提前一天废掉）",
+        _due_today == demo.DEMO_MENU[0].unit_price_fen - 500,
+        f"{_due_today}",
+    )
+
+    # ── N7 / N8 / N9：本地账本三处零覆盖的逻辑
+    _tmpdir2 = _tf.mkdtemp(prefix="mcdbutler-selftest-2-")
+    _old_snap2 = _snap.SNAPSHOT_FILE
+    _snap.SNAPSHOT_FILE = _Path(_tmpdir2) / "snapshots.json"
+    try:
+        for _i in range(3):
+            _snap.save(
+                _snap.entry_from_cart(
+                    cart=[CartItem("Z", f"品{_i}", 1, 2000)],
+                    paid_fen=1500,
+                    baseline_fen=2000,
+                    discount_fen=500,
+                    store_code="S1",
+                    store_name="测试店",
+                    city="",
+                    keyword="",
+                    coupon_titles=["测试券"],
+                    with_order_label="",
+                )
+            )
+        check(
+            "账本-latest 取的是最近一条，不是最早一条（replay 会复刻错的单）",
+            (_snap.latest() or {}).get("items", [{}])[0].get("name") == "品2",
+            str(_snap.latest()),
+        )
+        check(
+            "账本-delete_last(0) 一条都不删（entries[:-0] 会清空整本账）",
+            _snap.delete_last(0) == 0 and len(_snap.load_all()) == 3,
+            f"删了 {3 - len(_snap.load_all())} 条",
+        )
+    finally:
+        _snap.SNAPSHOT_FILE = _old_snap2
+    check(
+        "账本-摘要必须分清「成交」与「测算」（replay --list 不能说谎）",
+        "测算" in _snap.describe({"kind": "estimate", "saved_at": "x", "items": []})
+        and "成交" in _snap.describe({"kind": "order", "saved_at": "x", "items": []}),
+    )
+
+    # ── N14：晒出去的卡片里，「真实成交笔数」不能把测算数算进去
+    check(
+        "账单-真实成交只数 kind=order（把测算数当成交数是给用户一张圆不上的成绩单）",
+        summarize([{"kind": "order"}, {"kind": "estimate"}, {}])["real_orders"] == 1,
+        str(summarize([{"kind": "order"}, {"kind": "estimate"}, {}])),
+    )
+
+    # ── N10 / N11：营养搭配的「热量预算」和「蛋白质降序」两条主判据
+    from .nutrition import plan as nutrition_plan
+
+    _npairs = [
+        (CartItem("N1", "高蛋白", 1, 1500),
+         {"kcal": 300, "protein": 30.0, "fat": 5.0, "carb": 1.0, "sodium": 10, "calcium": 1}),
+        (CartItem("N2", "低蛋白", 1, 1500),
+         {"kcal": 100, "protein": 2.0, "fat": 1.0, "carb": 1.0, "sodium": 10, "calcium": 1}),
+        (CartItem("N3", "超预算", 1, 1500),
+         {"kcal": 900, "protein": 60.0, "fat": 1.0, "carb": 1.0, "sodium": 10, "calcium": 1}),
+    ]
+    _nres = nutrition_plan(_npairs, kcal_budget=500, size=2, top=5)
+    check(
+        "营养-推荐搭配必须真的在热量预算内（超预算的不能推荐）",
+        bool(_nres) and all(sum(p[1]["kcal"] for p in c) <= 500 for c in _nres),
+        str([sum(p[1]["kcal"] for p in c) for c in _nres]),
+    )
+    check(
+        "营养-推荐按蛋白质降序（最扛饿的排最前，不是最少蛋白的）",
+        bool(_nres)
+        and sum(p[1]["protein"] for p in _nres[0])
+        == max(sum(p[1]["protein"] for p in c) for c in _nres),
+        str([sum(p[1]["protein"] for p in c) for c in _nres]),
+    )
+
+    # ── N12：时段是左闭右开，边界整点不能被划到隔壁时段
+    check(
+        "黄历-时段边界是左闭右开（10 点已是午市、5 点已是早市、21 点已是夜宵）",
+        period_of(datetime(2026, 10, 11, 10))[0] == "午市"
+        and period_of(datetime(2026, 10, 11, 5))[0] == "早市"
+        and period_of(datetime(2026, 10, 11, 14))[0] == "下午茶"
+        and period_of(datetime(2026, 10, 11, 17))[0] == "晚市"
+        and period_of(datetime(2026, 10, 11, 21))[0] == "夜宵"
+        and period_of(datetime(2026, 10, 11, 0))[0] == "深夜",
+        str([period_of(datetime(2026, 10, 11, h))[0] for h in (5, 10, 14, 17, 21, 0)]),
+    )
+
+    # ── N13：已过期必须说「已过期」，不能被「今日到期」吃掉
+    check(
+        "黄历-已过期的券必须说「已过期」（说成今日到期会骗人当天跑去消费）",
+        expiry_note("2026-10-10", datetime(2026, 10, 11)) == "已过期",
+        expiry_note("2026-10-10", datetime(2026, 10, 11)),
+    )
+
+    # ── N16：同名活动的今日基准价取最低价
+    _cheap_day = CampaignDay(_T0, campaigns=(Campaign("麦麦夜市回归", price_yuan=12.9),))
+    _dear_day = CampaignDay(_T0, campaigns=(Campaign("麦麦夜市回归", price_yuan=9.9),))
+    check(
+        "活动日历-今天已有的同名活动按最低价当基准（取 max 会把更贵的那天说成值得等）",
+        len(fresh_campaigns(
+            _cheap_day,
+            [Campaign("麦麦夜市回归", price_yuan=9.9),
+             Campaign("麦麦夜市回归", price_yuan=15.0)],
+        )) == 0
+        and len(fresh_campaigns(
+            _dear_day, [ Campaign("麦麦夜市回归", price_yuan=12.9)]
+        )) == 1,
+        "基准价取错了",
+    )
+
+    # ── N15：已领取的券不能算成待领取（--claim 会重复领）
+    from .assets import build_report
+
+    class _FakeAssetsClient:
+        def call_json(self, tool, arguments=None):
+            return {"data": {"availablePoint": "9.9", "currency": "积分"}}
+
+        def call(self, tool, arguments=None):
+            if tool == "query-my-coupons":
+                return "## 卡包券\n- **有效期**: 2026-10-11 05:00-2026-12-31 10:29\n"
+            if tool == "available-coupons":
+                return (
+                    "### 麦麦省优惠券列表：\n"
+                    "- 优惠券标题：免费脆薯饼 \\\n"
+                    "  状态：已领取 \\\n"
+                )
+            return ""
+
+    _rep = build_report(_FakeAssetsClient())
+    check(
+        "资产-已领取的券不能算成待领取（--claim 会重复领一次）",
+        "· 已领取" in _rep and "待领取" not in _rep,
+        _rep,
+    )
+
+    # ── N17：对调邻域必须校验「对调后的券适用于对调后的商品」
+    _sx = CartItem("X", "X", 1, 2000)
+    _sy = CartItem("Y", "Y", 1, 2000)
+    _scps = [
+        Coupon("A", "a", "A券", frozenset({"X", "Y"})),
+        Coupon("B", "b", "B券", frozenset({"X"})),
+    ]
+
+    def _strict_oracle(items, a):
+        # 不合规的组合（券挂到它不适用的商品上）给一个离谱的低价，
+        # 把「校验写反」这件事从静默变成看得见。
+        for idx, ci in a.mapping.items():
+            if items[idx].product_code not in _scps[ci].product_codes:
+                return PriceResult(price_fen=0, original_fen=4000)
+        return PriceResult(price_fen=4000 - 100 * len(a.mapping), original_fen=4000)
+
+    _sopt = CouponOptimizer(_strict_oracle, max_calls=40)
+    _climbed = _sopt._hill_climb(
+        [_sx, _sy],
+        _scps,
+        _sopt._eligibility([_sx, _sy], _scps),
+        Assignment(mapping={0: 1, 1: 0}),
+    )
+    _sbad = [
+        (i, ci)
+        for i, ci in _climbed.mapping.items()
+        if [_sx, _sy][i].product_code not in _scps[ci].product_codes
+    ]
+    check(
+        "引擎-对调邻域必须校验「对调后的券适用于对调后的商品」（table 的 key/value 别弄反）",
+        not _sbad,
+        f"对调出了不合规的挂法 {_sbad}",
+    )
+
+    # ── N19：贪心必须最受约束的券先占坑
+    _gopt = CouponOptimizer(lambda items, a: PriceResult(price_fen=0), max_calls=1)
+    _gcart = [CartItem("X", "X"), CartItem("Y", "Y"), CartItem("Z", "Z")]
+    _gcps = [
+        Coupon("w", "w", "通用券", frozenset()),
+        Coupon("n", "n", "只挂X", frozenset({"X"})),
+    ]
+    check(
+        "引擎-贪心必须最受约束的券先占坑（可挂商品最少的先选，否则窄券抢不到位置）",
+        _gopt.greedy(_gcart, _gcps).mapping.get(0) == 1,
+        str(_gopt.greedy(_gcart, _gcps).mapping),
+    )
+
+    # ── N18：黄历的「宜」按省下的钱降序，最省的那条必须是第一条
+    _amenu = [
+        CartItem(product_code="B1", name="板烧三件套", unit_price_fen=3700, list_price_fen=3700),
+        CartItem(product_code="B2", name="麦香鱼", unit_price_fen=1500, list_price_fen=1500),
+    ]
+    _acps = [
+        Coupon(coupon_id="b1", coupon_code="b1", title="板烧立减8元",
+               product_codes=frozenset({"B1"})),
+        Coupon(coupon_id="b2", coupon_code="b2", title="麦香鱼立减3元",
+               product_codes=frozenset({"B2"})),
+    ]
+
+    def _alm2(items, a):
+        base = sum(i.unit_price_fen for i in items)
+        saved = sum(800 if ci == 0 else 300 for ci in (a.mapping or {}).values())
+        return PriceResult(price_fen=base - saved, original_fen=base)
+
+    _aday = build_almanac(_amenu, _acps, _alm2, Budget(40), now=datetime(2026, 10, 11, 12))
+    _yes = [r for r in _aday["readings"] if r.kind == "宜"]
+    check(
+        "黄历-宜按省下的钱降序（最省的那条排第一，否则「今天该吃什么」第一句就是错的）",
+        len(_yes) >= 2
+        and _yes[0].saved_fen == max(r.saved_fen for r in _yes)
+        and _yes[0].product_name == "板烧三件套",
+        str([(r.product_name, r.saved_fen) for r in _yes]),
+    )
+
+    # ── 18. README 说「完整演示一共六段」，这句话必须跟 demo 对得上
+    # 上一版 README 写的是「共七段」，实际只有六段，而且段名还漏了两个 ——
+    # 一句散文里的数字没人管，被人数出来就是「主打不编数据的项目自己编了」。
+    _SECTIONS = [
+        "麦门管家 · 离线演示",
+        "历史订单复刻",
+        "麦门黄历",
+        "券包体检",
+        "麦门活动日历",
+        "麦门段位",
+    ]
+    _hit = [s for s in _SECTIONS if s in _demo_out]
+    check(
+        "文档-演示段落数必须是六段（README 里那句「六段」不能漂）",
+        # 双向：demo 真跑出来的段数得是 6，README 里那句「一共**六段**」也得在。
+        # 只查一边的话，改 README 不改代码（或反过来）都不会红。
+        len(_hit) == 6 and "一共**六段**" in _readme,
+        f"demo {len(_hit)} 段 / README 写的是六段吗：{'一共**六段**' in _readme}",
+    )
+    check(
+        "文档-README 要把六段都提到（不能只说「还有好几段」）",
+        all(s in _readme for s in _SECTIONS),
+        f"README 没提：{[s for s in _SECTIONS if s not in _readme]}",
     )
 
     # ---------------------------------------------------------------- 输出
@@ -2115,4 +2440,8 @@ def run() -> int:
             line += f"   → {detail}"
         print(line)
     print(f"\n{passed}/{total} 通过")
+    if passed != total:
+        print("")
+        for line in _failure_lines(_RESULTS):
+            print(line)
     return 0 if passed == total else 1
