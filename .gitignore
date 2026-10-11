@@ -11,12 +11,13 @@ venv/
 .idea/
 .vscode/
 
-# 演示产物（自动生成的位图不放；README 引用的策划 SVG 例外，正常入库）
+# 演示产物（自动生成的位图不放；README 引用的策划 SVG 和可复现录屏 GIF 例外，正常入库）
 out/
 screenshots/*.png
 screenshots/*.jpg
 screenshots/*.jpeg
 screenshots/*.gif
+!screenshots/demo.gif
 
 # WorkBuddy 工作区内部笔记，不公开
 .workbuddy/

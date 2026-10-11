@@ -343,6 +343,10 @@ python -m src.cli meal --name 三件套                    # 这套餐能换成�
 
 ## 离线演示长什么样
 
+![demo 录屏](screenshots/demo.gif)
+
+*上面是 10 秒真实录屏（demo 跑完接 selftest 239/239 全绿），由 [`scripts/demo.tape`](scripts/demo.tape) 录制 —— 脚本入库，任何人都能重录一遍验证，不存在"截图 P 过"的疑问。下面是同一份输出的高清静态版：*
+
 ![demo](screenshots/demo.svg)
 
 ```
@@ -398,7 +402,9 @@ python -m src.cli meal --name 三件套                    # 这套餐能换成�
 >
 > 截图由 `python scripts/render_terminal_svg.py` 从真实 stdout 渲染生成——
 >
-> 改了引擎输出就重跑一次，文档不会和代码脱节。
+> 改了引擎输出就重跑一次，文档不会和代码脱节。录屏同理由 `vhs scripts/demo.tape`
+>
+> 录制（需装 [vhs](https://github.com/charmbracelet/vhs)），录完用 ffmpeg 压一遍体积。
 
 ---
 
@@ -845,17 +851,6 @@ CI **刻意不调麦当劳接口**：Token 走 secret 会把真实账号暴露�
 
   污染同时放大分子和分母，只看「N/M 通过」永远发现不了。必须连跑两轮比总数。
 
-<a id="license"></a>
-
-## 开源协议
-
-[MIT](LICENSE)。改、抄、商用都不用跟我打招呼，也不用署名。
-
-唯一想说的一句：这是个人做的**非官方**作品，别拿它暗示麦当劳背书，
-  
-也别用它做付费代下单那类生意 —— 原因写在 [红线](#redline) 里。
-
----
 
 <a id="promo"></a>
 
@@ -868,3 +863,17 @@ CI **刻意不调麦当劳接口**：Token 走 secret 会把真实账号暴露�
 ## 参赛
 
 麦当劳程序员节创意开发大赛参赛作品。相关文件：`CONTEST_DECLARATION.md`、`MCP_INTEGRATION.md`、`FINDINGS.md`。
+
+---
+
+<a id="license"></a>
+
+## 开源协议
+
+[MIT](LICENSE)。改、抄、商用都不用跟我打招呼，也不用署名。
+
+唯一想说的一句：这是个人做的**非官方**作品，别拿它暗示麦当劳背书，
+  
+也别用它做付费代下单那类生意 —— 原因写在 [红线](#redline) 里。
+
+---
