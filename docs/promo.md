@@ -159,8 +159,13 @@ python -m src.cli compare --items "龙焰鸡腿堡三件套,美式" --top 3 --mo
 - **随单购档位**单独作为一个搜索维度（实测这一档往往值好几块，比多爬两步重要）
 
 拿"穷举最优"当标尺量自己：
-离线自检里 **80 组随机购物车，命中 94% 的最优组合**（断言阈值 ≥85%），
+离线自检里 **80 组随机购物车，命中 94% 的最优组合**（断言阈值 ≥85%，低于这个数 CI 直接红），
 其余差距平均不到 ¥0.32，且**绝不超调用上限**。
+
+这个项目还有一条不常见的自我约束：**自检全绿不能证明自检有效。**
+`scripts/mutate.py` 会故意把 76 处核心逻辑改坏，再跑一遍自检，
+要求每一处都至少有一条断言跟着翻红 —— 第一轮这样试的时候，
+60 处里 33 处改坏后自检依然全绿，那些断言守的是运气，不是行为。
 
 ---
 
@@ -182,7 +187,7 @@ python -m src.cli compare --items "龙焰鸡腿堡三件套,美式" --top 3 --mo
 git clone https://github.com/GenshinKings/mcd-butler.git
 cd mcd-butler
 
-# 没 Token 也能先玩（离线演示 + 129 项自检）
+# 没 Token 也能先玩（离线演示 + 231 项自检，全程不发一个网络请求）
 python -m src.cli demo
 python -m src.cli selftest
 
@@ -196,7 +201,8 @@ python -m src.cli nutrition --kcal 800   # 热量预算内怎么搭最扛饿
 python -m src.cli compare --mode taxi    # 该去哪家店、这趟值不值得跑
 ```
 
-零第三方依赖，Python 标准库就能跑。
+零第三方依赖，Python 标准库就能跑，仓库顶部那个绿色 CI 徽章意味着：
+3.10 / 3.13 × Linux / Windows 四种组合上，自检和离线演示都被真跑过一遍了。
 
 ---
 
