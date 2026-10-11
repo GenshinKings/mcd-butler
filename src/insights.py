@@ -25,7 +25,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Sequence
 
-from .coupon_engine import Assignment, CartItem, Coupon, CouponOptimizer, PriceResult
+from .coupon_engine import (
+    Assignment,
+    Budget,
+    BudgetExhausted,
+    CartItem,
+    Coupon,
+    CouponOptimizer,
+    PriceResult,
+)
 
 
 @dataclass
@@ -57,6 +65,7 @@ def marginal_costs(
     baseline_fen: int,
     per_call_budget: int = 12,
     call_counter: list[int] | None = None,
+    budget: Budget | None = None,
 ) -> list[Marginal]:
     """逐件剔除，反推每件的真实成本。
 
@@ -66,11 +75,17 @@ def marginal_costs(
     """
     out: list[Marginal] = []
     for i, item in enumerate(cart):
+        # 预算见底就停：这一项洞察做不全可以不做，但不能把 --budget 撑爆
+        if budget is not None and budget.remaining <= 0:
+            break
         rest = [c for j, c in enumerate(cart) if j != i]
         if not rest:
             continue
-        opt = CouponOptimizer(oracle, max_calls=per_call_budget)
-        best = opt.optimize(rest, coupons, with_order_options(rest))
+        opt = CouponOptimizer(oracle, max_calls=per_call_budget, budget=budget)
+        try:
+            best = opt.optimize(rest, coupons, with_order_options(rest))
+        except BudgetExhausted:
+            break
         if call_counter is not None:
             call_counter[0] += opt.calls
         if best.price is None:
@@ -90,6 +105,7 @@ def redundant_coupons(
     cart: Sequence[CartItem],
     coupons: Sequence[Coupon],
     best: Assignment,
+    budget: Budget | None = None,
 ) -> list[tuple[CartItem, Coupon]]:
     """找出「挂了等于没挂」的券。
 
@@ -100,11 +116,17 @@ def redundant_coupons(
         return []
     out: list[tuple[CartItem, Coupon]] = []
     for item_idx, ci in sorted(best.mapping.items()):
+        if budget is not None and budget.remaining <= 0:
+            break  # 全局预算见底，剩下的券这次不查了
         reduced = {k: v for k, v in best.mapping.items() if k != item_idx}
         cand = Assignment(mapping=reduced, with_order=best.with_order)
         try:
+            if budget is not None:
+                budget.spend()
             price = oracle(cart, cand)
-        except Exception:
+        except (TypeError, ValueError, KeyError):
+            # 只吞「解析不出价格」这类数据问题；
+            # 网络/鉴权故障必须往上抛，否则会把故障伪装成「没有冗余券」。
             continue
         if price.price_fen == best.price.price_fen:
             out.append((cart[item_idx], coupons[ci]))
@@ -119,6 +141,7 @@ def split_suggestions(
     whole_fen: int,
     per_call_budget: int = 12,
     call_counter: list[int] | None = None,
+    budget: Budget | None = None,
 ) -> list[tuple[CartItem, int, int]]:
     """试试把某一件单独拆成一单，看会不会更便宜。
 
@@ -128,14 +151,19 @@ def split_suggestions(
     """
     out: list[tuple[CartItem, int, int]] = []
     for i, item in enumerate(cart):
+        if budget is not None and budget.remaining <= 0:
+            break
         rest = [c for j, c in enumerate(cart) if j != i]
         if not rest:
             continue
 
-        o_solo = CouponOptimizer(oracle, max_calls=per_call_budget)
-        b_solo = o_solo.optimize([item], coupons, with_order_options([item]))
-        o_rest = CouponOptimizer(oracle, max_calls=per_call_budget)
-        b_rest = o_rest.optimize(rest, coupons, with_order_options(rest))
+        try:
+            o_solo = CouponOptimizer(oracle, max_calls=per_call_budget, budget=budget)
+            b_solo = o_solo.optimize([item], coupons, with_order_options([item]))
+            o_rest = CouponOptimizer(oracle, max_calls=per_call_budget, budget=budget)
+            b_rest = o_rest.optimize(rest, coupons, with_order_options(rest))
+        except BudgetExhausted:
+            break
         if call_counter is not None:
             call_counter[0] += o_solo.calls + o_rest.calls
         if b_solo.price is None or b_rest.price is None:

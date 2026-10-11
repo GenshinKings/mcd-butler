@@ -9,11 +9,22 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 
-from .coupon_engine import Assignment, CartItem, Coupon, CouponOptimizer, PriceResult
-from .mcd_client import McpError
+from .coupon_engine import (
+    Assignment,
+    Budget,
+    BudgetExhausted,
+    CartItem,
+    Coupon,
+    CouponOptimizer,
+    PriceResult,
+    WithOrderOption,
+    to_fen,
+)
+from .mcd_client import McpError, load_dotenv
 from . import demo_data as demo
 
 
@@ -54,7 +65,8 @@ def run_demo() -> int:
     print("-" * 62)
     for line in best.describe(cart, coupons):
         print(f"  {line}")
-    assert best.price is not None
+    if best.price is None:
+        raise BudgetExhausted("没能算出任何价格")
     print(f"\n  原价 ¥{FEN(best.price.original_fen)} → 到手 ¥{FEN(best.price.price_fen)}")
     print(f"  省下 ¥{FEN(best.price.saved_fen)}    共调用算价接口 {optimizer.calls} 次")
 
@@ -104,7 +116,8 @@ def _demo_replay() -> None:
 
         # 今天的最优到手价
         best = optimizer.optimize(cart, demo.DEMO_COUPONS, demo.DEMO_WITH_ORDER_OPTIONS)
-        assert best.price is not None
+        if best.price is None:
+            continue
 
         paid_before = order["realTotalAmount"]
         paid_now = best.price.price_fen
@@ -115,7 +128,8 @@ def _demo_replay() -> None:
         print(f"  上次实付 ¥{FEN(paid_before)}  →  今天最优到手 ¥{FEN(paid_now)}")
         print(
             f"  同样的单，{verdict} ¥{FEN(abs(diff))}{mark}"
-            f"（已用尽 {len(best.mapping)} 张券 + {best.with_order or '无随单购'}）"
+            f"（已用尽 {len(best.mapping)} 张券"
+            f" + {best.with_order.label if best.with_order else '无随单购'}）"
         )
     print("\n（演示数据，不代表真实价格）")
 
@@ -219,7 +233,7 @@ def run_advise(city: str, keyword: str, budget: int) -> int:
             "items": payload_items,
         }
         if isinstance(assignment.with_order, dict):
-            payload["withOrder"] = assignment.with_order
+            payload["withOrder"] = assignment.with_order.payload
         d = client.data("calculate-price", payload)
         return PriceResult(
             price_fen=int(d.get("price", 0)),
@@ -240,19 +254,21 @@ def run_advise(city: str, keyword: str, budget: int) -> int:
         suffix = f"   ← {note}" if note else ""
         print(f"   - {item.name or item.product_code:<16} ¥{FEN(item.effective_price_fen())}{suffix}")
 
-    optimizer = CouponOptimizer(oracle, max_calls=budget)
+    shared = Budget(budget)
+    optimizer = CouponOptimizer(oracle, max_calls=budget, budget=shared)
     best = optimizer.optimize(cart, coupons, _with_order_options(cart))
-    assert best.price is not None
+    if best.price is None:
+        raise BudgetExhausted("没能算出任何价格")
 
-    baseline = optimizer.oracle(cart, Assignment(mapping={}, with_order=None))
+    baseline = optimizer.try_evaluate(cart, Assignment(mapping={}, with_order=None))
     print("\n最优组合：")
     for line in best.describe(cart, coupons):
         print(f"   {line}")
     print(f"\n裸买 ¥{FEN(baseline.price_fen)}  →  到手 ¥{FEN(best.price.price_fen)}")
     print(f"真实省下 ¥{FEN(best.price.saved_vs(baseline.price_fen))}")
 
-    extra = _print_insights(oracle, cart, coupons, best, budget)
-    print(f"\n算价接口共调用 {optimizer.calls + extra} 次")
+    extra = _print_insights(oracle, cart, coupons, best, shared)
+    print(f"\n算价接口共调用 {optimizer.budget_used} 次（上限 {budget}）")
     print("\n想换成自己爱吃的：")
     print('  python -m src.cli optimize --items "板烧鸡腿堡三件套,薯条x2"')
     return 0
@@ -336,7 +352,7 @@ def run_optimize(
             "items": payload_items,
         }
         if isinstance(assignment.with_order, dict):
-            payload["withOrder"] = assignment.with_order
+            payload["withOrder"] = assignment.with_order.payload
         data = client.data("calculate-price", payload)
         return PriceResult(
             price_fen=int(data.get("price", 0)),
@@ -368,32 +384,34 @@ def run_optimize(
         qty = f"×{item.quantity} " if item.quantity > 1 else ""
         print(f"  - {item.name or item.product_code:<16} {qty}¥{FEN(price)}{suffix}")
 
-    optimizer = CouponOptimizer(oracle, max_calls=budget)
+    shared = Budget(budget)
+    optimizer = CouponOptimizer(oracle, max_calls=budget, budget=shared)
     best = optimizer.optimize(cart, coupons, _with_order_options(cart))
     print("\n最优组合：")
     for line in best.describe(cart, coupons):
         print(f"  {line}")
-    assert best.price is not None
+    if best.price is None:
+        raise BudgetExhausted("没能算出任何价格")
 
     # 真实节省必须以「裸买价」为基准。
     # 不能用接口返回的 discount：随单购会把卡费计入 originalPrice
     # （实测 97.50 → 107.40，多出的 9.90 就是卡费），导致 discount 虚高。
-    baseline = optimizer.oracle(cart, Assignment(mapping={}, with_order=None))
+    baseline = optimizer.try_evaluate(cart, Assignment(mapping={}, with_order=None))
     saved = baseline.price_fen - best.price.price_fen
     print(f"\n裸买价 ¥{FEN(baseline.price_fen)}  →  到手 ¥{FEN(best.price.price_fen)}")
     print(f"真实省下 ¥{FEN(saved)}（接口 discount 报 ¥{FEN(best.price.discount_fen)}，含卡费口径）")
 
     extra = 0
     if insights:
-        extra = _print_insights(oracle, cart, coupons, best, budget)
-    print(f"\n算价接口共调用 {optimizer.calls + extra} 次")
+        extra = _print_insights(oracle, cart, coupons, best, shared)
+    print(f"\n算价接口共调用 {optimizer.budget_used} 次（上限 {budget}）")
 
     if save:
         from .snapshot import entry_from_cart, save as save_snapshot
 
         label = ""
         if isinstance(best.with_order, dict):
-            label = str(best.with_order.get("_label", ""))
+            label = best.with_order.label
         path = save_snapshot(
             entry_from_cart(
                 cart=cart,
@@ -455,7 +473,7 @@ def run_replay(store_code: str | None, list_only: bool) -> int:
         order = orders[0]
         target_store = target_store or str(order.get("storeCode", ""))
         try:
-            paid_fen = int(float(order.get("realTotalAmount") or 0) * 100)
+            paid_fen = to_fen(order.get("realTotalAmount"))
         except (TypeError, ValueError):
             paid_fen = None
         for p in order.get("orderProductList") or []:
@@ -524,7 +542,7 @@ def run_replay(store_code: str | None, list_only: bool) -> int:
             "items": payload_items,
         }
         if isinstance(assignment.with_order, dict):
-            payload["withOrder"] = assignment.with_order
+            payload["withOrder"] = assignment.with_order.payload
         d = client.data("calculate-price", payload)
         return PriceResult(
             price_fen=int(d.get("price", 0)),
@@ -536,7 +554,8 @@ def run_replay(store_code: str | None, list_only: bool) -> int:
 
     optimizer = CouponOptimizer(oracle, max_calls=40)
     best = optimizer.optimize(cart, coupons, _with_order_options(cart))
-    assert best.price is not None
+    if best.price is None:
+        raise BudgetExhausted("没能算出任何价格")
     print("\n今日最优组合：")
     for line in best.describe(cart, coupons):
         print(f"  {line}")
@@ -557,7 +576,7 @@ def run_replay(store_code: str | None, list_only: bool) -> int:
 
     label = ""
     if isinstance(best.with_order, dict):
-        label = str(best.with_order.get("_label", ""))
+        label = best.with_order.label
     save_snapshot(
         entry_from_cart(
             cart=cart,
@@ -627,7 +646,13 @@ def run_nutrition(city: str, keyword: str, kcal: int, size: int) -> int:
     return 0
 
 
-def _print_insights(oracle, cart, coupons, best, budget: int) -> None:
+def _print_insights(oracle, cart, coupons, best, budget) -> int:
+    """打印省钱洞察，返回本次洞察消耗的接口调用次数。
+
+    `budget` 是**全局共享**的预算对象，不是数字 ——
+    洞察里每一路都会新建求解器，只有共用同一个计数器，
+    才能保证「用户设了 --budget 40，就绝不会打出第 41 次」。
+    """
     """把「钱是怎么省下来的」讲明白。
 
     只给一个到手价，跟 App 的结算页没区别。真正值钱的是这三件事：
@@ -638,7 +663,8 @@ def _print_insights(oracle, cart, coupons, best, budget: int) -> None:
     if best.price is None:
         return 0
     whole = best.price.price_fen
-    counter = [0]  # 洞察用的是独立求解器，调用次数要单独累计
+    spent_before = budget.used if hasattr(budget, "used") else 0
+    counter = [0]
 
     print("\n" + "-" * 62)
     print("省钱洞察")
@@ -651,8 +677,9 @@ def _print_insights(oracle, cart, coupons, best, budget: int) -> None:
         coupons,
         _with_order_options,
         baseline_fen=whole,
-        per_call_budget=max(budget // max(len(cart), 1), 4),
+        per_call_budget=max(budget.remaining // max(len(cart), 1), 4),
         call_counter=counter,
+        budget=budget,
     )
     if marginals:
         print("\n  这一单里，每件东西实际花了你多少：")
@@ -671,7 +698,7 @@ def _print_insights(oracle, cart, coupons, best, budget: int) -> None:
             )
 
     # --- 2. 挂了等于没挂的券
-    redundant = ins.redundant_coupons(oracle, cart, coupons, best)
+    redundant = ins.redundant_coupons(oracle, cart, coupons, best, budget=budget)
     counter[0] += len(best.mapping)
     if redundant:
         print("\n  ⚠️ 以下券挂了等于没挂（摘掉它总价一分不变）：")
@@ -686,8 +713,9 @@ def _print_insights(oracle, cart, coupons, best, budget: int) -> None:
         coupons,
         _with_order_options,
         whole_fen=whole,
-        per_call_budget=max(budget // max(len(cart), 1), 4),
+        per_call_budget=max(budget.remaining // max(len(cart), 1), 4),
         call_counter=counter,
+        budget=budget,
     )
     if splits:
         print("\n  💡 分开下单更便宜：")
@@ -699,7 +727,9 @@ def _print_insights(oracle, cart, coupons, best, budget: int) -> None:
 
     if not marginals and not redundant and not splits:
         print("\n  （这张单的券结构简单，没有额外的省钱空间）")
-    return counter[0]
+    if budget.remaining <= 0:
+        print("\n  （算价调用已到 --budget 上限，洞察到此为止；调大 --budget 可看完整分析）")
+    return (budget.used - spent_before) if hasattr(budget, "used") else counter[0]
 
 
 def _parse_menu(raw: dict):
@@ -710,12 +740,6 @@ def _parse_menu(raw: dict):
     """
     items: list[CartItem] = []
     detail = raw.get("meals", {}) or {}
-
-    def to_fen(value) -> int:
-        try:
-            return int(float(value or 0) * 100)
-        except (TypeError, ValueError):
-            return 0
 
     for code, info in detail.items():
         if not isinstance(info, dict):
@@ -821,7 +845,7 @@ def _with_order_options(cart: list[CartItem]) -> list:
     菜单里带 canWithOrder 的商品，其标价往往挂在「随单购麦金卡/早餐卡」下，
     所以「要不要随单购」本身就是一个需要试算的决策维度。
     """
-    options: list = [None]
+    options: list[WithOrderOption | None] = [None]
     seen: set[str] = set()
     for item in cart:
         if not item.needs_with_order or not item.membership_code:
@@ -829,12 +853,16 @@ def _with_order_options(cart: list[CartItem]) -> list:
         if item.membership_code in seen:
             continue
         seen.add(item.membership_code)
+        # payload 里只放官方字段；展示文案单独放 label。
+        # 混在一起的话，官方一旦做严格 schema 校验，整个算价请求都会被拒。
         options.append(
-            {
-                "membershipCode": item.membership_code,
-                "membershipSpecId": item.membership_spec_id,
-                "_label": f"{item.discount_type}（membershipCode={item.membership_code}）",
-            }
+            WithOrderOption(
+                payload={
+                    "membershipCode": item.membership_code,
+                    "membershipSpecId": item.membership_spec_id,
+                },
+                label=f"{item.discount_type}（membershipCode={item.membership_code}）",
+            )
         )
     return options
 
@@ -861,6 +889,11 @@ def _parse_coupons(raw) -> list[Coupon]:
 # ==================================================================== main
 
 def main(argv: list[str] | None = None) -> int:
+    # 先把 .env 读进来，默认门店才能用得上（也避免"照着 README 做却报缺 Token"）
+    load_dotenv()
+    city_default = os.environ.get("MCD_DEFAULT_CITY", "上海")
+    kw_default = os.environ.get("MCD_DEFAULT_KEYWORD", "人民广场")
+
     parser = argparse.ArgumentParser(prog="mcd-butler", description="麦门管家")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -869,8 +902,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("selftest", help="离线自检解析器与引擎，无需 Token")
 
     p_adv = sub.add_parser("advise", help="一键顾问：今天该怎么点最划算")
-    p_adv.add_argument("--city", default="上海")
-    p_adv.add_argument("--keyword", default="人民广场")
+    p_adv.add_argument("--city", default=city_default)
+    p_adv.add_argument("--keyword", default=kw_default)
     p_adv.add_argument("--budget", type=int, default=40, help="算价接口调用上限")
 
     p_assets = sub.add_parser("assets", help="麦门资产周报（默认只读）")
@@ -879,14 +912,14 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     p_menu = sub.add_parser("menu", help="列出门店菜单")
-    p_menu.add_argument("--city", default="上海")
-    p_menu.add_argument("--keyword", default="人民广场")
+    p_menu.add_argument("--city", default=city_default)
+    p_menu.add_argument("--keyword", default=kw_default)
     p_menu.add_argument("--filter", default="", help="只显示名称包含该关键词的餐品")
     p_menu.add_argument("--limit", type=int, default=40, help="最多显示多少条")
 
     p_opt = sub.add_parser("optimize", help="真实账号券价寻优")
-    p_opt.add_argument("--city", default="上海")
-    p_opt.add_argument("--keyword", default="人民广场")
+    p_opt.add_argument("--city", default=city_default)
+    p_opt.add_argument("--keyword", default=kw_default)
     p_opt.add_argument("--budget", type=int, default=40, help="算价接口调用上限")
     p_opt.add_argument(
         "--items",
@@ -907,8 +940,8 @@ def main(argv: list[str] | None = None) -> int:
     p_rep.add_argument("--list", action="store_true", help="只列出本地快照")
 
     p_nut = sub.add_parser("nutrition", help="热量预算搭配")
-    p_nut.add_argument("--city", default="上海")
-    p_nut.add_argument("--keyword", default="人民广场")
+    p_nut.add_argument("--city", default=city_default)
+    p_nut.add_argument("--keyword", default=kw_default)
     p_nut.add_argument("--kcal", type=int, default=600, help="热量上限（千卡）")
     p_nut.add_argument("--size", type=int, default=3, help="最多几件")
 
@@ -919,6 +952,12 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\n已取消。")
         return 130
+    except BudgetExhausted as exc:
+        # 预算太小，连一次贪心都没跑完。
+        # 这时候不该编一个价格出来，明确告诉用户怎么改。
+        print(f"\n{exc}")
+        print("算价调用预算太小，没算出结果。把 --budget 调大再试，例如 --budget 80。")
+        return 3
     except McpError as exc:
         # Token 失效、限流、网络错误都走这里。
         # 直接抛 traceback 对使用者毫无帮助，给一句能照着做的提示。

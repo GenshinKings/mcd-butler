@@ -13,10 +13,40 @@ import os
 import re
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 DEFAULT_BASE_URL = "https://mcp.mcd.cn"
 PROTOCOL_VERSION = "2025-06-18"
+
+
+def load_dotenv() -> None:
+    """读取项目根目录的 `.env`（若存在），填进 os.environ。
+
+    为什么要有这段：仓库里给了 `.env.example`，说明写的是「复制为 .env 后填入」。
+    用户照做之后，如果代码只读 `os.environ`，他照样会看到「缺少 MCP Token」——
+    因为复制文件不等于 export 环境变量。
+    「照着文档一步步做，结果跑不起来」是最劝退的一种失败，
+    而且用户根本不会怀疑是项目的问题，只会觉得自己笨。
+
+    规则：已存在的环境变量优先，.env 只补缺；不覆盖、不落盘、不打印。
+    """
+    path = Path(__file__).resolve().parent.parent / ".env"
+    try:
+        if not path.is_file():
+            return
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
 
 class McpError(RuntimeError):
     """MCP 调用失败。"""
@@ -93,6 +123,7 @@ class McdMcpClient:
         base_url: str = DEFAULT_BASE_URL,
         timeout: int = 60,
     ):
+        load_dotenv()
         self.token = token or os.environ.get("MCD_MCP_TOKEN", "")
         if not self.token:
             raise McpError(

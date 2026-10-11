@@ -120,6 +120,54 @@ def match_menu(menu: list, nutrition: dict[str, dict]) -> list[tuple]:
     return exact
 
 
+# 组合枚举的规模上限。超过就把候选池收窄，宁可少看几个也不能让用户干等。
+# 参考量级：C(150,4) ≈ 2000 万，实测要跑 30 秒；收到 3 万以内是零点几秒。
+MAX_COMBOS = 30_000
+
+
+def _trim_pool(cands: list[tuple], size: int) -> list[tuple]:
+    """把候选池收窄到「组合数不超过上限」的规模。
+
+    收窄的依据是**每千卡蛋白质**（蛋白密度）：
+    在热量有上限的前提下，这个指标最能反映「这一口值不值得吃」。
+    只按蛋白质绝对值排序的话，会把高蛋白高热量的品全排在前面，
+    结果凑出来的搭配根本塞不进热量预算。
+
+    另外无条件保留蛋白质最高的 `size` 个 —— 用户很可能就是冲着它们来的，
+    不能因为密度略低就被过滤掉。
+    """
+    if size <= 0:
+        return cands
+    n = len(cands)
+    budget = MAX_COMBOS
+    pool = n
+    # 逐步缩小候选数，直到组合数落回上限内
+    while pool > size:
+        combos = 1
+        for i in range(1, min(size, pool) + 1):
+            combos = combos * (pool - i + 1) // i
+        if combos <= budget:
+            break
+        pool -= 1
+    pool = max(pool, size)
+    if pool >= n:
+        return cands
+
+    def density(p: tuple) -> float:
+        kcal = p[1]["kcal"]
+        return (p[1]["protein"] / kcal) if kcal > 0 else 0.0
+
+    must = sorted(cands, key=lambda p: -p[1]["protein"])[:size]
+    must_keys = {id(p[0]) for p in must}
+    rest = [p for p in cands if id(p[0]) not in must_keys]
+    rest.sort(key=lambda p: (-density(p), p[1]["kcal"]))
+    kept = must + rest[: max(pool - len(must), 0)]
+    # 保持原顺序，输出才不会看起来是乱的
+    order = {id(p[0]): i for i, p in enumerate(cands)}
+    kept.sort(key=lambda p: order[id(p[0])])
+    return kept
+
+
 def plan(
     pairs: list[tuple],
     kcal_budget: int,
@@ -133,6 +181,7 @@ def plan(
     那不叫搭配。
     """
     cands = [p for p in pairs if p[1]["kcal"] > 0]
+    cands = _trim_pool(cands, size)
     results: list[list[tuple]] = []
 
     for n in range(1, min(size, len(cands)) + 1):

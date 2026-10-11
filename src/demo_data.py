@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from .coupon_engine import CartItem, Coupon, PriceResult
+from .coupon_engine import CartItem, Coupon, PriceResult, WithOrderOption
 
 
 # ---------------------------------------------------------------- 演示门店
@@ -86,8 +86,14 @@ DEMO_COUPONS: list[Coupon] = [
 _DEMO_DISCOUNT = {"C1": 500, "C2": 400, "C3": 1200, "C4": 300, "C5": -100}
 
 # 随单购（演示）
-DEMO_WITH_ORDER_OPTIONS = [None, "早餐卡（随单购）", "麦金卡（随单购）"]
-_DEMO_WITH_ORDER_DISCOUNT = {None: 0, "早餐卡（随单购）": 200, "麦金卡（随单购）": 600}
+# 演示档位也用正式的 WithOrderOption —— payload 和 label 分开。
+# 演示里 payload 没有真实含义，但保持跟线上同构，离线才能测到线上会走的代码路径。
+DEMO_WITH_ORDER_OPTIONS = [
+    None,
+    WithOrderOption(payload={"membershipCode": "DEMO-BREAKFAST"}, label="早餐卡（随单购）"),
+    WithOrderOption(payload={"membershipCode": "DEMO-GOLD"}, label="麦金卡（随单购）"),
+]
+_DEMO_WITH_ORDER_DISCOUNT = {"": 0, "早餐卡（随单购）": 200, "麦金卡（随单购）": 600}
 
 
 # ---------------------------------------------------------------- 演示算价器
@@ -108,11 +114,13 @@ def demo_oracle(items: list[CartItem], assignment) -> PriceResult:
         if cid:
             discount += _DEMO_DISCOUNT.get(cid, 0)
 
+    wo_label = assignment.with_order.label if assignment.with_order else ""
+
     # 互斥规则：麦金卡随单购不能与 C2 同享
-    if assignment.with_order == "麦金卡（随单购）" and "C2" in coupon_ids:
+    if wo_label == "麦金卡（随单购）" and "C2" in coupon_ids:
         discount -= _DEMO_DISCOUNT["C2"]
 
-    discount += _DEMO_WITH_ORDER_DISCOUNT.get(assignment.with_order, 0)
+    discount += _DEMO_WITH_ORDER_DISCOUNT.get(wo_label, 0)
 
     price = max(subtotal - discount, 0)
     return PriceResult(
