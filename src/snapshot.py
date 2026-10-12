@@ -125,6 +125,17 @@ def load_all() -> list[dict]:
     return entries
 
 
+def has_order_key(key: str) -> bool:
+    """这笔真实订单记过了吗？
+
+    `replay` 每次跑都会复刻同一笔历史订单 —— 不查重的话，
+    把 replay 跑十遍就能把段位刷十遍，那和「把 optimize 多跑几次」是一回事。
+    """
+    if not key:
+        return False
+    return any(e.get("order_key") == key for e in load_all())
+
+
 def latest(store_code: str | None = None) -> dict | None:
     """取最近一条快照；指定 store_code 时只在该门店里找。"""
     entries = load_all()
@@ -184,17 +195,24 @@ def entry_from_cart(
     coupon_titles: list[str],
     with_order_label: str,
     kind: str = "estimate",
+    order_key: str = "",
 ) -> dict:
     """把 optimize 的结果打包成快照条目。
 
     `kind` 区分两种性质完全不同的记录，混在一起就是撒谎：
         "estimate" 测算 —— 引擎算出「这么点能省多少」，用户未必真买了
         "order"    成交 —— 真实下单记录（来自 `order-list` 的历史订单）
+
+    `order_key` 是订单号的 **哈希**，不是订单号本身。
+    订单号能在客服系统反查到手机号与支付流水，屏幕上和磁盘里都不该有原文；
+    但要防止同一笔订单被 `replay` 反复记账（那样段位又能刷了），
+    所以留一个不可逆的指纹用于去重。
     """
     return {
         "saved_at": datetime.now().strftime(FMT),
-        "source": "optimize",
+        "source": "optimize" if kind != "order" else "order-list",
         "kind": kind,
+        "order_key": str(order_key),
         "store_code": str(store_code),
         "store_name": store_name,
         "city": city,

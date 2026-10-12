@@ -154,6 +154,21 @@ def split_suggestions(
     为什么值得试：一张券只能用一次，整单结算时可能被迫二选一。
     这里只试「单件独立成单」这一种拆法 —— 完整枚举所有分割是 2^n，
     调用次数会爆；而单件拆出的情形已经覆盖了绝大多数真实受益场景。
+
+    两个必须守住的规矩，破了就会报出一个用户根本拿不到的价格：
+
+    1. **同一张券不能在两单里各用一次。**
+       早先的写法把完整券池分别交给两单各跑一遍，两边都挑到同一张最肥的券，
+       于是报出「拆开省 ¥5.00」——而那 ¥5.00 需要同一张券核销两次。
+       用户的实际体验是：照着做，第二单的券根本选不上，价格比整单还贵。
+       现在的做法是让两单**依次**挑券：先跑的那单挑走之后，
+       后跑的那单只能在剩下的券里选。这样报出来的合计是客人真能买到的。
+
+    2. **两单都随单购麦金卡的不算数。**
+       随单购是在这一单里买一张卡。拆成两单还各自随单购，就是买两张卡，
+       多付一份卡费。这种「便宜」是账面上便宜、付款时更贵。
+
+    两个方向都试（先给单件挑 / 先给其余挑），取真能买到的那个更低的。
     """
     out: list[tuple[CartItem, int, int]] = []
     for i, item in enumerate(cart):
@@ -163,19 +178,35 @@ def split_suggestions(
         if not rest:
             continue
 
+        calls = 0
+        best_total: int | None = None
         try:
-            o_solo = CouponOptimizer(oracle, max_calls=per_call_budget, budget=budget)
-            b_solo = o_solo.optimize([item], coupons, with_order_options([item]))
-            o_rest = CouponOptimizer(oracle, max_calls=per_call_budget, budget=budget)
-            b_rest = o_rest.optimize(rest, coupons, with_order_options(rest))
+            # 两个方向都试：先给「这一件」挑券，以及先给「其余」挑券。
+            for first, second in (([item], rest), (rest, [item])):
+                o1 = CouponOptimizer(oracle, max_calls=per_call_budget, budget=budget)
+                b1 = o1.optimize(first, coupons, with_order_options(first))
+                calls += o1.calls
+                if b1.price is None:
+                    continue
+                # 第二单只能用第一单挑剩下的券
+                taken = set(b1.mapping.values())
+                left = [c for k, c in enumerate(coupons) if k not in taken]
+                o2 = CouponOptimizer(oracle, max_calls=per_call_budget, budget=budget)
+                b2 = o2.optimize(second, left, with_order_options(second))
+                calls += o2.calls
+                if b2.price is None:
+                    continue
+                # 两单都随单购 = 买两张卡，这个价拿不到
+                if b1.with_order and b2.with_order:
+                    continue
+                total = b1.price.price_fen + b2.price.price_fen
+                if best_total is None or total < best_total:
+                    best_total = total
         except BudgetExhausted:
             break
         if call_counter is not None:
-            call_counter[0] += o_solo.calls + o_rest.calls
-        if b_solo.price is None or b_rest.price is None:
+            call_counter[0] += calls
+        if best_total is None or best_total >= whole_fen:
             continue
-
-        total = b_solo.price.price_fen + b_rest.price.price_fen
-        if total < whole_fen:
-            out.append((item, total, whole_fen - total))
+        out.append((item, best_total, whole_fen - best_total))
     return out

@@ -37,7 +37,18 @@ RANKS: list[tuple[int, str, str]] = [
 
 
 def rank_of(saved_fen: int) -> dict:
-    """按累计省下的钱给段位。返回当前段位、下一档、还差多少。"""
+    """按**真实成交的累计实付金额**给段位。返回当前段位、下一档、还差多少。
+
+    为什么只认真实成交：`optimize` 是测算，同一单跑 15 次就是 15 条记录 ——
+    段位要按测算算，就变成了「谁把命令多跑几遍谁段位高」的游戏，
+    发出去的卡片也是一份自己解释不清的假成绩单。
+    真实成交（来自 `replay` 导入的历史订单）按订单号去重，跑多少遍都是那几笔。
+
+    为什么用**实付**而不是「省了多少」：历史订单只有实付金额，
+    当时的裸买价无从得知 —— 编一个 baseline 去算省了多少就是虚报。
+    花出去的钱是硬事实，虽然段位因此更像「麦门资历」而不是「省钱战功」，
+    但至少它不掺假。
+    """
     saved_fen = max(0, int(saved_fen))
     cur_idx = 0
     for i, (need, _, _) in enumerate(RANKS):
@@ -117,21 +128,51 @@ def butler_almanac(best_saved_fen: int, today_expiry: int) -> str:
     return "今天这家店实在没什么可省的。换个时段或换家门店，小的再给您算一张。"
 
 
-def butler_warning(travel_fen: int, saved_fen: int) -> str:
-    """路费吃掉优惠时的劝退——这是管家最该说的一句实话。"""
+def butler_warning(
+    travel_fen: int,
+    saved_fen: int,
+    alt_gap_fen: int | None = None,
+    minutes: int = 0,
+) -> str:
+    """路费这笔账该怎么说 —— 管家最该说的一句实话。
+
+    旧版拿「路费」跟「券省下的钱」比，那是范畴错误：
+    路费是**出行方式**的成本（打车 ¥14.72、走路 ¥0），跟用不用券毫无关系。
+    同一单同一家店，换个 `--mode` 就从"白跑"变成"稳赚"，这话就没意义了；
+    而且项目并不支持外卖，却劝人"不如躺着等外卖"，是自己打自己脸。
+
+    真正该比的决策量是：**去这家**比**去次优那家**省下多少（alt_gap），
+    以及这趟来回要花多少时间。省得少还要跑到远处，才叫不值。
+    """
+    go = f"这趟来回 {minutes} 分钟" if minutes else "这一趟"
     if travel_fen <= 0:
-        return "走着去，路费为零，这一趟稳赚不赔。"
-    if saved_fen <= 0:
-        return f"这趟路费 {yuan(travel_fen)}，可这一单压根没省下钱。出门纯属花钱买罪受。"
-    if travel_fen >= saved_fen:
+        return "走着去，路费为零 —— 这一趟稳赚不赔。"
+
+    if alt_gap_fen is not None:
+        if alt_gap_fen <= 0:
+            return (
+                f"{go}，路费 {yuan(travel_fen)}。"
+                f"不过次选那家和这家综合花费一样，那就挑近的，别跟路费较劲。"
+            )
+        if alt_gap_fen < travel_fen:
+            return (
+                f"小的斗胆劝一句：跑远这家只比次选省 {yuan(alt_gap_fen)}，"
+                f"可{go}、路费 {yuan(travel_fen)} —— 省的钱还不够跑腿的。"
+                f"图省事就挑近的那家。"
+            )
         return (
-            f"小的斗胆劝一句：这趟路费 {yuan(travel_fen)}，"
-            f"比您省下的 {yuan(saved_fen)} 还贵。\n"
-            f"  您这是花钱出门买罪受——除非本来就要出去，否则不如躺着等外卖。"
+            f"{go}，路费 {yuan(travel_fen)}；"
+            f"但这家比次选省 {yuan(alt_gap_fen)}，划得来，值得跑。"
+        )
+
+    if saved_fen <= 0:
+        return (
+            f"{go}，路费 {yuan(travel_fen)}。这一单券没省出钱 —— "
+            f"路费是您为吃这口饭花的，小的照实报，不替您粉饰。"
         )
     return (
-        f"路费 {yuan(travel_fen)}，比省下的 {yuan(saved_fen)} 少，"
-        f"这趟划算，出门不亏。"
+        f"{go}，路费 {yuan(travel_fen)}；券省下 {yuan(saved_fen)}。"
+        f"这两笔各是各的账，小的不拿它们互相比。"
     )
 
 
@@ -188,11 +229,23 @@ def summarize(entries: list[dict]) -> dict:
     用户会被朋友问住 —— 那不是他省的钱。所以数量与金额都必须分开报。
     """
     saved = 0
+    real_saved = 0
+    real_paid = 0
     for e in entries:
         base = e.get("baseline_fen") or 0
         paid = e.get("paid_fen") or 0
         if isinstance(base, int) and isinstance(paid, int) and base > paid:
             saved += base - paid
+            # 只有真实成交（order）才进「真省下的钱」。
+            # 测算（estimate）是「这么点能省多少」的空间，用户未必真买了 ——
+            # 把它算进省下的钱，段位就成了「把 optimize 多跑几次」的游戏。
+            if e.get("kind") == "order":
+                real_saved += base - paid
+        # 真实成交的**实付金额**：这是段位的依据。
+        # 用实付而不是「省了多少」，是因为历史订单的裸买价无从得知 ——
+        # 编一个 baseline 去算省了多少，等于替主人虚报。花出去的钱才是硬事实。
+        if e.get("kind") == "order" and isinstance(paid, int) and paid > 0:
+            real_paid += paid
     stores = Counter(
         (e.get("store_name") or e.get("store_code") or "?") for e in entries
     )
@@ -206,7 +259,11 @@ def summarize(entries: list[dict]) -> dict:
     return {
         "orders": len(entries),
         "real_orders": real_orders,
+        "est_orders": len(entries) - real_orders,
         "saved_fen": saved,
+        "real_saved_fen": real_saved,
+        "real_paid_fen": real_paid,
+        "est_saved_fen": saved - real_saved,
         "top_store": stores.most_common(1)[0][0] if stores else "",
         "top_coupon": coupons.most_common(1)[0][0] if coupons else "",
         "first_at": times[0] if times else "",

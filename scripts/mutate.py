@@ -77,10 +77,13 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
         True,
     ),
     (
+        # 原文从 `except McpFatalError` 收紧成 `except McpError`：
+        # 业务性失败（不是环境故障，但同样表示「这一趟没问到」）也必须穿透，
+        # 否则返回空列表 = 把「没查到」说成「没有」。
         "卡包把限流降级为空",
         "assets.py",
-        "    except McpFatalError:\n        raise",
-        "    except Exception:\n        return {}",
+        "    except McpError:\n        # 业务性失败也必须穿透：返回空等于把「没查到」说成「没有」。\n        raise\n    except Exception:\n        return []",
+        "    except Exception:\n        return []",
         True,
     ),
     (
@@ -149,9 +152,23 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
     (
         "取价前不挖门槛",
         "campaign.py",
-        "vals = [float(m.group(1)) for m in _PRICE_RE.finditer(_strip_discounts(title))]",
-        "vals = [float(m.group(1)) for m in _PRICE_RE.finditer(title)]",
+        "vals = [\n        float(m.group(1))\n        for m in _PRICE_RE.finditer(_strip_amortized(_strip_discounts(title)))\n    ]",
+        "vals = [\n        float(m.group(1))\n        for m in _PRICE_RE.finditer(title)\n    ]",
         False,
+    ),
+    (
+        "取价前不抹摊销价（「每天低至 0.33 元」被当成活动价）",
+        "campaign.py",
+        "for m in _PRICE_RE.finditer(_strip_amortized(_strip_discounts(title)))",
+        "for m in _PRICE_RE.finditer(_strip_discounts(title))",
+        True,
+    ),
+    (
+        "标题取价退回 min（「双人餐 99 元（含两份各 49 元）」报成 ¥49）",
+        "campaign.py",
+        "    vals = [v for v in vals if 0.1 <= v <= 10000]\n    if vals:\n        return vals[0]",
+        "    vals = [v for v in vals if 0.1 <= v <= 10000]\n    if vals:\n        return min(vals)",
+        True,
     ),
     (
         "同名更便宜的活动不算新",
@@ -412,10 +429,20 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
         True,
     ),
     (
-        "N12-黄历时段边界写反（10:00 归早市、5:00 归深夜）",
+        # 时段改成「分钟边界」之后，边界判据从 `start <= h < end` 变成
+        # `start <= mins < end`。写反之后 10:30 整会被判成早市、
+        # 05:00 整会被判成深夜 —— 早餐券还能用的时候说它过期了。
+        "N12-黄历时段边界写反（10:30 归早市、5:00 归深夜）",
         "almanac.py",
-        "        if start <= h < end:",
-        "        if start < h <= end:",
+        "        if start <= mins < end:",
+        "        if start < mins <= end:",
+        True,
+    ),
+    (
+        "N12b-时段退回整点切分（10:15 被误划午市，早餐券提前 15 分钟作废）",
+        "almanac.py",
+        "    mins = now.hour * 60 + now.minute",
+        "    mins = now.hour * 60",
         True,
     ),
     (
@@ -502,10 +529,26 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
         True,
     ),
     (
+        # 原文重写过：现在两单**依次**挑券（先跑的那单挑走之后，后跑的只能用剩下
+        # 的券），并且两单都随单购的不算数。三条规矩各配一条变异。
         "R3-拆单建议放宽成「不更贵就推荐」（省 ¥0 也当省钱建议吐出来）",
         "insights.py",
-        "        if total < whole_fen:",
-        "        if total <= whole_fen:",
+        "        if best_total is None or best_total >= whole_fen:\n            continue",
+        "        if best_total is None or best_total > whole_fen:\n            continue",
+        True,
+    ),
+    (
+        "R3b-拆单又把同一张券在两单里各用一次（报出拿不到的价）",
+        "insights.py",
+        "                left = [c for k, c in enumerate(coupons) if k not in taken]",
+        "                left = list(coupons)",
+        True,
+    ),
+    (
+        "R3c-拆单不再排除「两单都随单购」（账面上便宜、付款时多付一份卡费）",
+        "insights.py",
+        "                if b1.with_order and b2.with_order:\n                    continue",
+        "                pass",
         True,
     ),
     (
@@ -551,10 +594,18 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
         True,
     ),
     (
+        # 配对改成「归一化后完全相等」之后，去重键从菜名换成了 canon_key。
         "R10-营养配对允许一条数据被多个菜串用（营养值重复计数）",
         "nutrition.py",
-        "            if nname in used:\n                continue",
-        "            pass",
+        "        if canon_key in used:\n            continue",
+        "        pass",
+        True,
+    ),
+    (
+        "R10b-营养配对退回双向子串（单品拿套餐热量、套餐拿单品热量）",
+        "nutrition.py",
+        "        hit = by_canon.get(_canon(nm))\n        if hit is None:\n            continue",
+        "        hit = None\n        for k, v in by_canon.items():\n            if k in _canon(nm) or _canon(nm) in k:\n                hit = v\n                break\n        if hit is None:\n            continue",
         True,
     ),
     (
@@ -736,9 +787,10 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
         True,
     ),
     (
+        # 原文里那句 `.format(code=...)` 是空转的（文案里没有占位符），已删掉。
         "T12-HttpError 的原始响应体又透传上屏（可能含个人信息）",
         "mcd_client.py",
-        '                    msg = _HTTP_UNAVAILABLE_MSG.format(code=exc.code)\n                    limited = False',
+        "                    msg = _HTTP_UNAVAILABLE_MSG\n                    limited = False",
         '                    msg = f"HTTP {exc.code}: {detail}"\n                    limited = False',
         True,
     ),
@@ -754,6 +806,118 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
         "cli.py",
         '        + f"¥{q.paid_fen / 100:>8.2f}"',
         '        + f"{q.paid_fen / 100:>9.2f}"',
+        True,
+    ),
+
+    # ---- 第七轮：本轮「管家不虚报」专项 ----
+    # 每一条都对应一处「改坏之后用户会被骗，而屏幕上毫无异常」。
+    (
+        "U1-量纲守卫的菜单合计读错字段（守卫永远不进，整个自杀式保护失效）",
+        "oracle.py",
+        "    menu_total = sum(it.effective_price_fen() * it.quantity for it in items)",
+        '    menu_total = sum(getattr(it, "price_fen", 0) or 0 for it in items)',
+        True,
+    ),
+    (
+        # 原来那种「跨商品取全局最小值」的写法被结构性地消灭了：
+        # best_min_base 只在「这件商品更值」时才更新，天然绑在最值钱那件商品上，
+        # 没法再用一处单行变异复现。所以改打同一条判据的另一种失效：
+        # 干脆不记这个价 → 判据永远不成立 → 随单购更划算时一句都不提醒。
+        "U2-体检不再记录跨档位最低价（随单购更划算时一句都不提醒）",
+        "audit.py",
+        "                best_min_base = min_base_any",
+        "                best_min_base = None",
+        True,
+    ),
+    (
+        "U4-黄历把「减不动」说成「没有券」（probed 退回 covered）",
+        "almanac.py",
+        "            if i.product_code not in probed_codes",
+        "            if i.product_code not in covered",
+        True,
+    ),
+    (
+        "U5-黄历不再把试过价的商品记进 probed_codes",
+        "almanac.py",
+        "            probed_codes.add(code)\n",
+        "",
+        True,
+    ),
+    (
+        "U6-compare 预算退回 max(6, …)（总数能打到 --budget 的两三倍）",
+        "cli.py",
+        "    per = budget // n\n    keep = n_stores\n    if per < MIN_CALLS_PER_STORE and n_stores > 1:\n        keep = min(n_stores, max(1, budget // MIN_CALLS_PER_STORE))\n        per = budget // max(1, keep)\n    return per, keep",
+        "    per = max(MIN_CALLS_PER_STORE, budget // n)\n    return per, n_stores",
+        True,
+    ),
+    (
+        "U7-距离未知的店又当成 0 米（假路费把它送上「综合最划算」第一名）",
+        "cli.py",
+        "        dist, dist_known = _distance_of(st)",
+        "        dist, dist_known = 0, True",
+        True,
+    ),
+    (
+        "U8-距离未知的店照样参与综合排序",
+        "route.py",
+        "        return not self.missing and not self.distance_unknown",
+        "        return not self.missing",
+        True,
+    ),
+    (
+        "U9-服务端时间又留着时区（naive−aware 相减炸掉，到期提醒静默消失）",
+        "cli.py",
+        "        return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt",
+        "        return dt",
+        True,
+    ),
+    (
+        "U10-卡包没查到又说成「没有今天到期的」（到期作废不可逆）",
+        "cli.py",
+        "    for line in _due_today_report(mine, lookup_error):\n        print(line)",
+        "    print(f'卡包 {len(mine)} 张，没有今天到期的。')",
+        True,
+    ),
+    (
+        "U11-「用了 N 张券」退回数挂上去的（含被随单购抵消、一分没减的那张）",
+        "cli.py",
+        "        work = _count_working_coupons(optimizer.oracle, cart, best)",
+        "        work = len(best.mapping)",
+        True,
+    ),
+    (
+        "U12-optimize 不再打印「照着做」（算了答案却不告诉人家手怎么点）",
+        "cli.py",
+        "    for line in _how_to_order(cart, coupons, best, best.converged):",
+        "    for line in ():",
+        True,
+    ),
+    (
+        "U13-条件价不再单独告警（标价 ¥29 实付 ¥57 又藏回行尾）",
+        "cli.py",
+        "    for line in _condition_warning(cart):\n        print(line)",
+        "    pass",
+        True,
+    ),
+    (
+        "U14-活动日历又替用户判断「不急」（紧迫性是他的事，不是管家的）",
+        "campaign.py",
+        "—— 今天没有这天才有，等不等你自己定",
+        "—— 今天没有，不急可以等这天",
+        True,
+    ),
+    (
+        "U15-健康度又不给分母定义（用户只能猜 60% 是在说谁）",
+        "audit.py",
+        '    lines.append(\n        f"  （健康度 = 真能省钱的 {worth} 张 ÷ 体检到的 {counted} 张；"',
+        "    if False:\n        lines.append(",
+        True,
+    ),
+    (
+        "U16-券面额落差说成「实测」（离线演示一个请求都没发过）",
+        "audit.py",
+        '                f"实际只省 ¥{yuan(v.value_fen)}"',
+        '                f"实测只省 ¥{yuan(v.value_fen)}"',
         True,
     ),
 ]

@@ -136,6 +136,11 @@ class StoreQuote:
     baseline_fen: int = 0  # 裸买价
     travel: TravelCost = field(default_factory=lambda: travel_cost(0))
     missing: tuple[str, ...] = ()  # 这家店没有的商品；有缺失就不该拿来比价
+    #: 接口没返回 distance。曾经这里直接填 0，于是「距离未知」被当成
+    #: 「就在你脚下、路费 ¥0」，而综合成本里路费又是最大的一项 ——
+    #: 一家不知道有多远的店会被排到「综合最划算」第一名。
+    #: 屏幕上同一段还写着「距离是真实值，不是估算」，等于自相矛盾。
+    distance_unknown: bool = False
 
     @property
     def saved_fen(self) -> int:
@@ -148,12 +153,25 @@ class StoreQuote:
 
     @property
     def comparable(self) -> bool:
-        """能不能参与排序：商品缺货的店不能跟齐全的比，那是不公平比较。"""
-        return not self.missing
+        """能不能参与排序：商品缺货的店不能跟齐全的比，那是不公平比较。
+
+        距离未知的店同样不能比：综合成本里含路费，路费算不出来，
+        那个总数就是假的，拿它去排名等于拿一个编出来的数赢。
+        """
+        return not self.missing and not self.distance_unknown
+
+    @property
+    def reason_uncomparable(self) -> str:
+        """为什么这家店不参与排序。缺货和距离未知要说不同的话。"""
+        if self.missing:
+            return "缺货"
+        if self.distance_unknown:
+            return "距离未知"
+        return ""
 
 
 def rank_stores(quotes: list[StoreQuote]) -> list[StoreQuote]:
-    """按综合成本升序排。缺货的店沉到最后。"""
+    """按综合成本升序排。缺货的店、距离未知的店沉到最后。"""
     return sorted(
         quotes,
         key=lambda q: (not q.comparable, q.total_fen, q.distance_m),
@@ -164,6 +182,11 @@ def verdict(quotes: list[StoreQuote]) -> str:
     """给一句人话结论：到底该不该跑这一趟、该去哪家店。"""
     good = [q for q in quotes if q.comparable]
     if not good:
+        if all(q.distance_unknown for q in quotes):
+            return (
+                "这几家店接口都没返回距离，算不出路费，也就没法比「哪家更划算」。"
+                "它们的到手价在表里，路费得你自己算。"
+            )
         return "没有一家店能凑齐你要的东西，换个关键词试试。"
 
     best = good[0]
@@ -200,9 +223,19 @@ def verdict(quotes: list[StoreQuote]) -> str:
                 f"那就挑最近的 —— 比次选近 {dd} 米、来回少花 {dt} 分钟。"
             )
 
-    # 这趟路费值不值：拿"省下的券钱"跟"路费"比
-    # 「路费吃掉优惠」这句话交给管家说 —— 干巴巴的"等于白跑"没人记得住，
-    # 带人味的劝才传得开。数字照旧，只是换了张嘴。
-    lines.append(butler_warning(best.travel.money_fen, best.saved_fen))
+    # 这趟路费值不值 —— 交给管家说，干巴巴的"等于白跑"没人记得住。
+    # 但比的必须是「比次优那家省多少」，不是「比券省的钱多不多」：
+    # 后者是范畴错误，换个出行方式结论就反转（见 persona.butler_warning）。
+    alt_gap = None
+    if len(good) > 1:
+        alt_gap = good[1].total_fen - best.total_fen
+    lines.append(
+        butler_warning(
+            best.travel.money_fen,
+            best.saved_fen,
+            alt_gap_fen=alt_gap,
+            minutes=best.travel.minutes,
+        )
+    )
 
     return "\n".join(lines)

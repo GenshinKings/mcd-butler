@@ -14,11 +14,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import itertools
+import json
 import random
 import re
 
 from .assets import parse_claimable_markdown, parse_coupon_markdown, fmt_num, _num
+from .snapshot import entry_from_cart
 from .coupon_engine import (
     Assignment,
     Budget,
@@ -489,20 +492,18 @@ def run() -> int:
         whole_fen=best.price.price_fen,
         per_call_budget=20,
     )
-    # 返回的是 (商品, 拆单后总价, 比整单便宜多少) 三元组。
-    # 只断言 isinstance(list) 的话，返回 [] 也通过。
+    # 这条断言原来是「拆单建议带得出金额」，并且指望 demo 场景里一定有拆单收益。
+    # 但那个收益是假的：逐件算下来，demo 里 4 条拆单建议**每一条**都是
+    # 「两单都随单购麦金卡」换来的 —— 拆成两单还各买一张卡，多付一份卡费，
+    # 账面上便宜 ¥6，付款时更贵。旧断言等于在给这个假收益背书。
+    #
+    # 现在反过来钉住：这种收益必须一分不报。
+    # 单独看这条是弱断言（返回 [] 就通过），所以下面 R7 有一条配对的强断言：
+    # 真能靠拆单多核销一张券时，必须报出来。两条一起才守得住。
     check(
-        "洞察-拆单建议带得出金额（不是只返回个 list）",
-        isinstance(splits, list)
-        and len(splits) >= 1
-        and all(
-            len(x) == 3
-            and hasattr(x[0], "product_code")
-            and isinstance(x[1], int)
-            and isinstance(x[2], int)
-            for x in splits
-        ),
-        f"{splits[:1]!r}",
+        "洞察-拆单收益若只能靠买两张随单购卡换来就不许报（账面便宜、付款更贵）",
+        splits == [],
+        str([(x[0].product_code, x[1], x[2]) for x in splits]),
     )
 
     # 11. 演示数据里那张「陷阱券」（C5，挂上反而加价）不该被选进最优解
@@ -865,10 +866,77 @@ def run() -> int:
 
     q_taxi = StoreQuote("C", "打车店", distance_m=144, paid_fen=3680, baseline_fen=3880,
                         travel=travel_cost(144, "taxi"))
+    v_taxi = verdict([q_taxi])
+    # 只有一家可比时没有 alt_gap，管家照实报路费与券省额，并且**不许**拿
+    # 「路费比券省的多」当劝退理由 —— 那是范畴错误（换个 --mode 结论就反），
+    # 更不许劝人"等外卖"（本项目不支持外卖）。
     check(
-        "比价-路费吃掉优惠时管家出言劝退",
-        "路费" in verdict([q_taxi]) and "劝" in verdict([q_taxi]),
-        f"路费¥{q_taxi.travel.money_fen / 100:.2f} vs 省¥{q_taxi.saved_fen / 100:.2f}",
+        "比价-只有一家时如实报路费且不拿路费比券钱",
+        "路费" in v_taxi and "各是各的账" in v_taxi and "外卖" not in v_taxi,
+        v_taxi[-60:],
+    )
+
+    # 两家可比、跑远只省一点点时，管家必须出言劝退——而且劝的是
+    # 「比次选省的钱 vs 路费」这一对，不是「券省的钱 vs 路费」。
+    # 远店货便宜 ¥2.80、但打车多花 ¥2.00 路费，综合只便宜 ¥0.80 ——
+    # 比路费少，所以该劝退（数字用 taxi 实算：200m→¥15.00，600m→¥17.00）。
+    q_near = StoreQuote("N", "近店", distance_m=200, paid_fen=3680, baseline_fen=3880,
+                        travel=travel_cost(200, "taxi"))
+    q_far = StoreQuote("F", "远店", distance_m=600, paid_fen=3400, baseline_fen=3880,
+                       travel=travel_cost(600, "taxi"))
+    v_far = verdict([q_far, q_near])
+    check(
+        "比价-跑远省的不够路费时管家出言劝退",
+        "劝" in v_far and "挑近" in v_far,
+        v_far[-80:],
+    )
+
+    # 接口没返回 distance 的门店，不许被当成「0 米 / 路费 ¥0」。
+    # 综合成本里路费是最大的一项，填 0 等于把一家不知道有多远的店
+    # 送上「综合最划算」第一名 —— 而屏幕上同一段还写着「距离是真实值」。
+    q_unknown = StoreQuote("U", "距离未知的店", distance_m=0, paid_fen=3000,
+                           baseline_fen=3880, travel=travel_cost(0, "walk"),
+                           distance_unknown=True)
+    check(
+        "比价-距离未知的店不许参与综合排序（路费算不出来，总数就是假的）",
+        not q_unknown.comparable and q_unknown.reason_uncomparable == "距离未知",
+    )
+    _ranked_unknown = rank_stores([q_unknown, q_near])
+    check(
+        "比价-距离未知的店必须沉到最后，不能靠假路费排第一",
+        _ranked_unknown[-1].store_code == "U",
+        str([q.store_code for q in _ranked_unknown]),
+    )
+    check(
+        "比价-全是距离未知时要承认算不出哪家划算（而不是说没店有货）",
+        "算不出路费" in verdict([q_unknown]),
+        verdict([q_unknown])[:60],
+    )
+
+    # compare 的 --budget 是**总数**上限，不是每家上限。
+    # 旧写法 max(6, budget//n) 让 --budget 60 --top 20 实际打 120 次，
+    # 超了用户设的上限一倍，屏幕上却还印着「均分」。
+    from .cli import MIN_CALLS_PER_STORE, _split_budget
+
+    _worst = 0
+    for _b in (6, 20, 40, 60, 100, 200):
+        for _n in (1, 2, 5, 8, 20):
+            _per, _keep = _split_budget(_b, _n)
+            _worst = max(_worst, _per * _keep - _b)
+    check(
+        "比价-预算均分后总数不许超过 --budget（说好是总数上限）",
+        _worst <= 0,
+        f"最多超 {_worst} 次",
+    )
+    check(
+        "比价-预算不够就少比几家，不许每家都浅尝辄止",
+        _split_budget(60, 20)[1] == 10 and _split_budget(60, 20)[0] == 6,
+        str(_split_budget(60, 20)),
+    )
+    check(
+        "比价-预算充足时家家都要比到（不必砍店）",
+        _split_budget(600, 20) == (30, 20),
+        str(_split_budget(600, 20)),
     )
 
     # 打烊门店必须被排除（businessStatus 实测为布尔值，True=营业中）。
@@ -1001,6 +1069,32 @@ def run() -> int:
     text = render_almanac(day, "小的不编。")
     check("黄历-渲染不崩且含日期与时段", "麦门黄历" in text and "2026-10-11" in text and "午市" in text)
 
+    # 「减不动」不等于「没有券」。
+    # 一件商品明明有一张适用券、只是挂上去一分没省，如果只把「省到钱的」
+    # 记进 covered，它就会掉进 orphans 被印成「这张券池里没有它能用的券」——
+    # 把「减不动」说成「没有」。变异测试证明这条曾经完全没有防护。
+    _zero_menu = [
+        CartItem("Z1", "能省的商品", 1, 3000, 3000),
+        CartItem("Z2", "减不动的商品", 1, 2000, 2000),
+    ]
+    _zero_cps = [
+        Coupon("z1", "y1", "真能省的券", product_codes=frozenset({"Z1"})),
+        Coupon("z2", "y2", "挂了不减钱的券", product_codes=frozenset({"Z2"})),
+    ]
+
+    def _zero_oracle(items, assignment):
+        base = sum(i.unit_price_fen * i.quantity for i in items)
+        off = 500 if items[0].product_code == "Z1" and assignment.mapping else 0
+        return PriceResult(price_fen=base - off, original_fen=base)
+
+    _zero_day = build_almanac(
+        _zero_menu, _zero_cps, _zero_oracle, Budget(40), now=datetime(2026, 10, 11, 12)
+    )
+    check(
+        "黄历-有券但减不动的商品不许说成「没有它能用的券」（减不动≠没有）",
+        not any("没有它能用的券" in (r.note or "") for r in _zero_day["readings"]),
+        str([(r.product_name, r.note) for r in _zero_day["readings"]]),
+    )
     # 预算见底时必须收工，绝不偷偷超支
     tiny = build_almanac(menu, coupons, almanac_oracle, Budget(1), now=datetime(2026, 10, 11))
     check("黄历-预算为1时不炸且不乱报宜", tiny["probes"] <= 1, str(tiny["probes"]))
@@ -1032,7 +1126,22 @@ def run() -> int:
         f"{progress_bar(3, 6)}|{progress_bar(9, 12)}",
     )
     check("口吻-空账单有说法", "空" in butler_total(0, 0))
-    check("口吻-劝退敢说实话", "劝" in butler_warning(1500, 500))
+    # 劝退必须发生在「比次选省的钱 < 路费」时，而不是「券省的钱 < 路费」时。
+    # 后者是范畴错误：路费是出行方式的成本，跟用不用券无关，
+    # 同一单换个 --mode 就从"白跑"变"稳赚"，那句话没有意义。
+    check(
+        "口吻-跑远省的不够路费时敢劝退",
+        "劝" in butler_warning(1500, 500, alt_gap_fen=200, minutes=30)
+        and "挑近" in butler_warning(1500, 500, alt_gap_fen=200, minutes=30),
+    )
+    check(
+        "口吻-路费比券省的多但值得跑时不劝退",
+        "劝" not in butler_warning(1500, 500, alt_gap_fen=3000, minutes=30),
+    )
+    check(
+        "口吻-只报账不比价时_two笔分开说",
+        "各是各的账" in butler_warning(1500, 500) and "外卖" not in butler_warning(1500, 500),
+    )
     check("口吻-路费为零时是稳赚", "稳赚" in butler_warning(0, 500))
 
     entries = [
@@ -1296,6 +1405,95 @@ def run() -> int:
         f"K4 face={vs['K4'].face_fen} value={vs['K4'].value_fen}",
     )
 
+    # 这家店压根没有随单购档位时，不许拿「配上随单购后不再额外省钱」去否定一张好券。
+    # 踩过：min_no 取的是**跨商品**的最小值，于是 A 商品的 base 拿去跟 B 商品的
+    # 挂券价比，一家没有随单购的店里，一张真省 ¥3 的券被贴上了这句判词 ——
+    # 用一个压根没当班的功能去否定一张好券。
+    _nocard = audit_coupons(
+        demo.audit_oracle,
+        demo.AUDIT_MENU,
+        demo.AUDIT_COUPONS,
+        lambda cart: [None],
+        budget=None,
+        limit=10,
+    )
+    check(
+        "体检-没有随单购档位时不许说「不再额外省钱」（没这功能就别拿它否定券）",
+        all("不再额外省钱" not in (v.note or "") for v in _nocard)
+        and any(v.value_fen > 0 for v in _nocard),
+        str([(v.coupon.coupon_id, v.value_fen, v.note) for v in _nocard if v.note]),
+    )
+
+    # 上面那条只钉住了「有没有随单购档位」这一个开关，而且因为没有随单购档位，
+    # 「全局取最小」和「取最值钱那件自己」恰好算出同一个数 —— 抓不住。
+    # 必须造一个**有随单购档位**的世界，两种算法才会分岔：
+    #   · 商品 A（¥20）：不随单购时这张券真能省 ¥3；随单购档位券被互斥，省 0
+    #   · 商品 B（¥5） ：这张券一分减不动
+    # 「跨商品取最小」会把 B 的 ¥5 当成「不挂券的最低价」，
+    # 于是 A 上那张真省 ¥3 的券被贴上「配上随单购后不再额外省钱」——
+    # 用户看到的是「你别吃 A 改吃 B，所以这张券没用」，而这不是他问的事。
+    class _CardOpt:
+        """随单购档位替身：`_probe` 只用到 `signature()` 做缓存键。"""
+
+        def __init__(self, label: str):
+            self.label = label
+
+        def signature(self) -> str:
+            return self.label
+
+    _CARD_OPT = _CardOpt("麦金卡")
+
+    def _cross_oracle(items, a):
+        base = sum(i.unit_price_fen * i.quantity for i in items)
+        item = items[0]
+        if item.product_code != "EXP":
+            return PriceResult(price_fen=base, original_fen=base)  # 便宜货：减不动
+        # 贵的东西：随单购会跟这张券互斥，所以只有不随单购时才真省 ¥3
+        off = 300 if (a.mapping and a.with_order is None) else 0
+        return PriceResult(price_fen=base - off, original_fen=base)
+
+    _cross_menu = [
+        CartItem("EXP", "贵的东西", 1, 2000),
+        CartItem("CHEAP", "便宜货", 1, 500),
+    ]
+    _cross_cps = [Coupon("X1", "y1", "通用券", product_codes=frozenset())]
+    _cross_v = audit_coupons(
+        _cross_oracle,
+        _cross_menu,
+        _cross_cps,
+        lambda c: [None, _CARD_OPT],
+        budget=None,
+        limit=5,
+    )
+    check(
+        "体检-不许拿别的商品的最低价去否定这张券（跨商品比价是错的）",
+        _cross_v[0].value_fen == 300
+        and "不再额外省钱" not in (_cross_v[0].note or ""),
+        f"value={_cross_v[0].value_fen} note={_cross_v[0].note!r}",
+    )
+    # 反向钉住：同一件商品上，随单购那一档确实更便宜时，这句话**该说**。
+    # 只钉一边的话，「永远不许说这句话」也能绿 —— 那是另一种谎。
+    def _card_wins_oracle(items, a):
+        base = sum(i.unit_price_fen * i.quantity for i in items)
+        if a.with_order is not None:
+            return PriceResult(price_fen=1500, original_fen=base)  # 随单购档只要 ¥15
+        off = 300 if a.mapping else 0
+        return PriceResult(price_fen=base - off, original_fen=base)
+
+    _cw_v = audit_coupons(
+        _card_wins_oracle,
+        [CartItem("EXP", "贵的东西", 1, 2000)],
+        _cross_cps,
+        lambda c: [None, _CARD_OPT],
+        budget=None,
+        limit=5,
+    )
+    check(
+        "体检-随单购那一档确实更便宜时必须说清楚（不许只钉一边装绿）",
+        "不再额外省钱" in (_cw_v[0].note or ""),
+        f"value={_cw_v[0].value_fen} note={_cw_v[0].note!r}",
+    )
+
     text = render(
         list(vs.values()),
         store_name="演示餐厅",
@@ -1483,7 +1681,7 @@ def run() -> int:
         off = 400 if assignment.mapping else 0
         return PriceResult(price_fen=2000 - off, original_fen=2000, discount_fen=0)
 
-    _gap, _trunc = _probe(
+    _gap, _trunc, _min_base_any = _probe(
         _mutex_oracle,
         [demo.AUDIT_MENU[3]],
         [None, _Opt("麦金卡")],
@@ -1939,7 +2137,7 @@ def run() -> int:
     _all_hints: list[str] = []
     for _e in (
         McpFatalError(_mc._RATE_LIMIT_MSG, rate_limited=True),
-        McpFatalError(_mc._HTTP_UNAVAILABLE_MSG.format(code=502)),
+        McpFatalError(_mc._HTTP_UNAVAILABLE_MSG),
         McpError("麦当劳接口这次没有返回数据，稍后再试。"),
     ):
         _all_hints += _error_hint(_e)[1]
@@ -2079,6 +2277,137 @@ def run() -> int:
         repr(_snapshot_saved_note("C:\\Users\\张三\\.mcd-butler\\s.json")),
     )
 
+    # ── 「照着做」：算出答案不等于能下单，最后一公里得补上
+    from .cli import (
+        _condition_warning,
+        _distance_of,
+        _due_today_report,
+        _how_to_order,
+        _parse_server_datetime,
+    )
+
+    # 距离未知 ≠ 0 米。这一条的防护曾经是零（变异删掉传参，自检一条没红）。
+    check(
+        "比价-门店字典里没给 distance 就是「不知道」，不能填 0 冒充就在楼下",
+        _distance_of({}) == (0, False)
+        and _distance_of({"distance": 1200}) == (1200, True)
+        and _distance_of({"distance": "1200"}) == (0, False)
+        and _distance_of({"distance": True}) == (0, False),
+        f"{_distance_of({})} {_distance_of({'distance': '1200'})}",
+    )
+
+    # 到期提醒是唯一不可逆的事（券过期作废，错过就没了）。
+    # 「没查到」必须跟「没有今天到期的」说不同的话。
+    _due_ok = _due_today_report([{"title": "A", "valid_text": "今天", "due_today": True}], None)
+    _due_no = _due_today_report([{"title": "A", "valid_text": "x"}], None)
+    _due_err = _due_today_report([], RuntimeError("限流"))
+    check(
+        "管家-卡包没查到时必须明说（不能跟「没有今天到期的」混成一句）",
+        "没查到" in "".join(_due_err)
+        and "没法保证" in "".join(_due_err)
+        and "今天内到期" not in "".join(_due_err),
+        str(_due_err),
+    )
+    check(
+        "管家-有今天到期的券要点名，没有就说没有（三种情形三种说法）",
+        "今天内到期，不用就作废" in "".join(_due_ok)
+        and "A" in "".join(_due_ok)
+        and "没有今天到期的" in "".join(_due_no)
+        and _due_today_report([], None) == [],
+    )
+
+    # 条件价（标价 ¥29、不满足条件按 ¥57 结账）必须单独喊一声。
+    # 这是最刺痛的一条真发现，藏在行尾「← …」里等于没有。
+    _cond_cart = [
+        CartItem("P1", "四件套", 1, 2900, 5700),
+        CartItem("P2", "巨无霸", 1, 2500, 2500),
+    ]
+    _cond_txt = "".join(_condition_warning(_cond_cart))
+    check(
+        "管家-购物车里有条件价时必须单独告警（标价不是你能拿到的价）",
+        "条件价" in _cond_txt and "四件套" in _cond_txt and "¥29.00" in _cond_txt
+        and "¥57.00" in _cond_txt and "差 ¥28.00" in _cond_txt
+        and "巨无霸" not in _cond_txt,
+        _cond_txt,
+    )
+    check(
+        "管家-没有条件价时不要乱喊（没坑不能硬造一个）",
+        _condition_warning([CartItem("P2", "巨无霸", 1, 2500, 2500)]) == [],
+    )
+
+    # 上面这些断言验的是「函数本身对不对」。
+    # 但变异测试证明还有一类更隐蔽的失效：**函数是对的，压根没接进命令里** ——
+    # 把 print 那几行删掉，上面每条断言照样全绿，而用户永远看不到这段输出。
+    # 所以再钉一道总闸：这些新东西必须真的出现在对应命令的源码里。
+    import inspect
+
+    from .cli import run_advise, run_compare, run_optimize
+
+    _src_of = {
+        "optimize": inspect.getsource(run_optimize),
+        "advise": inspect.getsource(run_advise),
+        "compare": inspect.getsource(run_compare),
+    }
+    check(
+        "管家-照着做的步骤必须真的打印出来（optimize 与 advise 都要）",
+        "_how_to_order" in _src_of["optimize"] and "_how_to_order" in _src_of["advise"],
+    )
+    check(
+        "管家-条件价告警必须真的接进 optimize（不能只写个函数放那儿）",
+        "_condition_warning" in _src_of["optimize"],
+    )
+    check(
+        "管家-到期提醒必须走 _due_today_report（没查到和没有要分开说）",
+        "_due_today_report" in _src_of["advise"],
+    )
+    check(
+        "比价-距离未知必须真的传进 StoreQuote（否则又变成 0 米）",
+        "distance_unknown" in _src_of["compare"] and "_distance_of" in _src_of["compare"],
+    )
+
+    # 服务端时间必须一律转成不带时区的墙上时间：
+    # 留着 tzinfo 的话，naive−aware 相减直接 TypeError，而那个异常落在
+    # 外层 except 里被吞掉 —— 「今天到期」这条最要紧的提醒会静默消失。
+    _pdt = _parse_server_datetime("2026-10-13T04:24:00.123456+08:00")
+    check(
+        "时间-服务端时间必须剥掉时区（naive−aware 相减会让到期提醒静默消失）",
+        _pdt is not None and _pdt.tzinfo is None and _pdt.hour == 4,
+        repr(_pdt),
+    )
+    check(
+        "时间-带 GMT 后缀、带空格分隔的报文都要认（取墙上时间，不做时区换算）",
+        _parse_server_datetime("2026-10-13 04:24:00 GMT+08:00") == _pdt.replace(microsecond=0)
+        and _parse_server_datetime("2026-10-13T04:24:00Z") is not None
+        and _parse_server_datetime("不是时间") is None,
+        str(_parse_server_datetime("2026-10-13 04:24:00 GMT+08:00")),
+    )
+
+    _how_cart = [CartItem("A", "巨无霸", 1, 2500), CartItem("B", "中份薯条", 2, 1200)]
+    _how_cps = [Coupon("c0", "x0", "巨无霸立减 5 元"), Coupon("c1", "x1", "小食买一送一（薯条）")]
+    _how_best = Assignment(mapping={0: 0, 1: 1})
+    _how_txt = "\n".join(_how_to_order(_how_cart, _how_cps, _how_best))
+    check(
+        "管家-最优解必须给出「照着做」的步骤（加什么 / 每张券挂哪件）",
+        "加购" in _how_txt
+        and "巨无霸×1" in _how_txt
+        and "中份薯条×2" in _how_txt
+        and "巨无霸 ← 「巨无霸立减 5 元」" in _how_txt
+        and "中份薯条 ← 「小食买一送一（薯条）」" in _how_txt,
+        _how_txt,
+    )
+    check(
+        "管家-没搜到底时要提醒先别照着做（结论还会变）",
+        "还没搜到底" in "\n".join(
+            _how_to_order(_how_cart, _how_cps, _how_best, converged=False)
+        ),
+    )
+    check(
+        "管家-一件券都挂不上时要直说，不许编一步操作出来",
+        "没有券能挂" in "\n".join(
+            _how_to_order(_how_cart, _how_cps, Assignment(mapping={}))
+        ),
+    )
+
     # compare 表格：金额必须带 ¥，否则用户分不清 36.00 是元还是分
     class _Q15:
         store_name = "人民广场麦当劳餐厅（一号店）超长名字测试"
@@ -2086,6 +2415,8 @@ def run() -> int:
         paid_fen = 3600
         total_fen = 3800
         comparable = True
+        distance_unknown = False
+        reason_uncomparable = "缺货"
         missing: list[str] = []
 
         class travel:  # noqa: N801
@@ -2390,6 +2721,24 @@ def run() -> int:
     except McpError:
         _scale_ok = False
     check("算价-正常的分口径不能被量纲守卫误伤", _scale_ok)
+    # 这条曾经是凑数的：菜单合计当时恒为 0（守卫读了个不存在的 `price_fen`），
+    # 于是 `if menu_total > 0` 永远不成立，这里无论守卫在不在都绿。
+    # 现在改成直接断言守卫「真的会用菜单价去比」——价格离谱时必须报错。
+    _scale_high = False
+    try:
+        _assert_price_scale({"price": 5700 * 10}, [CartItem("Z", "测试", 1, 5700)])
+    except McpError:
+        _scale_high = True
+    check(
+        "算价-到手价高过菜单价太多时必须报错（守卫不能是永远不进的死代码）",
+        _scale_high,
+    )
+    # 反向钉住「菜单合计算得对」：把守卫实现改成读错字段，上面那条就会翻红。
+    check(
+        "算价-菜单合计要用真实字段算（读错字段会得到 0，守卫形同虚设）",
+        CartItem("Z", "测试", 2, 5700).effective_price_fen() * 2 == 11400
+        and not hasattr(CartItem("Z", "测试", 1, 5700), "price_fen"),
+    )
 
     # ── 12. 金额换算不能用 banker's rounding
     from .route import yuan_to_fen
@@ -2533,8 +2882,19 @@ def run() -> int:
         "随单购「麦金卡（随单购）」再减 ¥6.00",
         "到手 ¥6.00（省 ¥6.00，力度 50%）",
         "标的 ¥62.90 是「随单购麦金卡优惠」价",
-        "标着减 ¥8.00，实测只省 ¥5.00",
-        "¥10.00 的商品上不生效，¥25.00 的才生效",
+        # 「实测」改成「实际」：这段渲染代码 demo 也在用，而离线演示
+        # 一个请求都没发过 —— 说「实测」是假的。
+        "标着减 ¥8.00，实际只省 ¥5.00",
+        # demo 的「真实试算过」同样是假承诺：演示数据是仓库里写死的。
+        "怎么挂最省（演示数据上逐张试算，不是真实门店的价格）",
+        # 省下的钱里有随单购那一段，卡费还没扣 —— 必须单独挑出来说，
+        # 否则坏了本项目自己立的「不拿卡费给自己脸上贴金」。
+        "其中 ¥6.00 是随单购带来的，卡费还没扣进去（不随单购是 ¥42.00）",
+        # 「用了 N 张券」数的是挂上去的券，不是减了钱的券。
+        "（用了 0 张券（另有 1 张挂了但被随单购抵消，没减到钱） + 麦金卡（随单购））",
+        # 「试出来的门槛」已改为「门槛」：券面写了就直接念券面（满 20 减 3 元
+        # → 门槛 ¥20.00），不再花两次算价反推一个更粗的区间。契约随之更新。
+        "门槛：满 ¥20.00（券面写的）",
         # 券名也算契约：README 里贴的券名和 demo_data.py 里的必须一致，
         # 否则读者照着 README 跑 demo 会看到另一张券。
         "中杯可乐立减 3 元",
@@ -2549,18 +2909,24 @@ def run() -> int:
         "挂「中杯可乐立减 3 元」→ 到手 ¥6.00（省 ¥3.00，力度 33%）",
         "「麦旋风满 20 减 1 元」挂券反而贵 ¥1.00",
         "不满足条件要按 ¥122.50 结账，差 ¥59.60",
-        "（每一条宜忌都是真的算过价出来的）",
+        # 离线演示里说「真的算过价」是假承诺；同时必须交代
+        # 「时段被钉在 12:00」这个为可复现做的妥协。
+        "演示把时间钉在当天 12:00",
         "券包体检 · 演示餐厅·二号店（另一套券池）",
         "在售 4 件 · 券池 5 张 · 本次体检 5 张",
         "健康度 ████████████░░░░░░░░ 60%",
+        # 光给一个百分比，用户只能猜分母是什么。定义必须上屏。
+        "健康度 = 真能省钱的 3 张 ÷ 体检到的 5 张",
         "挂「板烧鸡腿堡」 ¥18.00 → ¥14.00",
-        "试了 2 件适用商品，接口一分没减",
+        "门槛：满 ¥15.00（券面写的），便宜的东西够不到",
         "今天有 2 个活动",
         "超值𝟡.𝟡元早餐两件套陪你开工啦　¥9.90",
         "学生专属！49元150天麦金学期卡　¥49.00",
         "接下来 7 天，1 天有今天吃不到的新活动：",
         "麦麦夜市回归",
         "价格取自活动文案自己写的数字；没写的显示「未标价」，不猜。",
+        # 「不急可以等这天」是替用户判断紧迫性 —— 等不等由他自己定。
+        "等不等你自己定",
     ]
     _missing_demo = [s for s in _must_appear if s not in _demo_out]
     _missing_doc = [s for s in _must_appear if s not in _readme]
@@ -2725,11 +3091,14 @@ def run() -> int:
         str([sum(p[1]["protein"] for p in c) for c in _nres]),
     )
 
-    # ── N12：时段是左闭右开，边界整点不能被划到隔壁时段
+    # ── N12：时段是左闭右开，边界不能被划到隔壁时段。
+    # 早餐 10:30 才收摊，所以 10:15 必须还算早市 —— 早先按整点切，
+    # 10:15 就被划进午市，一张还能用的早餐券被说成过了时段。
     check(
-        "黄历-时段边界是左闭右开（10 点已是午市、5 点已是早市、21 点已是夜宵）",
-        period_of(datetime(2026, 10, 11, 10))[0] == "午市"
-        and period_of(datetime(2026, 10, 11, 5))[0] == "早市"
+        "黄历-时段边界左闭右开且早餐按 10:30 收摊",
+        period_of(datetime(2026, 10, 11, 5))[0] == "早市"
+        and period_of(datetime(2026, 10, 11, 10, 15))[0] == "早市"
+        and period_of(datetime(2026, 10, 11, 10, 30))[0] == "午市"
         and period_of(datetime(2026, 10, 11, 14))[0] == "下午茶"
         and period_of(datetime(2026, 10, 11, 17))[0] == "晚市"
         and period_of(datetime(2026, 10, 11, 21))[0] == "夜宵"
@@ -2761,7 +3130,8 @@ def run() -> int:
     )
 
     # ── N15：已领取的券不能算成待领取（--claim 会重复领）
-    from .assets import build_report
+    from .assets import build_report, points_advice
+    from .delivery import describe, mask_address
 
     class _FakeAssetsClient:
         def call_json(self, tool, arguments=None):
@@ -2783,6 +3153,107 @@ def run() -> int:
         "资产-已领取的券不能算成待领取（--claim 会重复领一次）",
         "· 已领取" in _rep and "待领取" not in _rep,
         _rep,
+    )
+
+    # ── 积分去向：报「您有 N 分」却不说这 N 分能干嘛，是在制造焦虑；
+    #    但为了显得有用而列出一堆其实要另付现金的商品，是骗人。
+    _pts = {"currency": "麦享会积分", "available": 9.9,
+            "expire_this_month": 0, "expire_next_month": 0}
+    _lot = {"name": "麦麦积分抽奖", "status": "进行中", "draw_point": 24,
+            "available": 9.9, "eligible": False, "reason": "积分不足"}
+    check(
+        "积分-抽不起时如实说还差多少",
+        "还差 14.1" in "".join(points_advice(_pts, _lot, {})),
+    )
+    check(
+        "积分-商城没有纯兑换项时不许编兑换清单",
+        "没有一件是纯积分兑换"
+        in "".join(points_advice(_pts, _lot, {"total": 50, "exchangeable": []})),
+    )
+    _mall = {
+        "total": 50,
+        "exchangeable": [
+            {"name": "1积分应援", "point": 1, "price": 0, "cat": ""},
+            {"name": "香芋派", "point": 50, "price": 0, "cat": ""},
+        ],
+    }
+    _ad = "".join(points_advice(_pts, _lot, _mall))
+    check(
+        "积分-要区分「换得起」和「还差多少」",
+        "换得起" in _ad and "✅" in _ad and "再攒 40.1" in _ad,
+        _ad[:120],
+    )
+    check(
+        "积分-够抽时报得出能抽几次",
+        "够抽" in "".join(
+            points_advice({"currency": "分", "available": 100,
+                           "expire_this_month": 0, "expire_next_month": 0},
+                          {"name": "抽", "status": "进行中", "draw_point": 24,
+                           "available": 100, "eligible": True, "reason": ""}, {})
+        ),
+    )
+
+    # ── 段位不能刷：测算重复记一百次也不许涨，真实订单还得按指纹去重。
+    # 早先段位按「累计省下」算，而 optimize 默认每次都记账 ——
+    # 于是同一单跑 15 次就是「省了 ¥94.50、麦门信徒」，发出去是张假成绩单。
+    _many = [{"baseline_fen": 5000, "paid_fen": 4400, "kind": "estimate"}] * 100
+    _s_many = summarize(_many)
+    check(
+        "段位-测算刷不出来（重复一百次仍是路人）",
+        rank_of(_s_many["real_paid_fen"])["title"] == "麦门路人"
+        and _s_many["real_orders"] == 0,
+        f"{_s_many['real_paid_fen']} / {rank_of(_s_many['real_paid_fen'])['title']}",
+    )
+    check(
+        "段位-真实成交按实付累计（不编裸买价）",
+        rank_of(summarize([{"paid_fen": 6000, "baseline_fen": 0,
+                            "kind": "order"}])["real_paid_fen"])["title"] == "麦门信徒",
+        str(summarize([{"paid_fen": 6000, "baseline_fen": 0, "kind": "order"}])["real_paid_fen"]),
+    )
+    # 订单指纹必须是**哈希**而不是订单号原文：订单号能在客服系统反查手机号
+    # 与支付流水，落到磁盘上等于把整单隐私写进文件。
+    _fake_order = {
+        "orderNo": "20261011abcd1234",
+        "storeCode": "S1",
+        "realTotalAmount": "38.00",
+    }
+    _key = hashlib.sha256(
+        str(_fake_order["orderNo"]).encode("utf-8")
+    ).hexdigest()[:16]
+    _entry = entry_from_cart(
+        cart=[], paid_fen=3800, baseline_fen=0, discount_fen=0,
+        store_code="S1", store_name="", city="", keyword="",
+        coupon_titles=[], with_order_label="", kind="order", order_key=_key,
+    )
+    check(
+        "账本-真实订单只存订单号哈希（不落原文，反查不到手机号）",
+        _entry["order_key"] == _key
+        and "20261011abcd1234" not in json.dumps(_entry, ensure_ascii=False),
+        _entry["order_key"],
+    )
+
+    # ── 外送：收货地址是能定位到一个人的数据，输出必须脱敏；
+    #    没有地址时只能说「算不了」，不许拿估算冒充。
+    check(
+        "外送-地址脱敏要打掉门牌尾号",
+        mask_address("上海市人民广场小区3号楼1502室").count("*") >= 4,
+        mask_address("上海市人民广场小区3号楼1502室"),
+    )
+
+    class _FakeDeliveryClient:
+        def call_json(self, tool, arguments=None):
+            if tool == "delivery-query-addresses":
+                return {"data": {"addresses": []}}
+            return {"data": {}}
+
+        def call(self, tool, arguments=None):
+            return ""
+
+    _dl = "\n".join(describe(_FakeDeliveryClient()))
+    check(
+        "外送-没有收货地址时如实说算不了且不编价",
+        "收货地址：0 个" in _dl and "算不出" in _dl and "不拿" in _dl,
+        _dl[:80],
     )
 
     # ── N17：对调邻域必须校验「对调后的券适用于对调后的商品」
@@ -3030,6 +3501,51 @@ def run() -> int:
         str([(x[0].product_code, x[2]) for x in _sp_got]),
     )
 
+    # ── R7：拆开的两单不许把同一张券用两次
+    # 上面那条只盯「< 放宽成 <=」，对更严重的虚报完全失明：
+    # 旧实现把完整券池分别交给两单各跑一遍，两边都挑中同一张券，
+    # 报出「拆开省 ¥5.00」——那 5 块需要同一张券核销两次，客人根本拿不到。
+    # 下面构造的语义是「每单最多用 1 张券」，正好是真实场景里最常见的限制。
+    _sp_disc = {0: 500, 1: 500}  # 券下标 -> 能减多少
+
+    def _sp_one_per_order(items, a):
+        total = sum(i.unit_price_fen * i.quantity for i in items)
+        best = 0
+        for ci in a.mapping.values():
+            best = max(best, _sp_disc.get(ci, 0))
+        return PriceResult(price_fen=total - best, original_fen=0)
+
+    _sp_pool = [Coupon("C0", "X0", "满减券甲"), Coupon("C1", "X1", "满减券乙")]
+    _sp_whole = 3500  # 整单：两件 ¥40，每单只能用 1 张券 → ¥35
+    # 只有一张券时：拆开也不会更便宜（第二单没券可用）
+    _sp_one = _ins6.split_suggestions(
+        _sp_one_per_order,
+        _sp_cart,
+        [_sp_pool[0]],
+        lambda c: [None],
+        whole_fen=_sp_whole,
+        per_call_budget=8,
+    )
+    check(
+        "洞察-拆单不许把同一张券在两单里各用一次（报出来的价必须是真能买到的）",
+        _sp_one == [],
+        str([(x[0].product_code, x[1], x[2]) for x in _sp_one]),
+    )
+    # 两张券时：拆开确实能各用一张，这个收益是真的，必须报出来
+    _sp_two = _ins6.split_suggestions(
+        _sp_one_per_order,
+        _sp_cart,
+        _sp_pool,
+        lambda c: [None],
+        whole_fen=_sp_whole,
+        per_call_budget=8,
+    )
+    check(
+        "洞察-真能靠拆单多核销一张券时必须报出来（不许为了保守把真收益也砍掉）",
+        _sp_two and all(g > 0 for _, _, g in _sp_two) and _sp_two[0][1] == 3000,
+        str([(x[0].product_code, x[1], x[2]) for x in _sp_two]),
+    )
+
     # ── R5：体检候选的去重键必须带价格
     # 同一个 productCode 有不同规格/不同价时，只按 code 去重会少试一件，
     # 而那件恰好可能够到门槛 —— 一张好券被静默判成废券。
@@ -3095,6 +3611,37 @@ def run() -> int:
     _bp = _first_price("超值套餐大放送", "限时 9.9 元起，另有 14.9 元可选")
     check("日历-正文兜底取价取最低价（报告里写的是「最低」）", _bp == 9.9, str(_bp))
 
+    # ── R11：摊销价在「标题里没有数字」时也不许漏进来
+    # 上面那条「49元150天麦金学期卡 → 49」靠的是标题里有数字；
+    # 标题一旦没数字，正文兜底就会把「每天低至 0.33 元」原样报成活动价。
+    check(
+        "日历-标题没数字时，正文里的摊销价也不许当活动价",
+        _first_price("麦金学期卡限时开售", "每天低至 0.33 元，一卡在手") is None,
+        str(_first_price("麦金学期卡限时开售", "每天低至 0.33 元，一卡在手")),
+    )
+    # ── R12：标题取价取「第一个」不是「最小的」
+    # 「双人餐 99元（含两份各 49 元）」取 min 会得到 49 —— 那是拆开的单价，
+    # 不是这一份的卖价。屏幕上会印「今天最低 ¥49.00」，而实际要付 ¥99。
+    check(
+        "日历-标题里有多个价时取第一个而不是最小的（卖价先出现）",
+        _first_price("双人餐 99 元（含两份各 49 元）") == 99.0,
+        str(_first_price("双人餐 99 元（含两份各 49 元）")),
+    )
+    # 反向钉住：别为了挡摊销价把真卖价也一起砍了。
+    # 「每天 10 点起 9.9 元」的 9.9 是真价 —— 句首那个「每天」说的是时间不是钱。
+    check(
+        "日历-挡摊销价不能误伤真卖价（「每天 10 点起 9.9 元」仍是 9.9）",
+        _first_price("早餐活动", "每天 10 点起 9.9 元抢麦旋风") == 9.9,
+        str(_first_price("早餐活动", "每天 10 点起 9.9 元抢麦旋风")),
+    )
+    # 上面那条只覆盖了「正文兜底」。标题里的摊销价同样要抹 ——
+    # 变异测试证明：只抹正文、不抹标题，自检一条都不会红。
+    check(
+        "日历-标题里的摊销价也要抹（「每天低至 0.33 元」不是价签）",
+        _first_price("每天低至 0.33 元限时开售") is None,
+        str(_first_price("每天低至 0.33 元限时开售")),
+    )
+
     # ── R10：一条营养数据只能配一个菜
     # 营养表没有 productCode，只能按名字模糊配对；若允许同一条数据被多个菜串用，
     # 「巨无霸套餐」会拿「巨无霸」的营养数据再算一遍，热量/蛋白全是假的。
@@ -3110,6 +3657,19 @@ def run() -> int:
         "营养-一条营养数据只能配一个菜（不能串味重复计数）",
         len(_mm_got) == 1 and _mm_got[0][0].product_code == "M1",
         str([p[0].product_code for p in _mm_got]),
+    )
+    # 上面这条在「只认精确匹配」之后已经**拦不住**去重被删掉了：
+    # 「巨无霸套餐」压根匹配不上，结果天然只有 1 条。
+    # 必须造两个归一化后**同名的不同菜品**（菜单里真有这种：品名差个空格/商标号），
+    # 去重失效时它们会共用同一条营养数据，热量被算两遍。
+    _mm_dup = match_menu(
+        [CartItem("M1", "巨无霸", 1, 2500), CartItem("M2", "巨 无 霸", 1, 2500)],
+        _mm_nut,
+    )
+    check(
+        "营养-归一化后同名的两件菜只能配一次（去重键不能只留原来的菜名）",
+        len(_mm_dup) == 1 and _mm_dup[0][0].product_code == "M1",
+        str([p[0].product_code for p in _mm_dup]),
     )
 
     # ── R11：`薯条x2` 的数量必须真的进购物车

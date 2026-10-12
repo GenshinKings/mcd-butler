@@ -247,7 +247,11 @@ class McdMcpClient:
                     msg = _RATE_LIMIT_MSG
                     limited = True
                 else:
-                    msg = _HTTP_UNAVAILABLE_MSG.format(code=exc.code)
+                    # 这里曾经写 `.format(code=exc.code)`，而这条文案里根本没有
+                    # 占位符 —— format 静默空转，看起来在按 HTTP 码给不同文案，
+                    # 实际一次都没生效。HTTP 码不上屏（对消费者是内部术语），
+                    # 所以直接用原文案，别留一个骗人的 format。
+                    msg = _HTTP_UNAVAILABLE_MSG
                     limited = False
                 last_exc = McpFatalError(msg, detail, rate_limited=limited)
                 if not retryable or attempt >= self.max_retries:

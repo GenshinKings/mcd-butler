@@ -248,7 +248,12 @@ def _assert_price_scale(data: dict, items: Sequence[CartItem]) -> None:
     # 上界只做很松的兜底（菜单价 ×3 + 100 元），不追求精确：
     # 随单购会把卡费算进原价，精确上界容易误伤。这里的目的是挡住
     # 「量纲错了导致价格离谱」这一类，不是挡住贵的订单。
-    menu_total = sum(getattr(it, "price_fen", 0) or 0 for it in items)
+    # 字段必须写对：这里曾经写成 `getattr(it, "price_fen", 0)`，而 CartItem
+    # 根本没有 `price_fen`（它叫 `unit_price_fen` / `list_price_fen`）——
+    # getattr 的默认值让菜单合计恒为 0，`menu_total > 0` 永远不成立，
+    # 整段守卫变成一次都不会执行的死代码，而且从外面完全看不出来。
+    # 所以这里直接用真实属性，写错了就当场 AttributeError，不会假装通过。
+    menu_total = sum(it.effective_price_fen() * it.quantity for it in items)
     if menu_total > 0 and price > menu_total * 3 + 10_000:
         raise McpError(
             f"麦当劳算价接口这次报了 ¥{price / 100:.2f}，"

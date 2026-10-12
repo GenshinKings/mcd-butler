@@ -87,36 +87,50 @@ def _float(v) -> float:
         return 0.0
 
 
+def _canon(s: str) -> str:
+    """品名归一化：去商标符号与所有空白。
+
+    只做这两件事 —— 不做「套餐/件套」后缀剥离。
+    见 match_menu 里那条血的教训：一旦允许跨单品/套餐匹配，
+    单品会拿到套餐的热量、套餐会拿到单品的热量，两个方向都错。
+    """
+    for ch in "™®©Ⓡ":
+        s = s.replace(ch, "")
+    return re.sub(r"\s+", "", s or "")
+
+
 def match_menu(menu: list, nutrition: dict[str, dict]) -> list[tuple]:
     """把菜单和营养表按品名对上。
 
-    没有 productCode 可用，只能按名字匹配。先精确，再退到「一方包含另一方」。
-    匹配不上就丢掉 —— 宁可少选几个，也不能拿错误的营养数据去给建议。
+    只认**归一化后完全相等**的名字，不再做「一方包含另一方」的回退。
+
+    为什么砍掉子串回退（实测踩过的坑）：
+    营养表里有「板烧鸡腿堡套餐」，菜单里是「板烧鸡腿堡」——
+    子串匹配让单品拿到了套餐（含薯条可乐）的热量 640kcal；
+    反过来「麦香鸡套餐」又匹配到「麦香鸡」，套餐拿到单品的 380kcal。
+    两个方向都是错的，而且命中哪个取决于 dict 的插入顺序。
+
+    热量建议是拿给减脂人群看的，错 260kcal 等于把人往反方向带。
+    匹配不上就丢掉 —— 宁可少几件，也不能拿错误的营养数据给建议。
     """
     exact: list[tuple] = []
-    by_name = {n: v for n, v in nutrition.items()}
+    by_canon: dict[str, tuple[str, dict]] = {}
+    for n, v in nutrition.items():
+        by_canon.setdefault(_canon(n), (n, v))
     used: set[str] = set()
 
     for item in menu:
         nm = (item.name or "").strip()
-        if nm in by_name:
-            exact.append((item, by_name[nm]))
-            used.add(nm)
-
-    for item in menu:
-        nm = (item.name or "").strip()
-        if nm in used or not nm:
+        if not nm:
             continue
-        hit = None
-        for nname, val in by_name.items():
-            if nname in used:
-                continue
-            if nm in nname or nname in nm:
-                hit = (nname, val)
-                break
-        if hit:
-            exact.append((item, hit[1]))
-            used.add(hit[0])
+        hit = by_canon.get(_canon(nm))
+        if hit is None:
+            continue
+        canon_key = _canon(nm)
+        if canon_key in used:
+            continue
+        exact.append((item, hit[1]))
+        used.add(canon_key)
     return exact
 
 

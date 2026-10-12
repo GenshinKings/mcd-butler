@@ -87,6 +87,25 @@ _STATUS_LABEL = {
 _FACE_RE = re.compile(r"(?:立减|满减|减|省|-)\s*(\d+(?:\.\d+)?)\s*元")
 
 
+# 券面写的「满 X」门槛。读不出来返回 0（表示「券面没写」）。
+# 两种写法都要认：「满 20 元」「满 20 减 3 元」。
+# 但单位必须锁死在「元」或「减」上 —— 「满 2 件减 5 元」是件数门槛，
+# 拿 2 当金额会报出一个 ¥2.00 的假门槛。
+_THRESHOLD_RES = (
+    re.compile(r"满\s*(\d+(?:\.\d+)?)\s*元"),
+    re.compile(r"满\s*(\d+(?:\.\d+)?)\s*减"),
+)
+
+
+def threshold_on_face(title: str) -> int:
+    """从券标题读门槛（分）。读不出返回 0 —— 0 表示「券面没写」，不是「无门槛」。"""
+    for rx in _THRESHOLD_RES:
+        m = rx.search(title or "")
+        if m:
+            return to_fen(m.group(1))
+    return 0
+
+
 def face_value_fen(title: str) -> int:
     """从券标题读面额（分）。
 
@@ -133,18 +152,26 @@ class Verdict:
         return self.face_fen - self.value_fen
 
     def threshold_note(self) -> str:
-        """把试出来的门槛区间说成人话。
+        """说清这张券的门槛。
 
-        接口从不告诉你门槛是多少，但**在什么价位生效、在什么价位不生效**
-        是可以试出来的：拿便宜的挂一次、拿贵的挂一次，中间就是门槛所在的区间。
+        券面写得明白就**直接用券面上的数字**：标题里「满 20 减 3 元」
+        已经把门槛印出来了，再花两次算价去"试"出一个更粗的区间
+        （¥10 不生效、¥25 才生效 → 门槛在中间），是自嗨 ——
+        用户拿到的是一个比券面更模糊的答案，还白等两次接口。
+
+        只有券面上读不出门槛时，才把试出来的区间报出来，
+        并且明确标注这是试出来的、不是券面写的。
         """
+        wrote = threshold_on_face(self.coupon.title)
+        if wrote:
+            return f"门槛：满 ¥{yuan(wrote)}（券面写的）"
         if self.works_from_fen <= 0 or self.blocked_fen <= 0:
             return ""
         if self.blocked_fen >= self.works_from_fen:
             return ""
         return (
-            f"¥{yuan(self.blocked_fen)} 的商品上不生效，"
-            f"¥{yuan(self.works_from_fen)} 的才生效 —— 门槛大概卡在中间"
+            f"券面没写门槛，小的试出来：¥{yuan(self.blocked_fen)} 上不生效、"
+            f"¥{yuan(self.works_from_fen)} 上才生效 —— 门槛在这两者之间"
         )
 
 
@@ -214,10 +241,11 @@ def _probe(
       · 但它配上麦金卡后不再额外省钱，因为麦金卡那一档更便宜
     混成一个"废券"，用户会以为这张券是假的；其实只是有更优的选择。
 
-    返回 (最大值结果, 是否被预算截断)。
+    返回 (最大值结果, 是否被预算截断, 所有档位里不挂券的最低价)。
     """
     best: tuple[int, int, int, Any] | None = None
     truncated = False
+    min_base_any: int | None = None
     for opt in options:
         if budget is not None and budget.remaining <= 0:
             truncated = True
@@ -257,7 +285,14 @@ def _probe(
         gap = base - with_c
         if best is None or gap > best[0]:
             best = (gap, base, with_c, opt)
-    return best, truncated
+        # 顺手记录「这件商品在所有档位里不挂券能做到多低」。
+        # 只有拿到这个数，才能回答「券配上随单购后还额外省钱吗」——
+        # 之前拿别的商品的 base 去凑这个最小值，跨商品比价，
+        # 结果是一家店压根没有随单购时，一张真省 ¥3 的券被说成
+        # 「配上随单购后不再额外省钱」。
+        if min_base_any is None or base < min_base_any:
+            min_base_any = base
+    return best, truncated, min_base_any
 
 
 def _sort_key(pair: tuple[int, Coupon]) -> tuple[int, str, int]:
@@ -335,8 +370,17 @@ def audit_coupons(
         probed_ok = 0
         item_failed = 0
         truncated_any = False
-        min_no = None   # 所有试过的档位里，不挂券的最低价
-        min_with = None  # 所有试过的档位里，挂上券的最低价
+        # 「配上随单购后还额外省钱吗」要拿**最值钱那件商品自己**的
+        # 各档位最低价来比。三个理由：
+        #   1. 跨商品取全局最小值是错的（拿一件便宜货的价格去否定另一件商品上
+        #      真能省 ¥3 的券，等于答非所问：用户问的是这张券值多少钱）。
+        #   2. 拿「最优档位的 base」也不够：券和随单购可能互斥，
+        #      随单购那一档不挂券可能反而更便宜。
+        #   3. 这个判据已经蕴含了「这家店得真有随单购档位」——
+        #      只有一个档位时 min_base_any 就等于那个档位的 base，
+        #      而 best_price_fen = base - value < base，条件天然不成立。
+        #      所以不需要再单独判一次 has_card_opt（那会是永远为真的死条件）。
+        best_min_base: int | None = None
         for item in cands:
             if budget is not None and budget.remaining <= 0:
                 truncated_any = True
@@ -351,7 +395,7 @@ def audit_coupons(
             # 缓存键必须带上价格：同一个 productCode 若有不同规格/价格，
             # 只按 code 缓存会串味（实测会把好券判成废券）。
             key = (item.product_code, item.effective_price_fen())
-            best, truncated = _probe(
+            best, truncated, min_base_any = _probe(
                 oracle, cart, options, orig_idx, budget, counter, base_cache, key, errors
             )
             if truncated:
@@ -365,8 +409,6 @@ def audit_coupons(
             probed_ok += 1
 
             value, base_fen, with_fen, _opt = best
-            min_no = base_fen if min_no is None else min(min_no, base_fen)
-            min_with = with_fen if min_with is None else min(min_with, with_fen)
 
             price = item.effective_price_fen()
             if value > 0:
@@ -380,6 +422,11 @@ def audit_coupons(
                 v.best_item = item
                 v.baseline_fen = base_fen
                 v.best_price_fen = with_fen
+                # 记下**这一件**商品在各档位里不挂券的最低价。
+                # 不能拿别的商品的价来凑：那件商品可能根本不是你想吃的，
+                # 用它当基准等于说「你别吃 A 改吃 B，所以这张券没用」——
+                # 可用户问的是「这张券值多少钱」，不是「今天最便宜能花多少」。
+                best_min_base = min_base_any
 
         v.calls = counter[0] - before
         # probed 必须是**成功算出价**的件数，不能是候选件数：
@@ -401,7 +448,7 @@ def audit_coupons(
             v.status = WORTH
             # 券本身有效力，但搭上随单购后不再额外省钱 —— 这两件事必须分开说，
             # 否则用户会以为券是假的，其实是随单购那一档更便宜。
-            if min_no is not None and min_with is not None and min_with >= min_no:
+            if best_min_base is not None and v.best_price_fen >= best_min_base:
                 v.note = "配上随单购后它不再额外省钱（随单购那一档本身就更低）"
         elif v.value_fen > 0:
             # 减了但没到"值得为它凑单"的程度。
@@ -507,6 +554,13 @@ def render(
     ratio = (worth / counted) if counted else 0.0
     suffix = f"（{unknown} 张没查出来，按未通过计入）" if unknown else ""
     lines.append(f"  健康度 {_bar(ratio)} {ratio * 100:.0f}%{suffix}")
+    # 分母是什么必须写出来。屏幕上只有一个百分比时，用户只能去猜
+    # 「60% 到底是在说谁」——而「这家店压根不卖你这张券能挂的东西」也算它
+    # 不健康，这一点没人猜得到。
+    lines.append(
+        f"  （健康度 = 真能省钱的 {worth} 张 ÷ 体检到的 {counted} 张；"
+        f"挂了白挂和在这家店无处可挂都算不健康）"
+    )
     if counted and counted < 3:
         # 券池只有 1~2 张时，健康度不是"你的券很健康"，而是"样本太少"。
         # 把接口现状讲明白，它就成了洞察而不是缺陷。
@@ -528,10 +582,13 @@ def render(
                 )
         lines.append("")
 
-    # ── 试出来的门槛：接口从不说门槛在哪，只能靠「便宜的挂不上、贵的挂得上」反推
+    # ── 门槛：券面写了就直接念券面，券面没写才把试出来的区间报出来。
+    # 标题里「满 20 减 3 元」已经把门槛印在脸上了，再花两次算价去反推一个
+    # 更粗的区间（¥10 不生效、¥25 才生效）纯属自嗨 —— 用户拿到的是
+    # 一个比券面更模糊的答案，还白等两次接口。
     thresholds = [v for v in verdicts if v.threshold_note()]
     if thresholds:
-        lines.extend(["", "  ── 试出来的门槛"])
+        lines.extend(["", "  ── 门槛"])
         for v in thresholds:
             lines.append(f"  · {v.coupon.title}\n      {v.threshold_note()}")
         lines.append("")
@@ -547,7 +604,10 @@ def render(
         for v in sorted(boasters, key=lambda v: -v.gap_fen):
             lines.append(
                 f"  ! {v.coupon.title}　标着减 ¥{yuan(v.face_fen)}，"
-                f"实测只省 ¥{yuan(v.value_fen)}"
+                # 「实测」在**离线演示**里是假的（一个请求都没发过），
+                # 而这同一段渲染代码 demo 也在用。改成「实际」，
+                # 真跑是算价接口实际算出来的，演示是演示数据上算出来的，都成立。
+                f"实际只省 ¥{yuan(v.value_fen)}"
             )
         lines.append("")
 

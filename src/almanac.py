@@ -31,21 +31,29 @@ from .mcd_client import McpFatalError
 # ------------------------------------------------------------------ 时段
 # 麦当劳的券大量是时段券（早餐/夜宵），黄历必须先把"现在几点"说清楚，
 # 否则推荐一张 10:31 就失效的早餐券，等于骗人。
+# 边界用「当天 0 点起的分钟数」，因为早餐不是整点结束的。
+# 麦当劳早餐 10:30 收摊：早先这里写的是 (5, 10) 按整点切，
+# 于是 10:15 时黄历第一行已经印「午市」，而早餐券其实还能再用 15 分钟 ——
+# 一张还能用的券被说成过了时段，比不提醒更坑人。
+def _m(h: int, minute: int = 0) -> int:
+    return h * 60 + minute
+
+
 PERIODS: list[tuple[int, int, str, str]] = [
-    (5, 10, "早市", "早餐券在这个点还能用，过 10:30 就作废"),
-    (10, 14, "午市", "正餐时段，套餐券最全"),
-    (14, 17, "下午茶", "甜品饮料券的主场，正餐券多半歇着"),
-    (17, 21, "晚市", "全天券都能用，人最多"),
-    (21, 24, "夜宵", "夜宵券专场，白天的好券反而用不了"),
-    (0, 5, "深夜", "多数门店已打烊，先确认营业时间"),
+    (_m(5), _m(10, 30), "早市", "早餐券在这个点还能用，过 10:30 就作废"),
+    (_m(10, 30), _m(14), "午市", "正餐时段，套餐券最全"),
+    (_m(14), _m(17), "下午茶", "甜品饮料券的主场，正餐券多半歇着"),
+    (_m(17), _m(21), "晚市", "全天券都能用，人最多"),
+    (_m(21), _m(24), "夜宵", "夜宵券专场，白天的好券反而用不了"),
+    (_m(0), _m(5), "深夜", "多数门店已打烊，先确认营业时间"),
 ]
 
 
 def period_of(now: datetime) -> tuple[str, str]:
     """返回（时段名，提示语）。"""
-    h = now.hour
+    mins = now.hour * 60 + now.minute
     for start, end, name, tip in PERIODS:
-        if start <= h < end:
+        if start <= mins < end:
             return name, tip
     return "深夜", PERIODS[-1][3]
 
@@ -155,7 +163,8 @@ def build(
     probes = 0
     positives: list[Reading] = []
     traps: list[Reading] = []  # 挂了反而更贵的，这是最值钱的洞见
-    covered: set[str] = set()
+    covered: set[str] = set()  # 真正省到钱的（挂上反而更贵的也算进去了）
+    probed_codes: set[str] = set()  # 挂上券算过价的（省没省到都算）
 
     for ci, coupon in enumerate(coupons):
         if budget.remaining <= 1 or probes >= max_probes:
@@ -179,6 +188,11 @@ def build(
                 continue
 
             saved = base_fen - used.price_fen
+            # 只要这张券真的挂上去算过价，这件商品就是「试过」，
+            # 哪怕一分没省。下面「忌：没券可挂的贵价单品」用的是这个集合 ——
+            # 用错成「省到钱的」集合，会把一件明明有适用券、只是没减动的东西
+            # 说成「没有它能用的券」——把「减不动」说成「没有」。
+            probed_codes.add(code)
             note = expiry_note(coupon.valid_until, now)
             reading = Reading(
                 kind="宜" if saved > 0 else ("忌" if saved < 0 else "平"),
@@ -239,7 +253,7 @@ def build(
         orphans = [
             i
             for i in menu
-            if i.product_code not in covered
+            if i.product_code not in probed_codes
             and i.product_code not in cond_codes  # 已作为条件价陷阱列出过，别重复
             and i.list_price_fen > 0
         ]

@@ -55,6 +55,28 @@ def _strip_discounts(text: str) -> str:
     """把文本里的门槛和优惠额挖掉，只留下可能是卖价的数字。"""
     return _DISCOUNT_RE.sub(" ", text or "")
 
+
+# 摊销价的标志词：「每天低至 0.33 元」是把 49 元摊到 150 天上的营销数字，
+# 不是结账要付的钱。它跟「原价」「门槛」一样，一律不认。
+# 只抹「摊销词 + 紧跟的一个价」，不抹整句：
+# 「每天 10 点起 9.9 元抢麦旋风」里的 9.9 是真卖价，不能因为句首有「每天」就砍掉。
+# 所以用 `{0,8}` 限定摊销词与价之间最多 8 个字 —— 超过 8 个字的就不是「每天 X 元」了。
+_AMORTIZED_RE = re.compile(
+    r"(?:每天|每日|每份|每周|每月|每年|日均|天均|折合|相当于)"
+    r"[^，。；、]{0,4}?\d+(?:\.\d+)?\s*元"
+)
+
+
+def _strip_amortized(text: str) -> str:
+    """把「每天低至 0.33 元」这类摊销价整个抹掉。
+
+    为什么必须单列一条：`_strip_discounts` 只管门槛和优惠额，管不到摊销价。
+    于是「49元150天麦金学期卡 + 正文每天低至 0.33 元」在**标题里没数字**时，
+    正文兜底会原样把 0.33 当成活动价报出去 —— 屏幕上「今天最低 ¥0.33」，
+    那是把一句广告词当成了价签。
+    """
+    return _AMORTIZED_RE.sub(" ", text or "")
+
 _WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 
 
@@ -134,15 +156,22 @@ def _first_price(title: str, body: str = "") -> float | None:
        里有两个数字，取 `min` 会稳定拿到优惠额 3 —— 而优惠额和门槛
        通常都比卖价小，所以这是个**系统性偏向**，不是偶发误差。
     """
-    vals = [float(m.group(1)) for m in _PRICE_RE.finditer(_strip_discounts(title))]
-    vals = [v for v in vals if 0.1 <= v <= 10000]
-    if vals:
-        return min(vals)
+    # 标题里**取第一个**，不取最小的：
+    # 「双人餐 99元（含两份各 49 元）」取 min 会得到 49 ——
+    # 那是拆开算的单价，不是这一份的卖价。卖价通常是标题里最先出现的那个数。
     vals = [
         float(m.group(1))
-        for m in _BODY_PRICE_RE.finditer(_strip_discounts(body))
+        for m in _PRICE_RE.finditer(_strip_amortized(_strip_discounts(title)))
     ]
     vals = [v for v in vals if 0.1 <= v <= 10000]
+    if vals:
+        return vals[0]
+    vals = [
+        float(m.group(1))
+        for m in _BODY_PRICE_RE.finditer(_strip_amortized(_strip_discounts(body)))
+    ]
+    vals = [v for v in vals if 0.1 <= v <= 10000]
+    # 正文里列的是「可选档位」，报告上写的是「最低 ¥X」，所以正文仍取最小值
     return min(vals) if vals else None
 
 
@@ -395,7 +424,11 @@ def advise_line(
         tail = f"（最低 ¥{min(prices):.2f}）" if prices else "（未标价）"
         out.append(
             f"　{d.day.strftime('%m-%d')}（{d.label(base)}）"
-            f"「{fresh[0].title}」{tail} —— 今天没有，不急可以等这天"
+            # 早先这里写「今天没有，不急可以等这天」。
+            # 「不急」是替用户判断紧迫性 —— 他可能今晚就要请客，也可能
+            # 明天就离开这座城市。管家该做的是把「今天没有、哪天有」说清楚，
+            # 等不等由他自己定。
+            f"「{fresh[0].title}」{tail} —— 今天没有这天才有，等不等你自己定"
         )
         if len(out) >= 3:
             break

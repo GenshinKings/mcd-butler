@@ -23,7 +23,7 @@ import re
 from datetime import datetime
 from typing import Any
 
-from .mcd_client import McpFatalError, McdMcpClient
+from .mcd_client import McpError, McdMcpClient
 
 # `2026-10-11 05:00-2026-10-11 10:29 周日 05:00-10:29` —— 只取前两个时间点，
 # 后面的「周日 05:00-10:29」是重复的可用餐时段说明，正则不碰它。
@@ -76,10 +76,11 @@ def fetch_points(client: McdMcpClient) -> dict:
     """积分账户。任何字段缺失都返回 0，不抛异常。"""
     try:
         payload = client.call_json("query-my-account")
-    except McpFatalError:
-        # Token 失效 / 限流 / 断网必须穿透。吞掉它就会打印
+    except McpError:
+        # Token 失效 / 限流 / 断网（McpFatalError）必须穿透，
+        # **业务性 McpError 同样必须穿透**：吞掉它就会打印
         # 「卡包（0 张）／券池为空」，用户以为自己一张券都没有，
-        # 实际是这一次根本没问到服务器。
+        # 实际是这一次根本没问到服务器 —— 「没查到」被说成了「没有」。
         raise
     except Exception:
         return {}
@@ -97,6 +98,149 @@ def fetch_points(client: McdMcpClient) -> dict:
         "expire_next_month": _num(data.get("nextMouthExpirePoint")),
         "expire_last_month": _num(data.get("lastMouthExpirePoint")),
     }
+
+
+# ------------------------------------------------------- 积分能干什么
+
+def fetch_lottery(client: McdMcpClient) -> dict:
+    """积分抽奖：抽一次要多少分、现在够不够抽。
+
+    为什么要查它：只报「本月将过期 N 分」是在制造焦虑 ——
+    用户看完不知道这点分能干嘛。抽奖是积分最现实的去处，
+    而「抽一次要多少分」接口是明确给的（实测 drawPoint=24）。
+    """
+    try:
+        payload = client.call_json("query-lottery-info")
+    except McpError:
+        # 业务性失败也必须穿透：返回空等于把「没查到」说成「没有」。
+        raise
+    except Exception:
+        return {}
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return {}
+    dec = data.get("drawDecision") or {}
+    if not isinstance(dec, dict):
+        dec = {}
+    return {
+        "name": data.get("activityName") or "积分抽奖",
+        "status": data.get("activityStatusText") or "",
+        "draw_point": _num(data.get("drawPoint")),
+        "available": _num(data.get("availablePoint")),
+        "eligible": bool(dec.get("resourceEligible")),
+        "reason": str(dec.get("reason") or ""),
+    }
+
+
+def fetch_points_mall(client: McdMcpClient) -> dict:
+    """麦麦商城里**真正能用积分换**的商品。
+
+    实测踩过的坑：这个接口返回的 50 件商品里 `point` 全是 "0"、带 `price` ——
+    那是**现金购买**的派对/读书会，不是积分兑换。
+    拿它当「您的积分能换这些」，等于凭空造出一个不存在的兑换清单。
+    所以只把 `point > 0` 的算作兑换项，一件都没有就如实说一件都没有。
+    """
+    try:
+        payload = client.call_json("mall-points-products")
+    except McpError:
+        # 业务性失败也必须穿透：返回空等于把「没查到」说成「没有」。
+        raise
+    except Exception:
+        return {}
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return {}
+    items = []
+    for it in data:
+        if not isinstance(it, dict):
+            continue
+        point = _num(it.get("point"))
+        if point <= 0:
+            continue
+        items.append(
+            {
+                "name": str(it.get("spuName") or "未命名商品"),
+                "point": point,
+                "price": _num(it.get("price")),
+                "cat": str(it.get("catName") or ""),
+            }
+        )
+    items.sort(key=lambda x: x["point"])
+    return {"total": len(data), "exchangeable": items}
+
+
+def points_advice(points: dict, lottery: dict, mall: dict) -> list[str]:
+    """积分去向的结论。**宁可说「什么都换不了」，也不编一份兑换清单。**
+
+    管家的分寸：报完「您有 9.9 分」就闭嘴，是最敷衍的；
+    但为了显得有用而列出一堆其实要用现金买的商品，是骗人。
+    """
+    if not points:
+        return []
+    unit = points["currency"]
+    avail = points["available"]
+    lines: list[str] = []
+    expire = points["expire_this_month"] + points["expire_next_month"]
+
+    if lottery:
+        need = lottery["draw_point"]
+        if need > 0:
+            if avail >= need:
+                times = int(avail // need)
+                lines.append(
+                    f"- 积分抽奖：抽一次 {fmt_num(need)} {unit}，"
+                    f"您现在够抽 **{times} 次**"
+                    + (f"（{lottery['status']}）" if lottery["status"] else "")
+                )
+            else:
+                lines.append(
+                    f"- 积分抽奖：抽一次要 {fmt_num(need)} {unit}，"
+                    f"您有 {fmt_num(avail)} —— **还差 {fmt_num(need - avail)}**，先攒着"
+                )
+        elif lottery["status"]:
+            lines.append(f"- 积分抽奖：{lottery['status']}")
+
+    if mall:
+        n_ex = len(mall["exchangeable"])
+        if n_ex == 0:
+            lines.append(
+                f"- 麦麦商城：{mall['total']} 件在售，但**没有一件是纯积分兑换**"
+                f"（都要另付现金），所以这点分暂时换不了东西"
+            )
+        else:
+            # 分成「现在就换得起」和「还差一点」：混在一起报，用户得自己
+            # 拿余额去比，那不叫管家，叫打印接口。
+            afford = [it for it in mall["exchangeable"] if it["point"] <= avail]
+            lines.append(
+                f"- 麦麦商城：{n_ex} 件可用积分兑换，"
+                f"按您现在的 {fmt_num(avail)} {unit}，"
+                f"**{len(afford)} 件换得起**"
+            )
+            for it in afford[:3]:
+                extra = f" + ¥{fmt_num(it['price'])}" if it["price"] > 0 else ""
+                lines.append(f"  - ✅ {it['name']}　{fmt_num(it['point'])} {unit}{extra}")
+            if not afford:
+                cheap = mall["exchangeable"][0]
+                lines.append(
+                    f"  - 最便宜的「{cheap['name']}」要 {fmt_num(cheap['point'])} {unit}，"
+                    f"还差 {fmt_num(cheap['point'] - avail)}"
+                )
+            elif len(afford) < n_ex:
+                nxt = next((it for it in mall["exchangeable"] if it["point"] > avail), None)
+                if nxt:
+                    lines.append(
+                        f"  - 再攒 {fmt_num(nxt['point'] - avail)} {unit} 就能换「{nxt['name']}」"
+                    )
+
+    if expire > 0 and mall and not mall["exchangeable"] and (
+        not lottery or avail < lottery["draw_point"]
+    ):  # noqa: SIM102
+        # 到期了却无处可花 —— 这才是真该说的实话，别让用户白着急
+        lines.append(
+            f"- ⚠️ 有 {fmt_num(expire)} {unit} 即将过期，"
+            f"但按上面的行情，它们**没有可换的东西** —— 不是您没抓紧，是没得换。"
+        )
+    return lines
 
 
 # ---------------------------------------------------------------- 卡包
@@ -155,7 +299,8 @@ def fetch_my_coupons(client: McdMcpClient, now: datetime | None = None) -> list[
     """卡包内已持有的券，并标注距到期还有多久。"""
     try:
         text = client.call("query-my-coupons", {})
-    except McpFatalError:
+    except McpError:
+        # 业务性失败也必须穿透：返回空等于把「没查到」说成「没有」。
         raise
     except Exception:
         return []
@@ -207,7 +352,8 @@ def fetch_claimable(client: McdMcpClient) -> list[dict]:
     """可领取（或已领取）的券。"""
     try:
         text = client.call("available-coupons", {})
-    except McpFatalError:
+    except McpError:
+        # 业务性失败也必须穿透：返回空等于把「没查到」说成「没有」。
         raise
     except Exception:
         return []
@@ -246,6 +392,12 @@ def build_report(client: McdMcpClient, claim: bool = False) -> str:
                 lines.append(f"- ⚠️ **{label} {fmt_num(v)} {unit}**")
         if points["expire_this_month"] == 0 and points["expire_next_month"] == 0:
             lines.append("- 近两月无即将过期积分")
+        # 「有分」不等于「有得花」。报完余额就结束是在制造焦虑 ——
+        # 得把这点分到底能干嘛（抽奖够不够 / 商城有没有纯兑换）说清楚。
+        advice = points_advice(points, fetch_lottery(client), fetch_points_mall(client))
+        if advice:
+            lines.append("- **这点分能干什么：**")
+            lines.extend(advice)
         lines.append("")
 
     # ---- 卡包 + 到期预警（这一节才是真正的价值点）
