@@ -16,6 +16,11 @@
     python scripts/check_links.py --online        # 再联网查外链
     python scripts/check_links.py --all           # 扫仓库里所有被跟踪的 .md
 
+    # 本机 env 里的 https_proxy 要是不可用的（很常见：代理软件换了端口），
+    # urllib 会照着它连，然后报「网络不通」——看起来像死链，其实链接是好的。
+    # 这时显式指定一个能用的代理：
+    python scripts/check_links.py --online --proxy http://127.0.0.1:7897
+
 退出码：
     0 = 全部点得到；1 = 有死链（会列出具体位置）
 """
@@ -55,7 +60,7 @@ def _tracked_files() -> set[str]:
     return set(out.stdout.splitlines())
 
 
-def _scan(md: pathlib.Path, tracked: set[str], online: bool) -> list[str]:
+def _scan(md: pathlib.Path, tracked: set[str], online: bool, proxy: str = "") -> list[str]:
     text = md.read_text(encoding="utf-8")
     body = _FENCE.sub("", text)  # 去掉代码块：示例命令不是链接
     rel_dir = md.parent
@@ -70,7 +75,7 @@ def _scan(md: pathlib.Path, tracked: set[str], online: bool) -> list[str]:
         elif target.startswith(("http://", "https://")):
             if not online:
                 continue
-            bad.extend(_check_http(md.name, target))
+            bad.extend(_check_http(md.name, target, proxy))
         elif target.startswith("mailto:"):
             continue
         else:
@@ -114,12 +119,20 @@ def _safe_url(url: str) -> str:
     )
 
 
-def _check_http(name: str, url: str) -> list[str]:
+def _check_http(name: str, url: str, proxy: str = "") -> list[str]:
     req = urllib.request.Request(
         _safe_url(url), method="GET", headers={"User-Agent": "mcd-butler-link-check"}
     )
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        if proxy:
+            # 显式指定代理：绕开 env 里那个可能已经失效的 https_proxy
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+            )
+            resp_ctx = opener.open(req, timeout=20)
+        else:
+            resp_ctx = urllib.request.urlopen(req, timeout=20)
+        with resp_ctx as resp:
             if resp.status >= 400:
                 return [f"{name}: {url} —— HTTP {resp.status}"]
     except urllib.error.HTTPError as exc:
@@ -132,6 +145,12 @@ def _check_http(name: str, url: str) -> list[str]:
 def main(argv: list[str]) -> int:
     online = "--online" in argv
     scan_all = "--all" in argv
+    proxy = ""
+    for i, arg in enumerate(argv):
+        if arg == "--proxy" and i + 1 < len(argv):
+            proxy = argv[i + 1]
+        elif arg.startswith("--proxy="):
+            proxy = arg.split("=", 1)[1]
 
     tracked = _tracked_files()
     if scan_all and tracked:
@@ -142,9 +161,13 @@ def main(argv: list[str]) -> int:
     dead: list[str] = []
     for md in targets:
         if md.exists():
-            dead.extend(_scan(md, tracked, online))
+            dead.extend(_scan(md, tracked, online, proxy))
 
-    print(f"检查 {len(targets)} 个文件（外链{'联网' if online else '跳过'}）")
+    print(
+        f"检查 {len(targets)} 个文件"
+        f"（外链{'联网' if online else '跳过'}"
+        f"{'，走代理 ' + proxy if proxy else ''}）"
+    )
     if dead:
         print(f"\n发现 {len(dead)} 处点不到的链接：")
         for item in dead:

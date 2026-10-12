@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 1882" font-family="'Cascadia Code','Consolas','SF Mono','Microsoft YaHei Mono',monospace">
-  <rect width="820" height="1882" rx="14" fill="#1e1e2e"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 980" font-family="'Cascadia Code','Consolas','SF Mono','Microsoft YaHei Mono',monospace">
+  <rect width="820" height="980" rx="14" fill="#1e1e2e"/>
   <rect width="820" height="40" rx="14" fill="#181825"/>
   <rect y="26" width="820" height="14" fill="#181825"/>
   <circle cx="24" cy="20" r="6" fill="#ff5f56"/>
@@ -7,85 +7,44 @@
   <circle cx="64" cy="20" r="6" fill="#27c93f"/>
   <text x="410" y="25" fill="#a6accd" font-size="13" text-anchor="middle">mcd-butler · 真实 demo 输出渲染（非手绘图）</text>
 
-  <text x="28" y="74" fill="#89b4fa" font-size="14" xml:space="preserve">麦门黄历（almanac）</text>
-  <text x="28" y="96" fill="#cdd6f4" font-size="14" xml:space="preserve">==============================================================</text>
-  <text x="28" y="118" fill="#f9e2af" font-size="14" xml:space="preserve">════════ 麦门黄历 · 2026-10-11 周日 · 午市 ════════</text>
-  <text x="28" y="140" fill="#cdd6f4" font-size="14" xml:space="preserve">  正餐时段，套餐券最全　（本张黄历实打实算了 11 次价）</text>
-  <text x="28" y="162" fill="#a6e3a1" font-size="14" xml:space="preserve">  宜 · 中份薯条</text>
-  <text x="28" y="184" fill="#cdd6f4" font-size="14" xml:space="preserve">      挂「小食买一送一（薯条）」→ 到手 ¥6.00（省 ¥6.00，力度 50%）</text>
-  <text x="28" y="206" fill="#a6e3a1" font-size="14" xml:space="preserve">  宜 · 巨无霸</text>
-  <text x="28" y="228" fill="#cdd6f4" font-size="14" xml:space="preserve">      挂「巨无霸立减 5 元」→ 到手 ¥20.00（省 ¥5.00，力度 20%）</text>
-  <text x="28" y="250" fill="#a6e3a1" font-size="14" xml:space="preserve">  宜 · 麦辣鸡腿堡</text>
-  <text x="28" y="272" fill="#cdd6f4" font-size="14" xml:space="preserve">      挂「汉堡类任选 -4 元」→ 到手 ¥18.00（省 ¥4.00，力度 18%）</text>
-  <text x="28" y="294" fill="#a6e3a1" font-size="14" xml:space="preserve">  宜 · 中杯可乐</text>
-  <text x="28" y="316" fill="#cdd6f4" font-size="14" xml:space="preserve">      挂「饮料免费升杯」→ 到手 ¥6.00（省 ¥3.00，力度 33%）</text>
-  <text x="28" y="338" fill="#f38ba8" font-size="14" xml:space="preserve">  忌 · 麦旋风</text>
-  <text x="28" y="360" fill="#cdd6f4" font-size="14" xml:space="preserve">      「麦旋风满 20 减 1 元」挂券反而贵 ¥1.00（多半是把卡费算进来了）</text>
-  <text x="28" y="382" fill="#f38ba8" font-size="14" xml:space="preserve">  忌 · BFF四宫格小食盘双人餐</text>
-  <text x="28" y="404" fill="#cdd6f4" font-size="14" xml:space="preserve">      菜单标 ¥62.90 是「随单购麦金卡优惠」，不满足条件就按 ¥122.50 结 —— 差 ¥59.60</text>
-  <text x="28" y="426" fill="#f9e2af" font-size="14" xml:space="preserve">  今天能省的都在上面了，不多，但都是真的 —— 小的不编。</text>
-  <text x="28" y="448" fill="#6c7086" font-size="14" xml:space="preserve">  （以上每条宜忌都真的打过算价接口；演示数据，不代表真实价格）</text>
-  <text x="28" y="470" fill="#cdd6f4" font-size="14" xml:space="preserve">==============================================================</text>
-  <text x="28" y="492" fill="#cdd6f4" font-size="14" xml:space="preserve">券包体检（audit）</text>
-  <text x="28" y="514" fill="#cdd6f4" font-size="14" xml:space="preserve">==============================================================</text>
-  <text x="28" y="536" fill="#f9e2af" font-size="14" xml:space="preserve">══════════════════════════════════════════════════════════</text>
-  <text x="28" y="558" fill="#cdd6f4" font-size="14" xml:space="preserve">  券包体检 · 演示餐厅·二号店（另一套券池）</text>
-  <text x="28" y="580" fill="#f9e2af" font-size="14" xml:space="preserve">══════════════════════════════════════════════════════════</text>
-  <text x="28" y="602" fill="#cdd6f4" font-size="14" xml:space="preserve">  在售 4 件 · 券池 5 张 · 本次体检 5 张（真打 10 次算价接口）</text>
-  <text x="28" y="624" fill="#cdd6f4" font-size="14" xml:space="preserve">  真能省钱   3 张</text>
-  <text x="28" y="646" fill="#cdd6f4" font-size="14" xml:space="preserve">  挂了白挂   1 张</text>
-  <text x="28" y="668" fill="#cdd6f4" font-size="14" xml:space="preserve">  无处可挂   1 张</text>
-  <text x="28" y="690" fill="#cdd6f4" font-size="14" xml:space="preserve">  健康度 ████████████░░░░░░░░ 60%</text>
-  <text x="28" y="712" fill="#cdd6f4" font-size="14" xml:space="preserve">── 最值钱的券 ────────────────────────────────────────────</text>
-  <text x="28" y="734" fill="#cdd6f4" font-size="14" xml:space="preserve">  ¥5.00  安格斯厚牛堡立减 8 元</text>
-  <text x="28" y="756" fill="#cdd6f4" font-size="14" xml:space="preserve">        挂「安格斯厚牛堡」 ¥25.00 → ¥20.00</text>
-  <text x="28" y="778" fill="#cdd6f4" font-size="14" xml:space="preserve">  ¥4.00  板烧鸡腿堡立减 4 元</text>
-  <text x="28" y="800" fill="#cdd6f4" font-size="14" xml:space="preserve">        挂「板烧鸡腿堡」 ¥18.00 → ¥14.00</text>
-  <text x="28" y="822" fill="#cdd6f4" font-size="14" xml:space="preserve">  ¥3.00  满 20 减 3 元</text>
-  <text x="28" y="844" fill="#cdd6f4" font-size="14" xml:space="preserve">        挂「安格斯厚牛堡」 ¥25.00 → ¥22.00</text>
-  <text x="28" y="866" fill="#cdd6f4" font-size="14" xml:space="preserve">── 试出来的门槛 ───────────────────────────────────────────</text>
-  <text x="28" y="888" fill="#cdd6f4" font-size="14" xml:space="preserve">  ? 满 20 减 3 元　¥10.00 的商品上不生效，¥25.00 的才生效 —— 门槛大概卡在中间</text>
-  <text x="28" y="910" fill="#cdd6f4" font-size="14" xml:space="preserve">── 券面额 ≠ 券价值 ────────────────────────────────────────</text>
-  <text x="28" y="932" fill="#cdd6f4" font-size="14" xml:space="preserve">  ! 安格斯厚牛堡立减 8 元　标着减 ¥8.00，实测只省 ¥5.00</text>
-  <text x="28" y="954" fill="#cdd6f4" font-size="14" xml:space="preserve">── 看着挺猛，其实没用 ─────────────────────────────────────</text>
-  <text x="28" y="976" fill="#cdd6f4" font-size="14" xml:space="preserve">  × 小食满 15 减 3 元（标着减 ¥3.00）</text>
-  <text x="28" y="998" fill="#cdd6f4" font-size="14" xml:space="preserve">    试了 2 件适用商品，接口一分没减</text>
-  <text x="28" y="1020" fill="#cdd6f4" font-size="14" xml:space="preserve">── 这家店用不上 ──────────────────────────────────────────</text>
-  <text x="28" y="1042" fill="#cdd6f4" font-size="14" xml:space="preserve">  · 麦咖啡新品立减 3 元</text>
-  <text x="28" y="1064" fill="#cdd6f4" font-size="14" xml:space="preserve">    这家店的在售菜单里没有它能挂的商品</text>
-  <text x="28" y="1086" fill="#cdd6f4" font-size="14" xml:space="preserve">── 快过期 ────────────────────────────────────────────────</text>
-  <text x="28" y="1108" fill="#cdd6f4" font-size="14" xml:space="preserve">  ⏳ 明天到期　板烧鸡腿堡立减 4 元　还能省 ¥4.00</text>
-  <text x="28" y="1130" fill="#cdd6f4" font-size="14" xml:space="preserve">  ⏳ 2 天后到期　小食满 15 减 3 元　但这张在这家店省不了钱</text>
-  <text x="28" y="1152" fill="#6c7086" font-size="14" xml:space="preserve">  （演示数据；真实门店跑 `python -m src.cli audit`）</text>
-  <text x="28" y="1174" fill="#cdd6f4" font-size="14" xml:space="preserve">==============================================================</text>
-  <text x="28" y="1196" fill="#cdd6f4" font-size="14" xml:space="preserve">麦门活动日历（campaign）</text>
-  <text x="28" y="1218" fill="#cdd6f4" font-size="14" xml:space="preserve">==============================================================</text>
-  <text x="28" y="1240" fill="#f9e2af" font-size="14" xml:space="preserve">══════════════════════════════════════════════════════════</text>
-  <text x="28" y="1262" fill="#cdd6f4" font-size="14" xml:space="preserve">  麦门活动日历</text>
-  <text x="28" y="1284" fill="#f9e2af" font-size="14" xml:space="preserve">══════════════════════════════════════════════════════════</text>
-  <text x="28" y="1306" fill="#f9e2af" font-size="14" xml:space="preserve">  今天 2026-10-11 周日</text>
-  <text x="28" y="1328" fill="#f9e2af" font-size="14" xml:space="preserve">  今天有 2 个活动</text>
-  <text x="28" y="1350" fill="#cdd6f4" font-size="14" xml:space="preserve">    · 超值𝟡.𝟡元早餐两件套陪你开工啦　¥9.90</text>
-  <text x="28" y="1372" fill="#cdd6f4" font-size="14" xml:space="preserve">      早八的快乐，一堡一咖已就位</text>
-  <text x="28" y="1394" fill="#cdd6f4" font-size="14" xml:space="preserve">    · 学生专属！49元150天麦金学期卡　¥49.00</text>
-  <text x="28" y="1416" fill="#cdd6f4" font-size="14" xml:space="preserve">      每天低至 0.33 元，一卡在手</text>
-  <text x="28" y="1438" fill="#cdd6f4" font-size="14" xml:space="preserve">  接下来 7 天，1 天有今天吃不到的新活动：</text>
-  <text x="28" y="1460" fill="#cdd6f4" font-size="14" xml:space="preserve">    🆕 10-14 周三（3 天后）　最低 ¥12.90</text>
-  <text x="28" y="1482" fill="#cdd6f4" font-size="14" xml:space="preserve">      麦麦夜市回归</text>
-  <text x="28" y="1504" fill="#cdd6f4" font-size="14" xml:space="preserve">  价格取自活动文案自己写的数字；没写的显示「未标价」，不猜。</text>
-  <text x="28" y="1526" fill="#f9e2af" font-size="14" xml:space="preserve">  今天 2 个活动，最低 ¥9.90：超值𝟡.𝟡元早餐两件套陪你开工啦</text>
-  <text x="28" y="1548" fill="#cdd6f4" font-size="14" xml:space="preserve">  　10-14（3 天后）「麦麦夜市回归」（最低 ¥12.90） —— 今天没有，不急可以等这天</text>
-  <text x="28" y="1570" fill="#6c7086" font-size="14" xml:space="preserve">  （演示报文，结构照搬真实返回；真实门店跑 `python -m src.cli campaign`）</text>
-  <text x="28" y="1592" fill="#cdd6f4" font-size="14" xml:space="preserve">==============================================================</text>
-  <text x="28" y="1614" fill="#89b4fa" font-size="14" xml:space="preserve">麦门段位（brag）</text>
-  <text x="28" y="1636" fill="#cdd6f4" font-size="14" xml:space="preserve">==============================================================</text>
-  <text x="28" y="1658" fill="#cdd6f4" font-size="14" xml:space="preserve">  ¥      0 起　麦门路人   ░░░░░░░░░░░░　刚进门，还没尝到甜头</text>
-  <text x="28" y="1680" fill="#cdd6f4" font-size="14" xml:space="preserve">  ¥     10 起　麦门学徒   ██░░░░░░░░░░　开始懂规矩了</text>
-  <text x="28" y="1702" fill="#cdd6f4" font-size="14" xml:space="preserve">  ¥     50 起　麦门信徒   ████░░░░░░░░　已经会挑券了</text>
-  <text x="28" y="1724" fill="#cdd6f4" font-size="14" xml:space="preserve">  ¥    150 起　麦门执事   ██████░░░░░░　券在手里，心里有数</text>
-  <text x="28" y="1746" fill="#cdd6f4" font-size="14" xml:space="preserve">  ¥    400 起　麦门主教   ████████░░░░　一单能省出一包薯条</text>
-  <text x="28" y="1768" fill="#cdd6f4" font-size="14" xml:space="preserve">  ¥   1000 起　麦门大主教  ██████████░░　麦当劳见了您都得让三分</text>
-  <text x="28" y="1790" fill="#cdd6f4" font-size="14" xml:space="preserve">  ¥   3000 起　麦门永存   ████████████　您就是麦门本身</text>
-  <text x="28" y="1812" fill="#f9e2af" font-size="14" xml:space="preserve">  段位来自本机快照累计（~/.mcd-butler/），不联网、不上传。</text>
-  <text x="28" y="1834" fill="#cdd6f4" font-size="14" xml:space="preserve">  看自己的账本：`python -m src.cli brag`</text>
+  <text x="28" y="74" fill="#cdd6f4" font-size="14" xml:space="preserve">  中杯可乐  ¥9.00</text>
+  <text x="28" y="96" fill="#cdd6f4" font-size="14" xml:space="preserve">  麦旋风    ¥10.00</text>
+  <text x="28" y="118" fill="#cdd6f4" font-size="14" xml:space="preserve">  合计      ¥56.00</text>
+  <text x="28" y="140" fill="#cdd6f4" font-size="14" xml:space="preserve"></text>
+  <text x="28" y="162" fill="#cdd6f4" font-size="14" xml:space="preserve">可用券（5 张）</text>
+  <text x="28" y="184" fill="#cdd6f4" font-size="14" xml:space="preserve">  巨无霸立减 5 元       适用 巨无霸</text>
+  <text x="28" y="206" fill="#cdd6f4" font-size="14" xml:space="preserve">  汉堡类任选 -4 元      适用 巨无霸、麦辣鸡腿堡</text>
+  <text x="28" y="228" fill="#cdd6f4" font-size="14" xml:space="preserve">  小食买一送一（薯条）  适用 中份薯条</text>
+  <text x="28" y="250" fill="#cdd6f4" font-size="14" xml:space="preserve">  中杯可乐立减 3 元     适用 中杯可乐</text>
+  <text x="28" y="272" fill="#cdd6f4" font-size="14" xml:space="preserve">  麦旋风满 20 减 1 元   适用 麦旋风</text>
+  <text x="28" y="294" fill="#cdd6f4" font-size="14" xml:space="preserve"></text>
+  <text x="28" y="316" fill="#cdd6f4" font-size="14" xml:space="preserve">怎么挂最省（每张券都真实试算过）</text>
+  <text x="28" y="338" fill="#cdd6f4" font-size="14" xml:space="preserve">  巨无霸    ¥25.00  ← 巨无霸立减 5 元       → ¥20.00</text>
+  <text x="28" y="360" fill="#cdd6f4" font-size="14" xml:space="preserve">  中份薯条  ¥12.00  ← 小食买一送一（薯条）  → ¥ 6.00</text>
+  <text x="28" y="382" fill="#cdd6f4" font-size="14" xml:space="preserve">  中杯可乐  ¥ 9.00  ← 中杯可乐立减 3 元     → ¥ 6.00</text>
+  <text x="28" y="404" fill="#cdd6f4" font-size="14" xml:space="preserve">  麦旋风    ¥10.00  ← 没挂券                → ¥10.00</text>
+  <text x="28" y="426" fill="#cdd6f4" font-size="14" xml:space="preserve">  ----------------------------------------------</text>
+  <text x="28" y="448" fill="#cdd6f4" font-size="14" xml:space="preserve">  挂券后小计 ¥42.00</text>
+  <text x="28" y="470" fill="#cdd6f4" font-size="14" xml:space="preserve">  随单购「麦金卡（随单购）」再减 ¥6.00（卡费另算）</text>
+  <text x="28" y="492" fill="#cdd6f4" font-size="14" xml:space="preserve">  ----------------------------------------------</text>
+  <text x="28" y="514" fill="#cdd6f4" font-size="14" xml:space="preserve">  原价 ¥56.00 → 到手 ¥36.00，省下 ¥20.00</text>
+  <text x="28" y="536" fill="#cdd6f4" font-size="14" xml:space="preserve"></text>
+  <text x="28" y="558" fill="#cdd6f4" font-size="14" xml:space="preserve">复刻上一单（同样的单，今天再买多少钱）</text>
+  <text x="28" y="580" fill="#cdd6f4" font-size="14" xml:space="preserve"></text>
+  <text x="28" y="602" fill="#cdd6f4" font-size="14" xml:space="preserve">  07-14 · 麦门管家·演示餐厅</text>
+  <text x="28" y="624" fill="#cdd6f4" font-size="14" xml:space="preserve">    巨无霸 ×1          当时 ¥24.00 → 现在 ¥25.00</text>
+  <text x="28" y="646" fill="#cdd6f4" font-size="14" xml:space="preserve">    中份薯条 ×1</text>
+  <text x="28" y="668" fill="#cdd6f4" font-size="14" xml:space="preserve">    中杯可乐 ×1</text>
+  <text x="28" y="690" fill="#cdd6f4" font-size="14" xml:space="preserve">    上次实付 ¥33.00 → 今天 ¥26.00，便宜了 ¥7.00</text>
+  <text x="28" y="712" fill="#6c7086" font-size="14" xml:space="preserve">    （用了 3 张券 + 麦金卡（随单购））</text>
+  <text x="28" y="734" fill="#cdd6f4" font-size="14" xml:space="preserve"></text>
+  <text x="28" y="756" fill="#cdd6f4" font-size="14" xml:space="preserve">  09-02 · 麦门管家·演示餐厅</text>
+  <text x="28" y="778" fill="#cdd6f4" font-size="14" xml:space="preserve">    麦辣鸡腿堡 ×1</text>
+  <text x="28" y="800" fill="#cdd6f4" font-size="14" xml:space="preserve">    麦旋风 ×1</text>
+  <text x="28" y="822" fill="#cdd6f4" font-size="14" xml:space="preserve">    上次实付 ¥30.00 → 今天 ¥26.00，便宜了 ¥4.00</text>
+  <text x="28" y="844" fill="#6c7086" font-size="14" xml:space="preserve">    （用了 1 张券 + 麦金卡（随单购））</text>
+  <text x="28" y="866" fill="#cdd6f4" font-size="14" xml:space="preserve"></text>
+  <text x="28" y="888" fill="#cdd6f4" font-size="14" xml:space="preserve">  就这两段：把购物车和券丢进来，算出怎么挂最省。</text>
+  <text x="28" y="910" fill="#cdd6f4" font-size="14" xml:space="preserve">  还有黄历 / 券包体检 / 活动日历 / 段位，想看就跑：</text>
+  <text x="28" y="932" fill="#cdd6f4" font-size="14" xml:space="preserve">    python -m src.cli demo --all</text>
 </svg>
