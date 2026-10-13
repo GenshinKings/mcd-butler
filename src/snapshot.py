@@ -137,10 +137,20 @@ def has_order_key(key: str) -> bool:
 
 
 def latest(store_code: str | None = None) -> dict | None:
-    """取最近一条快照；指定 store_code 时只在该门店里找。"""
+    """取最近一条**真实成交**；一笔真实成交都没有，才退回最近一条测算。
+
+    为什么必须挑，不能简单取 `entries[-1]`：replay 曾经每跑一次就往账本里
+    追加一条测算，于是"最近一条"永远是他自己上一次写的测算价。
+    第二次跑 replay 就变成了「上次算出来的价」比「这次算出来的价」——
+    两个测算值相减，永远是 ¥0.00。**真正的涨价只能被检出一次，之后一律"持平"**，
+    而用户是被这个数字说服去/不去那家店的。
+    """
     entries = load_all()
     if store_code:
         entries = [e for e in entries if e.get("store_code") == store_code]
+    for e in reversed(entries):
+        if e.get("kind") == "order":
+            return e
     return entries[-1] if entries else None
 
 
@@ -157,7 +167,13 @@ def describe(entry: dict) -> str:
 
 # ---------------------------------------------------------------- 撤回
 def delete_last(n: int = 1) -> int:
-    """撤回最近 n 条快照，返回实际删除条数。
+    """撤回最近 n 条快照，返回实际删除条数；**账本读不出来时返回 -1**。
+
+    为什么要区分 -1 和 0：两者都表示"一条没删"，但意思完全相反 ——
+    0 是"账本本来就是空的"，-1 是"账本读不出来，我没敢动它"。
+    合并成 0 会让调用方打印"账本是空的，没有可撤回的记录"，
+    用户于是以为自己没数据、甚至以为清空成功了，而数据其实还在盘上
+    （只是解析失败）。把"没查到"说成"没有"，是最伤人的那一类谎。
 
     为什么要有这个：optimize 默认会把每一次测算写进账本，
     于是「输错店名随手一跑」「--budget 1 探测一下」也都被记成省钱记录。
@@ -165,7 +181,9 @@ def delete_last(n: int = 1) -> int:
     否则那张卡片是一份他自己都解释不清的假成绩单。
     """
     entries, broken = _read()
-    if broken or not entries:
+    if broken:
+        return -1
+    if not entries:
         return 0
     n = max(int(n), 0)
     keep = entries[:-n] if 0 < n < len(entries) else ([] if n >= len(entries) else entries)

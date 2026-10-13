@@ -541,7 +541,7 @@ def _count_working_coupons(oracle, cart, best) -> int:
     return working
 
 
-def _how_to_order(cart, coupons, best, converged: bool = True) -> list[str]:
+def _how_to_order(cart, coupons, best, converged: bool = True, now=None) -> list[str]:
     """把最优解翻译成「在 App 里手怎么点」。
 
     为什么必须有这一段：算出「巨无霸挂 A、薯条挂 B」之后，用户还是得
@@ -549,7 +549,12 @@ def _how_to_order(cart, coupons, best, converged: bool = True) -> list[str]:
     没给做法 —— 真实点单链路里，这就是最后一公里，断了等于没算。
 
     只说**确定的**事：加什么、每张券挂在哪件。不猜 App 的界面长什么样。
+
+    `now` 给了就在末尾补一句时效 —— 算价时刻不等于下单时刻，
+    这条不说，用户拿着 10:29 算好的早市价在 10:31 去结账，一定多付钱。
     """
+    from datetime import datetime as _dt
+
     lines: list[str] = []
     goods = "、".join(
         f"{it.name or it.product_code}×{it.quantity}" for it in cart
@@ -564,8 +569,19 @@ def _how_to_order(cart, coupons, best, converged: bool = True) -> list[str]:
     else:
         lines.append("  2) 这一单没有券能挂上，直接下就是最便宜的")
     if best.with_order is not None:
+        # 「卡费另算」四个字不够：卡费是**花出去退不回来**的钱，
+        # 而且下一单想再享这个价还得再买一次。只说"另算"，
+        # 用户会以为这是一次性小钱，实际上它是这单的真实成本之一。
         lines.append(
-            f"  3) 这个价要随单购「{best.with_order.label}」才拿得到（卡费另算）"
+            f"  3) 这个价要随单购「{best.with_order.label}」才拿得到 —— "
+            "卡费另付、**买了不退**，下一单还得再买一次才享得到"
+        )
+    if isinstance(now, _dt):
+        # 算价时刻 ≠ 下单时刻。早市 10:30 收、夜市 21:00 起，
+        # 跨过那个点，屏幕上这个价就不是柜台那个价了。
+        lines.append(
+            f"  ⚠️ 这个价是 {now:%H:%M} 算的。拖过时段边界（早市 10:30 收、"
+            "夜市 21:00 起）就不是这个价了 —— 到柜台前再看一眼几点"
         )
     if not converged:
         lines.append("  （这一单还没搜到底，照着做之前可以先 --budget 调大再看一眼）")
@@ -763,60 +779,15 @@ def run_audit(
     return 0
 
 
-def server_now(client) -> datetime:
-    """取服务端时间；拿不到就退回本机时间。
-
-    为什么不能只用 `datetime.now()`：黄历的「时段」和「今日到期」都依赖现在几点。
-    本机时区设错或系统时间不准时（换个设备、挂个 VPN、虚拟机跑），
-    整份黄历都会错，而且错得很隐蔽 —— 用户只会觉得"这券明明还没到期"。
-    服务端时间是唯一可信的基准，实测返回带 `timezone: GMT+08:00`。
-
-    两个踩过的坑：
-
-    1. 这里曾经直接 `datetime.fromisoformat(str(text)[:26])`。报文一旦带微秒
-       加时区（"2026-10-13T04:24:00.123456+08:00" 是 32 个字符），`[:26]`
-       会把 `+08:00` 整段切掉，剩下一个 naive 时间，不报错、只是算错。
-    2. 更糟的是反过来：解析出带时区的 aware datetime 之后，拿它去减券的到期日
-       （naive），Python 直接抛 TypeError；而这个 TypeError 落在外层
-       `except Exception` 里被吞掉 —— 「今天到期，不用就作废」这条**最要紧**
-       的提醒就静默消失了，用户还以为自己没有快过期的券。
-
-    所以这里一律返回**墙上时间**（不带时区）：券的到期日也是墙上时间，
-    两边口径一致，也不会再出现 aware−naive 的 TypeError。
-    """
-    try:
-        data = client.data("now-time-info", {})
-        text = (data or {}).get("datetime") if isinstance(data, dict) else None
-        if text:
-            parsed = _parse_server_datetime(text)
-            if parsed is not None:
-                return parsed
-    except McpError:
-        # 接口层面的失败（限流/断网）才允许退回本机时间，并让调用方知道
-        pass
-    return datetime.now()
-
-
-_TZ_SUFFIX = re.compile(
-    r"\s*(?:Z|[+-]\d{2}:?\d{2}|GMT\s*[+-]?\d{1,2}(?::\d{2})?|UTC\s*[+-]?\d{1,2})\s*$",
-    re.IGNORECASE,
+# 「现在几点」全项目只有一个出处（src/clock.py）。
+# 曾经 `advise` 用服务端时间、`assets` 用本机时间，同一个账号同一时刻
+# 一个报「今天有 N 张要作废」、另一个报「0 张」—— 而错的方向是漏报，
+# 券过期不可逆。现在两边都调同一个函数，想再分叉也分叉不了。
+# 这里保留 `_parse_server_datetime` 这个名字，是因为自检直接引用它。
+from .clock import (  # noqa: E402  （re-export，见上）
+    parse_server_datetime as _parse_server_datetime,
 )
-
-
-def _parse_server_datetime(text) -> datetime | None:
-    """把服务端时间报文解析成**不带时区**的 datetime。解析不了就返回 None。"""
-    s = str(text).strip()
-    if not s:
-        return None
-    for cand in (s, _TZ_SUFFIX.sub("", s).strip(), s.replace(" ", "T", 1)):
-        try:
-            dt = datetime.fromisoformat(cand)
-        except (ValueError, TypeError):
-            continue
-        # 万一还是拿到带时区的（3.10 只认 +HH:MM 这一种写法），
-        # 直接丢掉 tzinfo 取墙上时间 —— 绝不让 aware 泄漏出去
-        return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
-    return None
+from .clock import server_now, server_now_with_source  # noqa: E402
 
 
 def _load_menu_and_coupons(client, store_code: str):
@@ -881,8 +852,30 @@ def _locate(client, city: str, keyword: str, store_code: str | None = None):
         print(f"   想换一家：把 --store 换成别的编码（本店就是 {store_code}）")
         print(f"   想看附近还有哪些店：python -m src.cli compare")
 
+    for line in _closed_warning(store):
+        print(line)
+
     menu, coupons = _load_menu_and_coupons(client, store_code)
     return store, store_code, menu, coupons
+
+
+def _closed_warning(store: dict) -> list[str]:
+    """门店没在营业时的提醒。单独抽出来是因为它必须能被离线断言。
+
+    为什么非说不可：白跑一趟是**不可逆**的损失 —— 路费和时间都回不来，
+    而接口明明给了 `businessStatus`。早先只有 `compare` 会剔打烊店，
+    `optimize` / `advise` 走 `_locate` 这条路：用户拿着算好的价跑到一家
+    关着门的店，只会得出一个结论 —— 这软件骗人。
+
+    价照算（他要的就是这个价），但得先让他知道门可能是关着的。
+    字段缺失时不喊：不知道就是不知道，不能把"没查到"说成"打烊"。
+    """
+    if store.get("businessStatus") is not False:
+        return []
+    return [
+        f"⚠️ 接口说「{store.get('storeName') or '这家店'}」现在没在营业。",
+        "   下面的价照算，但你得先确认它还开着门 —— 白跑一趟没人赔你。",
+    ]
 
 
 def _explain_coupon_scope(n: int) -> None:
@@ -1011,7 +1004,7 @@ def run_advise(
         for line in best.describe(cart, coupons):
             print(f"   {line}")
         print("\n照着做：")
-        for line in _how_to_order(cart, coupons, best, best.converged):
+        for line in _how_to_order(cart, coupons, best, best.converged, now=server_now(client)):
             print(line)
         print(f"\n裸买 ¥{FEN(baseline.price_fen)}  →  到手 ¥{FEN(best.price.price_fen)}")
         print(f"真实省下 ¥{FEN(best.price.saved_vs(baseline.price_fen))}")
@@ -1076,12 +1069,24 @@ def _butler_close(saved_fen: int, wrote: bool = False) -> str:
         est_fen = s.get("est_saved_fen", 0)
         real_n = s.get("real_orders", 0)
         real_fen = s.get("real_saved_fen", 0)
-        r = rank_of(real_fen)
+        # 段位必须和 `brag` 用同一把尺子 —— **真实成交的累计实付**。
+        # 早先这里传的是 real_saved_fen：历史订单只记得住实付，裸买价无从得知
+        # 所以记的是 0，real_saved 恒为 0 —— optimize 收尾于是永远印最低档
+        # 「麦门路人」，而同一个账本 `brag` 印的是另一档。一个用户，两个段位。
+        r = rank_of(s.get("real_paid_fen", 0))
         parts = []
         if est_n:
             parts.append(f"{est_n} 次测算，找出 ¥{est_fen / 100:.2f} 的省钱空间（尚未成交）")
         if real_n:
-            parts.append(f"{real_n} 笔真实成交，真省下 ¥{real_fen / 100:.2f}")
+            if real_fen > 0:
+                parts.append(f"{real_n} 笔真实成交，真省下 ¥{real_fen / 100:.2f}")
+            else:
+                # 不能印「真省下 ¥0.00」——那是在说他一分没省。
+                # 事实是这一段**无从得知**：历史订单里没有当时的裸买价，不编。
+                parts.append(
+                    f"{real_n} 笔真实成交，累计实付 ¥{s.get('real_paid_fen', 0) / 100:.2f}"
+                    "（省了多少无从得知，不编）"
+                )
         if parts:
             lines.append("账上：" + "；".join(parts) + "。")
         lines.append(f"段位「{r['title']}」只按真实成交算 —— 测算不算数，刷不动。")
@@ -1302,7 +1307,7 @@ def run_optimize(
     # 光给答案不算完事：用户还得切回 App 手工重放这一单。
     # 把「手怎么点」写出来，才是把结论送到能下单的地方。
     print("\n照着做：")
-    for line in _how_to_order(cart, coupons, best, best.converged):
+    for line in _how_to_order(cart, coupons, best, best.converged, now=server_now(client)):
         print(line)
     # 真实节省必须以「裸买价」为基准。
     # 不能用接口返回的 discount：随单购会把卡费计入 originalPrice
@@ -1319,7 +1324,16 @@ def run_optimize(
             cart, Assignment(mapping=best.mapping, with_order=None)
         )
         if no_wo is None:
-            print("  （预算不足，没能拆出券与随单购各自的贡献，--budget 调大可看到）")
+            # `try_evaluate` 返回 None 有**两种**原因，混成一句"预算不足"是误导：
+            # 用户照着去调大 --budget，而真实原因是限流 / 接口拒绝，
+            # 调多大都一样。这里按剩余预算分开说。
+            if optimizer.remaining <= 0:
+                print("  （预算用完了，没能拆出券与随单购各自的贡献，--budget 调大可看到）")
+            else:
+                print(
+                    "  （这一档算价没成功，没能拆出券与随单购各自的贡献 —— "
+                    "不是预算问题，等一会儿重试即可）"
+                )
         else:
             coupon_gain = baseline.price_fen - no_wo.price_fen
             wo_gain = no_wo.price_fen - best.price.price_fen
@@ -1610,10 +1624,17 @@ def run_brag(with_link: bool = False) -> int:
     if s["real_orders"] == 0:
         # 这行必须说：否则用户把「测算」当「已省」，晒出去会被朋友问住。
         print("  ⚠️ 其中 0 笔是真实成交 —— 这是「这么点能省多少」，不是已经省下的钱。")
-    else:
+    elif s["real_saved_fen"] > 0:
         print(
             f"  真实成交       {s['real_orders']} 笔，真省下 ¥{s['real_saved_fen'] / 100:.2f}"
         )
+    else:
+        # 真实成交的裸买价无从得知（账本里记的是 0，刻意不编），
+        # 所以这里不能印「真省下 ¥0.00」——那是说他一分没省，而真实情况是不知道。
+        print(
+            f"  真实成交       {s['real_orders']} 笔，累计实付 ¥{s['real_paid_fen'] / 100:.2f}"
+        )
+        print("  （省了多少无从得知：历史订单里没有当时的裸买价，小的不替您编一个）")
     if s["top_store"]:
         print(f"  最常光顾   {s['top_store']}")
     if s["top_coupon"]:
@@ -1674,6 +1695,15 @@ def run_forget(last: int, all_: bool) -> int:
         print("--last 需要是正整数；一条都不撤回，账本未改动。")
         return 0
     n = delete_last(last)
+    if n < 0:
+        # 读不出来 ≠ 空的。说成"空的"，用户会以为自己没数据、甚至以为清空
+        # 已经成功，而数据其实还在盘上 —— 只是这一趟没解析出来。
+        from .snapshot import SNAPSHOT_FILE
+
+        print("账本读不出来，小的没敢动它（怕把还能救的数据弄没了）。")
+        print(f"  它在 {SNAPSHOT_FILE}")
+        print("  先复制一份备份，再打开看看是不是被别的程序写坏了。")
+        return 1
     if n == 0:
         print("账本是空的，没有可撤回的记录。")
         return 1
@@ -1693,8 +1723,10 @@ def _with_order_label(with_order) -> str:
     return with_order.label if with_order is not None else ""
 
 
-def _replay_baseline_fen(optimizer, cart: list[CartItem]) -> int:
+def _replay_baseline_fen(optimizer, cart: list[CartItem]) -> int | None:
     """这一单「一件券都不挂、也不买随单购」的裸买价（分）。
+
+    算不出来返回 None —— 宁可不说，也不拿接口的 `original_fen` 顶上（理由见下）。
 
     不能拿接口返回的 `original_fen` 当裸买价：最优解一旦选了随单购档位，
     接口会把 **卡费** 算进 `originalPrice`，于是「省下的钱」凭空多出卡费那一截。
@@ -1704,10 +1736,16 @@ def _replay_baseline_fen(optimizer, cart: list[CartItem]) -> int:
     单独拆出来是因为：这段逻辑埋在 `run_replay` 里时没法离线断言，
     改回「拿接口的 original 当基准」也不会有任何一条自检变红。
     """
-    return optimizer.evaluate(cart, Assignment(mapping={}, with_order=None)).price_fen
+    try:
+        return optimizer.evaluate(cart, Assignment(mapping={}, with_order=None)).price_fen
+    except BudgetExhausted:
+        # 预算被爬山吃光了。这行只是一条补充信息，不该把整份对比结果掀翻 ——
+        # 早先它抛出去，屏幕上是「完整对比表 + 一句算价次数太少」，rc=3，
+        # 而且后面的记账全不执行。宁可这一行不印。
+        return None
 
 
-def run_replay(store_code: str | None, list_only: bool) -> int:
+def run_replay(store_code: str | None, list_only: bool, budget: int = 40) -> int:
     """历史订单复刻：把这单按今天的菜单和券重算一遍，报价格变动。
 
     数据源有两条，按优先级：
@@ -1772,7 +1810,11 @@ def run_replay(store_code: str | None, list_only: bool) -> int:
         target_store = entry.get("store_code", "")
         paid_fen = entry.get("paid_fen")
         want = [(i["code"], int(i.get("qty") or 1)) for i in entry.get("items") or []]
-        source = f"本地快照 {entry.get('saved_at', '')}"
+        # 「上次实付」是笔什么钱，必须写在脸上：快照里绝大多数条目是测算
+        # （只是"这么点能省多少"），不是真成交。拿测算值当"上次实付"去比，
+        # 两个数都是算出来的，diff 也就没什么意义了 —— 用户会拿它做决策。
+        kind = "真实成交" if entry.get("kind") == "order" else "测算（不是真花过的钱）"
+        source = f"本地快照 {entry.get('saved_at', '')}　[{kind}]"
 
     print(f"复刻来源：{source}")
     print(f"目标门店：{target_store}")
@@ -1814,10 +1856,13 @@ def run_replay(store_code: str | None, list_only: bool) -> int:
 
     oracle = make_price_oracle(client, target_store, coupons)
 
-    optimizer = CouponOptimizer(oracle, max_calls=40)
+    optimizer = CouponOptimizer(oracle, max_calls=budget)
     best = optimizer.optimize(cart, coupons, _with_order_options(cart))
     if best.price is None:
-        print("\n这单一件商品都没算成价，加 --budget 80 再试一次。")
+        # 早先这里写「加 --budget 80 再试一次」，而 replay 根本没有 --budget
+        # 这个参数 —— 照着敲是 unrecognized arguments。给了走不通的自救指令
+        # 比不给更糟：用户会以为是自己的问题。现在参数真有了，话也就对了。
+        print(f"\n这单一件商品都没算成价（算价预算 {budget} 次）。加 --budget 80 再试一次。")
         return 1
     print("\n今日最优组合：")
     for line in best.describe(cart, coupons):
@@ -1834,17 +1879,25 @@ def run_replay(store_code: str | None, list_only: bool) -> int:
         print(f"同样的单，{verdict} ¥{FEN(abs(diff))}{mark}")
     print("-" * 62)
 
-    # 存一份今天的快照，下次就能比。
-    # 复刻来源是**真实历史订单**时，另存一条 kind="order" 的成交记录 ——
-    # 段位只能靠它涨。记账前先查重：同一笔订单跑十遍 replay 也只算一次。
+    # 这一趟算出来的**不记进账本**。
+    #
+    # 早先这里无条件 save 一条测算，于是跑十次 replay 账本里就多十条，
+    # 而 `latest()` 取的是最后一条 —— 也就是上一次 replay 自己写进去的测算价。
+    # 第二次起就成了「上次算出来的价」比「这次算出来的价」，两个测算值相减恒为
+    # ¥0.00：真正的涨价只能被检出一次，之后永远"持平"。
+    # 规矩得和 optimize 一致 —— 测算不算数，也就不记账。
+    baseline_fen = _replay_baseline_fen(optimizer, cart)
+    if baseline_fen is not None:
+        print(f"（今日裸买价 ¥{FEN(baseline_fen)}，挂券后 ¥{FEN(best.price.price_fen)}）")
+
+    # 只有**真实成交**才落账：段位靠它涨，也只认它。记账前先查重 ——
+    # 同一笔订单跑十遍 replay 也只算一次。
     from .snapshot import (
         entry_from_cart,
         has_order_key,
         save as save_snapshot,
     )
 
-    label = _with_order_label(best.with_order)
-    baseline_fen = _replay_baseline_fen(optimizer, cart)
     if real_order is not None and isinstance(paid_fen, int) and paid_fen > 0:
         import hashlib
 
@@ -1873,20 +1926,10 @@ def run_replay(store_code: str | None, list_only: bool) -> int:
         elif key:
             print("\n（这笔真实成交以前记过了，不重复计）")
 
-    save_snapshot(
-        entry_from_cart(
-            cart=cart,
-            paid_fen=best.price.price_fen,
-            baseline_fen=baseline_fen,
-            discount_fen=baseline_fen - best.price.price_fen,
-            store_code=target_store,
-            store_name="",
-            city="",
-            keyword="",
-            coupon_titles=[coupons[ci].title for ci in best.mapping.values()],
-            with_order_label=label,
-        )
-    )
+    if real_order is None:
+        # 这一趟是拿本地快照复刻的 —— 而本地快照本身多半也是测算。
+        # 必须说清楚：屏幕上这两个数都是算出来的，不是他真花过的钱。
+        print("\n（这一趟是测算，没记进账本。要记一单就用 `optimize --save`）")
     return 0
 
 
@@ -2391,6 +2434,7 @@ def main(argv: list[str] | None = None) -> int:
     p_rep = sub.add_parser("replay", help="历史订单复刻与价格变动")
     p_rep.add_argument("--store", default=None, help="指定门店编码，默认用最近快照")
     p_rep.add_argument("--list", action="store_true", help="只列出本地快照")
+    p_rep.add_argument("--budget", type=int, default=40, help="算价接口调用上限")
 
     p_cmp = sub.add_parser("compare", help="多门店比价 + 路程性价比（该不该跑这一趟）")
     p_cmp.add_argument("--city", default=city_default)
@@ -2562,7 +2606,7 @@ def _dispatch(args) -> int:
     if args.cmd == "assets":
         return run_assets(args.claim)
     if args.cmd == "replay":
-        return run_replay(args.store, args.list)
+        return run_replay(args.store, args.list, args.budget)
     if args.cmd == "compare":
         return run_compare(
             args.city,

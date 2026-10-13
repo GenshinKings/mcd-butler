@@ -367,9 +367,19 @@ def claim_all(client: McdMcpClient) -> str:
 
 # ---------------------------------------------------------------- 周报
 
-def build_report(client: McdMcpClient, claim: bool = False) -> str:
-    """生成一份 Markdown 资产周报。默认只读。"""
-    now = datetime.now()
+def build_report(client: McdMcpClient, claim: bool = False, now=None) -> str:
+    """生成一份 Markdown 资产周报。默认只读。
+
+    `now` 可以外部注入（自检要用固定时间），不传就取服务端时间 ——
+    **不能**退回 `datetime.now()` 了事：那会让同一账号在同一时刻
+    一边报「今天有 N 张要作废」、一边报「0 张」，而错的方向是漏报。
+    """
+    from .clock import server_now_with_source
+
+    if now is None:
+        now, _src = server_now_with_source(client)
+    else:
+        _src = "given"
     lines: list[str] = ["# 本周麦门资产", ""]
 
     # ---- 积分
@@ -407,6 +417,12 @@ def build_report(client: McdMcpClient, claim: bool = False) -> str:
     alive = [c for c in mine if not c.get("expired") and not c.get("due_today")]
 
     lines.append(f"## 卡包（{len(mine)} 张）")
+    # 到期作废是不可逆的，用户有权知道这个「今天」是哪个钟给的。
+    # 服务端没问到、退回本机时间时，本机时区若不准，漏报就是白扔一张券。
+    if _src == "local":
+        lines.append(
+            "- ⚠️ 服务端时间没问到，**按本机时间判断到期**（本机时钟不准会有偏差）"
+        )
     if not mine:
         lines.append("- 卡包为空")
     else:

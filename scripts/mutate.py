@@ -673,8 +673,8 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
         # 把数字写进 old 会让这条变异在下一轮排版调整后静默失效（S3 已经跳过一次了）。
         "S3-导航表出现死链（改了锚点忘了改跳过去的链接）",
         "README.md",
-        "](#commands)（中文名 ←→ 命令名对照）",
-        "](#command-list)（中文名 ←→ 命令名对照）",
+        "[17 个命令都是干嘛的](#commands)",
+        "[17 个命令都是干嘛的](#command-list)",
         True,
     ),
     (
@@ -692,10 +692,10 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
         True,
     ),
     (
-        "S6-删掉导航表入口（820 行 README 没有地图）",
+        "S6-删掉导航入口（近千行 README 没有地图）",
         "README.md",
-        "<summary><b>在这一页里找东西</b>（这份 README 很长，先给张地图，点哪都能跳）</summary>",
-        "<summary><b>更多说明</b></summary>",
+        "**在这一页里找东西：** [装到我电脑上](#install)",
+        "**在这一页里找东西：** 参见下文。",
         True,
     ),
     (
@@ -866,7 +866,7 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
     ),
     (
         "U9-服务端时间又留着时区（naive−aware 相减炸掉，到期提醒静默消失）",
-        "cli.py",
+        "clock.py",
         "        return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt",
         "        return dt",
         True,
@@ -888,7 +888,7 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
     (
         "U12-optimize 不再打印「照着做」（算了答案却不告诉人家手怎么点）",
         "cli.py",
-        "    for line in _how_to_order(cart, coupons, best, best.converged):",
+        "    for line in _how_to_order(cart, coupons, best, best.converged, now=server_now(client)):",
         "    for line in ():",
         True,
     ),
@@ -918,6 +918,72 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
         "audit.py",
         '                f"实际只省 ¥{yuan(v.value_fen)}"',
         '                f"实测只省 ¥{yuan(v.value_fen)}"',
+        True,
+    ),
+    # ---------- 第七轮：跨命令口径 / 不可逆损失 ----------
+    (
+        "V1-引擎不再先算裸买下界（预算小时能给出比不挂券更贵的解）",
+        "coupon_engine.py",
+        "        bare = Assignment(mapping={}, with_order=None)\n"
+        "        if self.try_evaluate(cart, bare) is not None:\n"
+        "            best = bare\n",
+        "",
+        True,
+    ),
+    (
+        "V2-段位又改用省额（历史订单无裸买价 → 恒为 0 → optimize 收尾永远最低档）",
+        "cli.py",
+        '        r = rank_of(s.get("real_paid_fen", 0))\n'
+        "        parts = []",
+        '        r = rank_of(s.get("real_saved_fen", 0))\n'
+        "        parts = []",
+        True,
+    ),
+    (
+        "V3-账单金额又按类型读（float/字符串被静默丢成 ¥0）",
+        "persona.py",
+        '        base = as_fen(e.get("baseline_fen"))\n'
+        '        paid = as_fen(e.get("paid_fen"))\n'
+        "        if base > paid:",
+        '        base = e.get("baseline_fen") or 0\n'
+        '        paid = e.get("paid_fen") or 0\n'
+        "        if isinstance(base, int) and isinstance(paid, int) and base > paid:",
+        True,
+    ),
+    (
+        "V4-账本读不出来又翻译成「账本是空的」（撤回返回 0）",
+        "snapshot.py",
+        "    entries, broken = _read()\n    if broken:\n        return -1\n    if not entries:\n        return 0",
+        "    entries, broken = _read()\n    if broken or not entries:\n        return 0",
+        True,
+    ),
+    (
+        "V5-取最近一单又退回 entries[-1]（拿自己的测算当基准，diff 恒为 0）",
+        "snapshot.py",
+        '    for e in reversed(entries):\n        if e.get("kind") == "order":\n            return e\n'
+        "    return entries[-1] if entries else None",
+        "    return entries[-1] if entries else None",
+        True,
+    ),
+    (
+        "V6-打烊店又不提醒（白跑一趟不可逆）",
+        "cli.py",
+        '    if store.get("businessStatus") is not False:\n        return []\n',
+        "    return []\n",
+        True,
+    ),
+    (
+        "V7-随单购又把卡费说成「另算」（不说不退、不说下次还得再买）",
+        "cli.py",
+        '            "卡费另付、**买了不退**，下一单还得再买一次才享得到"',
+        '            "（卡费另算）"',
+        True,
+    ),
+    (
+        "V8-又不报算价时刻（跨过时段边界价格就变了）",
+        "cli.py",
+        '    if isinstance(now, _dt):\n',
+        "    if False:\n",
         True,
     ),
 ]

@@ -397,20 +397,31 @@ def run() -> int:
     except Exception as exc:  # noqa: BLE001
         check("引擎-预算耗尽不崩", False, repr(exc))
 
-    # 8b. 契约锁定（修复「裸买基准在 optimize 后崩溃」的 P0）：
-    # optimize 会把共享预算吃光，之后再 try_evaluate(裸买) 必然返回 None；
-    # 因此调用方必须在 optimize 之前先算裸买基准。这里断言该契约成立，
-    # 防止 cli 把 baseline 写回 optimize 之后导致 AttributeError。
-    # 预算必须小到「optimize 一定会吃光」。用 40 的话这条断言锁的是
-    # 演示数据恰好够费，而不是契约本身 —— 演示数据一改就塌，还查不出原因。
+    # 8b. 契约锁定（「裸买基准在 optimize 后拿不到」这个坑，从根上填了）：
+    # 早先 optimize 从不算裸买价，预算被爬山吃光后 try_evaluate(裸买) 返回 None，
+    # 调用方只能把 baseline 挪到 optimize 之前算 —— 顺序一写反就 AttributeError，
+    # 而这个坑没有任何东西拦得住。现在引擎第零步就把裸买价算出来并进了缓存，
+    # 于是**什么时候问都有答案**，顺序问题从此不存在。
+    # 预算给 3（小到 optimize 一定会吃光），锁的是「吃光了也问得到」。
     opt_budget = Budget(3)
     eng = CouponOptimizer(demo.demo_oracle, max_calls=3, budget=opt_budget)
     eng.optimize(cart, demo.DEMO_COUPONS, demo.DEMO_WITH_ORDER_OPTIONS)
     late = eng.try_evaluate(list(cart), Assignment(mapping={}, with_order=None))
     check(
-        "契约-optimize吃光预算后裸买基准为None",
-        late is None,
-        f"应返回 None 以提醒调用方『基准须先算』，实际 {late!r}",
+        "契约-optimize吃光预算后仍问得到裸买基准（引擎第零步算过并缓存了）",
+        late is not None and late.price_fen > 0,
+        f"应命中缓存返回一个真价，实际 {late!r}",
+    )
+    # 下界契约：给的价**绝不能比不挂券更贵**。预算小到爬山删不完陷阱券时，
+    # 早先会停在比裸买贵的解上，屏幕上出现「真实省下 ¥-1.00」。
+    # 先判 None 再取价：删掉第零步后这里 late 就是 None，
+    # 直接 `.price_fen` 会让**整屏自检崩掉**（变异测试标成"崩"而不是"红"）——
+    # 崩也算被抓住，但给用户看的是一屏 traceback，不是一句人话。
+    _bare_now = demo.demo_oracle(list(cart), Assignment(mapping={}, with_order=None))
+    check(
+        "引擎-预算再小也不许给出比裸买更贵的解（挂券不能挂出负收益）",
+        late is not None and late.price_fen <= _bare_now.price_fen,
+        f"best={getattr(late, 'price_fen', None)} 裸买={_bare_now.price_fen}",
     )
     # 反过来：先算基准则能拿到价格（cli 的正确写法）
     early_budget = Budget(40)
@@ -1114,6 +1125,36 @@ def run() -> int:
         str(rank_of(5000)["next"]),
     )
     check("段位-负数不炸", rank_of(-100)["title"] == "麦门路人")
+
+    # 段位只能有一把尺子。曾经 optimize 收尾传 `real_saved_fen`、brag 传
+    # `real_paid_fen`：历史订单没有裸买价，real_saved 恒为 0，
+    # 于是 optimize 收尾永远印最低档「麦门路人」，而 brag 印的是另一档 ——
+    # 同一个用户被自己的工具告知两个段位。
+    # 光测 `rank_of` 本身抓不到这种错，必须钉住**调用点传了什么**。
+    import inspect as _inspect
+
+    from . import cli as _cli_mod
+
+    _cli_src = _inspect.getsource(_cli_mod)
+    check(
+        "段位-不许拿省额定段位（历史订单无裸买价，那个数恒为 0）",
+        "rank_of(real_fen)" not in _cli_src
+        and 'rank_of(s["real_saved_fen"]' not in _cli_src
+        and 'rank_of(s.get("real_saved_fen"' not in _cli_src,
+        "还有调用点在拿 real_saved_fen 定段位",
+    )
+    check(
+        "段位-所有账本段位调用点都用同一把尺子（真实成交累计实付）",
+        _cli_src.count('rank_of(s.get("real_paid_fen"') >= 2,
+        "至少 optimize 收尾与 brag 两处都要用 real_paid_fen",
+    )
+    # replay 曾在屏幕上写「加 --budget 80 再试一次」，而 replay 根本没有
+    # --budget 这个参数 —— 照着敲是 unrecognized arguments。
+    # 给一条走不通的自救指令，比不给更糟：用户会以为是自己敲错了。
+    check(
+        "命令-replay 真的有 --budget（它自己在错误提示里让人加这个）",
+        'p_rep.add_argument("--budget"' in _cli_src,
+    )
     check("段位-进度条首尾正确", progress_bar(0, 6).startswith("░") and set(progress_bar(6, 6)) == {"█"})
     # 早先这条跟上一行的 `set(progress_bar(6, 6)) == {"█"}` 完全重复，是凑数。
     # 换成真正没人守的方向：进度条长度必须等于总格数，实心数等于当前级数。
@@ -1154,6 +1195,22 @@ def run() -> int:
     check("账单-汇总真实节省", s["saved_fen"] == 500 and s["orders"] == 2, str(s))
     check("账单-最常光顾与最常用券", s["top_store"] == "人民广场店" and s["top_coupon"] == "板烧立减")
     check("账单-脏数据不崩", summarize([{}, {"baseline_fen": None}])["saved_fen"] == 0)
+    # 「脏数据不崩」只喂了 {} 和 None，测不到真正会骗人的那一支。
+    # 旧版本账本 / 手改过的 JSON 里金额可能是 `5000.0` 或 `"5000"`：
+    # 早先写的是 `isinstance(base, int)`，类型不对就整条丢弃 ——
+    # 实测一笔 ¥6.00 的真实成交被算成 ¥0.00，用户以为自己从来没省过钱。
+    # 金额该按**数值**读，不该按**类型**读。
+    _dirty = summarize(
+        [
+            {"baseline_fen": 5000.0, "paid_fen": "4400", "kind": "estimate"},
+            {"baseline_fen": "8000", "paid_fen": 7500.0, "kind": "order"},
+        ]
+    )
+    check(
+        "账单-float/字符串金额不能被静默丢掉（否则真成交记成 ¥0）",
+        _dirty["saved_fen"] == 1100 and _dirty["real_paid_fen"] == 7500,
+        f"saved={_dirty['saved_fen']} real_paid={_dirty['real_paid_fen']}",
+    )
     card = brag_card(500, 2, "麦门学徒", "X店", "Y券")
     card_link = brag_card(500, 2, "麦门学徒", with_link=True)
     check(
@@ -1329,18 +1386,28 @@ def run() -> int:
     from .mcd_client import McpError
 
     class _FlakyOracle:
-        """和 demo_oracle 完全同一个世界，只在第 2、6 次调用上抖一下。
+        """和 demo_oracle 完全同一个世界，按固定种子约三成概率抖一下。
 
-        只在固定的两次上失败（而不是按概率），是因为连续失败 3 次会触发
-        `_failures >= 3` 的抛错兜底 —— 那就测不到"跳过候选继续搜"这个行为了。
+        刻意**不**写成「第 2、6 次调用失败」：那把断言钉死在调用序号上，
+        引擎内部只要多算一次（比如第零步的裸买下界），所有序号集体错位，
+        这条断言立刻失真 —— 本轮就真踩到了：加了下界之后，它从
+        「抖动下仍能找到好解」悄悄退化成「抖动下没崩」，却照样绿。
+        换成固定种子的伪随机序列，调用次数怎么变都不影响它测的东西。
+
+        也刻意**不**写成「按概率随机失败」：`_failures` 是**累计**计数，
+        累计 3 次就走抛错兜底（那是另一条行为，有别的断言管）。
+        30% 的概率下 200 次调用必超 3 次，这条断言就变成在测「兜底抛错」了。
+        所以只抖 2 次、隔几步抖一次：既避开抛错兜底，也不留连续失败。
         """
 
-        def __init__(self):
+        def __init__(self) -> None:
+            self._left = 2  # 总共只抖 2 次
             self.calls = 0
 
         def __call__(self, items, assignment):
             self.calls += 1
-            if self.calls in (2, 6):
+            if self._left > 0 and self.calls % 4 == 0:
+                self._left -= 1
                 raise McpError("模拟网络抖动")
             return demo.demo_oracle(items, assignment)
 
@@ -2407,6 +2474,51 @@ def run() -> int:
             _how_to_order(_how_cart, _how_cps, Assignment(mapping={}))
         ),
     )
+    # 随单购的卡费是**花出去退不回来**的钱，而且下一单还得再买一次。
+    # 只说「卡费另算」，用户会当成一笔可以忽略的小钱 —— 其实它是这单的真实成本。
+    class _WO2:
+        label = "麦金卡（随单购）"
+
+        def signature(self) -> str:
+            return "wo2"
+
+    _card_txt = "\n".join(
+        _how_to_order(_how_cart, _how_cps, Assignment(mapping={0: 0}, with_order=_WO2()))
+    )
+    check(
+        "管家-随单购必须说清卡费不退、下一单还得再买（不是「另算」两个字）",
+        "不退" in _card_txt and "再买一次" in _card_txt,
+        _card_txt,
+    )
+    # 算价时刻 ≠ 下单时刻。跨过时段边界（早市 10:30 收）价格就变了，
+    # 拿着 10:29 算好的价 10:31 去结账一定多付钱 —— 这句不说是害人。
+    _timed = "\n".join(
+        _how_to_order(_how_cart, _how_cps, _how_best, now=datetime(2026, 10, 13, 10, 29))
+    )
+    check(
+        "管家-报出算价时刻并警告跨时段就不是这个价",
+        "10:29 算的" in _timed and "10:30" in _timed,
+        _timed,
+    )
+    check(
+        "管家-没给时间就不编一个时刻（不知道就是不知道）",
+        "算的" not in _how_txt,
+        _how_txt,
+    )
+    # 打烊 = 白跑一趟，不可逆。字段缺失时必须闭嘴（没查到 ≠ 打烊）。
+    from .cli import _closed_warning
+
+    _cw = _closed_warning({"storeName": "人民广场店", "businessStatus": False})
+    check(
+        "管家-门店打烊时必须先喊一声（白跑一趟没人赔）",
+        len(_cw) == 2 and "没在营业" in _cw[0] and "人民广场店" in _cw[0],
+        str(_cw),
+    )
+    check(
+        "管家-营业状态未知时不许说打烊（没查到不等于打烊）",
+        _closed_warning({"storeName": "X"}) == []
+        and _closed_warning({"storeName": "X", "businessStatus": True}) == [],
+    )
 
     # compare 表格：金额必须带 ¥，否则用户分不清 36.00 是元还是分
     class _Q15:
@@ -3137,6 +3249,12 @@ def run() -> int:
         def call_json(self, tool, arguments=None):
             return {"data": {"availablePoint": "9.9", "currency": "积分"}}
 
+        def data(self, tool, arguments=None):
+            # 周报要取服务端时间判断「今天到期」。这里故意**不**提供时间：
+            # 真正的服务端不可达就是这个样子，于是周报会退回本机时间，
+            # 并在报告里明说「按本机时间判断到期」—— 这条下面有断言盯着。
+            return None
+
         def call(self, tool, arguments=None):
             if tool == "query-my-coupons":
                 return "## 卡包券\n- **有效期**: 2026-10-11 05:00-2026-12-31 10:29\n"
@@ -3153,6 +3271,19 @@ def run() -> int:
         "资产-已领取的券不能算成待领取（--claim 会重复领一次）",
         "· 已领取" in _rep and "待领取" not in _rep,
         _rep,
+    )
+    # 问不到服务端时间时必须自己说出来：本机时钟不准 → 到期判断偏 → 漏报，
+    # 而券作废不可逆，用户有权知道这个「今天」是哪个钟给的。
+    check(
+        "资产-服务端时间问不到时明说按本机时间判断到期（漏报不可逆）",
+        "按本机时间判断到期" in _rep,
+        _rep[:200],
+    )
+    # 反过来：给得出服务端时间就不该再喊这一句（不是每次都喊 = 不是装饰）
+    check(
+        "资产-拿得到服务端时间时不再喊本机时间警告",
+        "按本机时间判断到期" not in build_report(_FakeAssetsClient(), now=datetime(2026, 10, 13, 12, 0)),
+        "",
     )
 
     # ── 积分去向：报「您有 N 分」却不说这 N 分能干嘛，是在制造焦虑；
@@ -3191,6 +3322,43 @@ def run() -> int:
                           {"name": "抽", "status": "进行中", "draw_point": 24,
                            "available": 100, "eligible": True, "reason": ""}, {})
         ),
+    )
+
+    # ── 账本：取「最近一单」时必须是真实成交，不能是自己刚写进去的测算
+    from . import snapshot as _snapmod
+
+    _orig_load = _snapmod.load_all
+    try:
+        # 顺序是刻意的：真实成交**在前**、测算**在后**。
+        # 反过来的话 entries[-1] 正好就是那条真实成交，
+        # 于是「优先真实成交」和「直接取最后一条」返回同一个东西 ——
+        # 变异测试真的抓到了这一条：V5 改回去，自检全绿。
+        # 现实里就是这个顺序：replay / optimize 每次把测算追加到末尾。
+        _snapmod.load_all = lambda: [
+            {"kind": "order", "paid_fen": 5000, "store_code": "S1"},
+            {"kind": "estimate", "paid_fen": 3000, "store_code": "S1"},
+        ]
+        _got = _snapmod.latest("S1")
+    finally:
+        _snapmod.load_all = _orig_load
+    check(
+        "账本-取最近一单优先真实成交（拿自己的测算当基准，diff 恒为 0）",
+        _got is not None and _got.get("kind") == "order" and _got.get("paid_fen") == 5000,
+        str(_got),
+    )
+
+    # 「读不出来」和「本来就是空的」必须分开：合并成 0 会让屏幕打印
+    # 「账本是空的，没有可撤回的记录」，用户以为数据没了、甚至以为清空成功了。
+    _orig_read = _snapmod._read
+    try:
+        _snapmod._read = lambda: ([{"paid_fen": 1}], True)
+        _broken_n = _snapmod.delete_last(1)
+    finally:
+        _snapmod._read = _orig_read
+    check(
+        "账本-读不出来时撤回返回 -1（不许翻译成「账本是空的」）",
+        _broken_n == -1,
+        str(_broken_n),
     )
 
     # ── 段位不能刷：测算重复记一百次也不许涨，真实订单还得按指纹去重。

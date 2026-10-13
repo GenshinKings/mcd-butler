@@ -22,8 +22,12 @@ from __future__ import annotations
 
 from collections import Counter
 
+from .coupon_engine import as_fen
+
 # ------------------------------------------------------------------ 段位
-# 门槛按「累计省下多少钱」划分（单位：分）。
+# 门槛按「真实成交的累计**实付**金额」划分（单位：分）。
+# 早先这里写的是「累计省下多少钱」，和下面的实现是反的，而没人发现 ——
+# 注释骗自己不算，骗到的是后来照着注释改代码的人。
 # 取名走麦门黑话：路人 → 学徒 → 信徒 → 执事 → 主教 → 大主教 → 麦门永存。
 RANKS: list[tuple[int, str, str]] = [
     (0, "麦门路人", "刚进门，还没尝到甜头"),
@@ -232,9 +236,13 @@ def summarize(entries: list[dict]) -> dict:
     real_saved = 0
     real_paid = 0
     for e in entries:
-        base = e.get("baseline_fen") or 0
-        paid = e.get("paid_fen") or 0
-        if isinstance(base, int) and isinstance(paid, int) and base > paid:
+        # 一律走 `as_fen`，**不能**写 `isinstance(x, int)`：
+        # 旧版本账本、手改过的 JSON 里金额可能是 `5000.0` 或 `"5000"`，
+        # 类型一判就整条丢弃 —— 实测一笔 ¥6.00 的真实成交被算成 ¥0.00，
+        # 用户于是以为自己从来没省过钱。金额该按数值读，不该按类型读。
+        base = as_fen(e.get("baseline_fen"))
+        paid = as_fen(e.get("paid_fen"))
+        if base > paid:
             saved += base - paid
             # 只有真实成交（order）才进「真省下的钱」。
             # 测算（estimate）是「这么点能省多少」的空间，用户未必真买了 ——
@@ -244,7 +252,7 @@ def summarize(entries: list[dict]) -> dict:
         # 真实成交的**实付金额**：这是段位的依据。
         # 用实付而不是「省了多少」，是因为历史订单的裸买价无从得知 ——
         # 编一个 baseline 去算省了多少，等于替主人虚报。花出去的钱才是硬事实。
-        if e.get("kind") == "order" and isinstance(paid, int) and paid > 0:
+        if e.get("kind") == "order" and paid > 0:
             real_paid += paid
     stores = Counter(
         (e.get("store_name") or e.get("store_code") or "?") for e in entries

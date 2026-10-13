@@ -475,6 +475,18 @@ class CouponOptimizer:
         table = self._eligibility(cart, coupons)
         best: Assignment | None = None
 
+        # ---- 第零步：先把「一张券都不挂、也不随单购」算出来钉成下界（1 次调用）
+        #
+        # 没有这个下界会出什么事：预算不够让爬山把陷阱券删完时，best 会停在
+        # 一个比裸买更贵的解上，屏幕上于是出现「真实省下 ¥-1.00」——
+        # 挂券挂出了负收益。而裸买是唯一一个「一定拿得到」的价：
+        # 它是地板，不是候选之一。先把它踩在脚下，后面只许更好，不许更差。
+        #
+        # 只算一次、也不拿它去爬山（空 mapping 没有券可换可删，爬了也是空转）。
+        bare = Assignment(mapping={}, with_order=None)
+        if self.try_evaluate(cart, bare) is not None:
+            best = bare
+
         # ---- 第一步：每个随单购档位先用贪心各试一次（每档只花 1 次调用）
         #
         # 为什么不能「一个档位爬完山再试下一个」：
