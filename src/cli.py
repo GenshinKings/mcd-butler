@@ -23,6 +23,7 @@ from .coupon_engine import (
     CouponOptimizer,
     PriceResult,
     WithOrderOption,
+    suggest_budget,
     to_fen,
     valid_until_end,
 )
@@ -88,7 +89,9 @@ def _dev_note(text: str) -> None:
         print(text, file=sys.stderr)
 
 
-def _print_search_note(converged: bool, budget: int) -> list[str]:
+def _print_search_note(
+    converged: bool, budget: int, suggested: int | None = None
+) -> list[str]:
     """把「这次到底有没有试遍所有可能」如实告诉用户，顺便给下一步。
 
     为什么要说这件事：`--budget` 默认 40，购物车 6 件商品 8 张券以上基本
@@ -98,14 +101,26 @@ def _print_search_note(converged: bool, budget: int) -> list[str]:
 
     拆成纯函数是为了能离线断言：埋在某条命令的收尾里时，
     就算哪天有人把它删了，一条自检都不会红。
+
+    `suggested` 是按这一单的规模**算出来**的预算建议（`suggest_budget`）。
+    没有它的时候，这里只会机械地报「加 --budget {当前的两倍}」——
+    对 2 件商品是浪费（本来就搜透了），对 6 件商品又远远不够
+    （要几百次才搜得动）。那是个拍脑袋的数，不是算出来的。
     """
     if converged:
         return []
     lines = [
         "",
         "这次没把所有组合都试完 —— 上面是到目前为止找到的最低价，",
-        f"但不保证没有更便宜的了。想试得更全，加 --budget {budget * 2} 再跑一次。",
+        "但不保证没有更便宜的了。",
     ]
+    if suggested and suggested > budget:
+        lines.append(
+            f"按这一单的规模，想试得比较全大约需要 --budget {suggested}"
+            f"（现在是 {budget}）。"
+        )
+    else:
+        lines.append(f"想试得更全，加 --budget {budget * 2} 再跑一次。")
     for line in lines:
         print(line)
     return lines
@@ -1009,7 +1024,16 @@ def run_advise(
         print(f"\n裸买 ¥{FEN(baseline.price_fen)}  →  到手 ¥{FEN(best.price.price_fen)}")
         print(f"真实省下 ¥{FEN(best.price.saved_vs(baseline.price_fen))}")
         _print_insights(oracle, cart, coupons, best, shared)
-        _print_search_note(best.converged, budget)
+        _print_search_note(
+            best.converged,
+            budget,
+            suggested=suggest_budget(
+                optimizer._eligibility(cart, coupons),
+                len(cart),
+                len(_with_order_options(cart)),
+                budget,
+            ),
+        )
         print(f"\n{_butler_close(best.price.saved_vs(baseline.price_fen), wrote=False)}")
         return 0
 
@@ -1342,7 +1366,16 @@ def run_optimize(
 
     if insights:
         _print_insights(oracle, cart, coupons, best, shared)
-    _print_search_note(best.converged, budget)
+    _print_search_note(
+        best.converged,
+        budget,
+        suggested=suggest_budget(
+            optimizer._eligibility(cart, coupons),
+            len(cart),
+            len(_with_order_options(cart)) if cart else 1,
+            budget,
+        ),
+    )
 
     if save:
         from .snapshot import entry_from_cart, save as save_snapshot

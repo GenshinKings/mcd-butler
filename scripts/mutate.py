@@ -9,8 +9,9 @@
     每次补完断言都能立刻验证补的是不是真的。
 
 用法：
-    python scripts/mutate.py            # 跑全部变异
-    python scripts/mutate.py --quick    # 只跑最快的几条
+    python scripts/mutate.py            # 跑全部变异（约 12 分钟）
+    python scripts/mutate.py --quick    # 只跑标了快速档的那几条
+    python scripts/mutate.py --only=V   # 只跑名字里带「V」的（改完引擎后用它复验）
 
 判定：
     改坏后 0 条变红 = 该处没有回归防护（P0）。
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 import atexit
 import io
+import json
 import pathlib
 import signal
 import subprocess
@@ -476,8 +478,8 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
     (
         "N17-对调邻域的适用校验弄反（table 的 key/value 反了）",
         "coupon_engine.py",
-        "                if i1 not in table.get(c2, []) or i2 not in table.get(c1, []):",
-        "                if i1 not in table.get(c1, []) or i2 not in table.get(c2, []):",
+        "            if i1 not in table.get(c2, []) or i2 not in table.get(c1, []):",
+        "            if i1 not in table.get(c1, []) or i2 not in table.get(c2, []):",
         False,
     ),
     (
@@ -729,9 +731,19 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
         True,
     ),
     (
+        # 原文必须能**唯一**钉住缓存命中那一处。
+        # 这里曾经只写 `self._budget.refund()`,而引擎里后来又多了一处
+        # 「算价失败也退还预扣」的 refund，缩进一模一样 —— 替换打到了新添的
+        # 那一处，缓存退款反而没被改坏，断言于是不红，这条变异悄悄变成 0 条。
+        # 教训：两处代码长得像时，原文必须带上能区分它们的上下文。
         "T4-缓存命中照样扣预算（白拿的请求也吃掉额度）",
         "coupon_engine.py",
-        "            self._budget.refund()",
+        "            # 上游缓存命中：把刚才预扣的那一趟还回去。\n"
+        "            # 预算保护的是真实网络请求，不是 evaluate 的调用次数。\n"
+        "            self._budget.refund()\n"
+        "            self.calls -= 1",
+        "            # 上游缓存命中：把刚才预扣的那一趟还回去。\n"
+        "            # 预算保护的是真实网络请求，不是 evaluate 的调用次数。\n"
         "            pass",
         True,
     ),
@@ -986,7 +998,126 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
         "    if False:\n",
         True,
     ),
+    # ---- 下面这几条守的是搜索算法本身。
+    # 它们对应的数字都是 `scripts/bench.py --ablate` 量出来的，不是「觉得应该有用」。
+    (
+        "V9-抢占邻域又没了（有一类最优解只有它走得到，小场景命中率掉到 71%）",
+        "coupon_engine.py",
+        "        if not wide:\n            return\n",
+        "        return\n",
+        True,
+    ),
+    (
+        "V10-卡住后又不走平局步（只肯下降，等于在局部最优原地认输）",
+        "coupon_engine.py",
+        "                accept_equal=True,\n",
+        "                accept_equal=False,\n",
+        True,
+    ),
+    (
+        "V11-邻域计数又退回上界（预算建议会翻倍，用户白等一场）",
+        "coupon_engine.py",
+        "        + sum(  # 邻域 5：对调 —— 还要两边都适用才成立\n"
+        "            1\n"
+        "            for (i1, c1), (i2, c2) in itertools.combinations(list(mapping.items()), 2)\n"
+        "            if i1 in table.get(c2, ()) and i2 in table.get(c1, ())\n"
+        "        )\n",
+        "        + m * (m - 1) // 2\n",
+        True,
+    ),
+    (
+        "V12-预算建议又改成往下压（报个比现在还小的数等于没说）",
+        "coupon_engine.py",
+        "    return max(rounded, current)",
+        "    return min(rounded, current)",
+        True,
+    ),
+    (
+        "V13-预算不够时又去逐个档位均分（每档都半途而废，6 件 7 券命中掉到 0%）",
+        "coupon_engine.py",
+        "            targets = screened if deep_all else screened[:1]",
+        "            targets = screened",
+        True,
+    ),
+    (
+        # 同理，原文必须带上能区分的上下文，且**真的删掉那两行** ——
+        # 早先只改了注释、没动 refund/raise，等于什么都没改坏，自然不红。
+        "V14-算价失败又不退还预扣（一次抖动白白吃掉额度）",
+        "coupon_engine.py",
+        "            self._budget.refund()\n"
+        "            self.calls -= 1\n"
+        "            raise",
+        "            raise",
+        True,
+    ),
 ]
+
+
+#: 「此刻源码正被改坏」的标记。存在即表示上一次没走到还原那一步。
+#: 放在 .workbuddy/ 下（已被 .gitignore 忽略），不会污染仓库。
+_MARKER = ROOT / ".workbuddy" / "mutate-in-progress.json"
+
+
+def _marker_recover() -> str | None:
+    """启动时若发现上次「改坏后没还原」的标记，就地还原并说明。
+
+    为什么需要它：这个脚本的工作方式是「改坏 → 跑自检 → 还原」。
+    一旦在中间被打断（Ctrl-C、超时被 SIGTERM、IDE 杀进程），源码就停在
+    改坏的状态，而 `git diff` 看起来只是普通的一行改动 ——
+    用户会带着一个坏仓库继续干活，还以为是自己的改动。
+    真的发生过：`clamp_top` 被留在 `return top`，自检两轮莫名少 2 条。
+
+    为什么不直接拿「改坏版文本」去源码里搜：试过，误报一大片 ——
+    很多改坏版本身就是常见代码片段（`except Exception:\n return None`
+    在正常代码里到处都是），数出 11 处「残留」，其实全是误伤。
+    所以改成标记文件：改坏前写、还原后删，精确且能自动恢复。
+
+    **还原前必须先对账**：只有当文件当前内容**正是**那条变异的改坏版时，才动它。
+    否则说明被打断之后源码又被改过（可能是用户自己动手修的），
+    这时拿备份覆盖等于把人的改动抹掉 —— 只警告，不覆盖。
+    """
+    if not _MARKER.exists():
+        return None
+    try:
+        data = json.loads(_MARKER.read_text(encoding="utf-8"))
+        rel, backup = data["file"], data["backup"]
+        path = (SRC / rel) if (SRC / rel).is_file() else (ROOT / rel)
+        mut = next((m for m in MUTATIONS if m[0] == data["name"]), None)
+        if mut is None:
+            _MARKER.unlink()
+            return f"清掉了一条对不上号的旧标记（{data['name']}）"
+        expected_bad = backup.replace(mut[2], mut[3], 1)
+        if path.read_text(encoding="utf-8") != expected_bad:
+            _MARKER.unlink()
+            return (
+                f".. 上次跑 {data['name']} 时被打断，但 {rel} 现在已经不是当时的改坏版"
+                f"（多半已经还原过、或被人动过）—— 不敢覆盖，已清掉标记，请自行确认"
+            )
+        path.write_text(backup, encoding="utf-8", newline="\n")
+        _MARKER.unlink()
+        return f"自动还原了上次被打断的改动：{data['name']}（{rel}）"
+    except Exception as exc:  # noqa: BLE001
+        return f"发现上次的标记但自动还原失败（{exc!r}），请手动检查后删除 {_MARKER}"
+
+
+def _preflight() -> list[str]:
+    """开工前查一件事：每条变异的原文必须**唯一**命中。
+
+    替换用的是 `replace(原文, 改坏版, 1)`，只换第一处。两处代码长得一样时，
+    改坏的很可能是另一处 —— 于是这条变异悄悄变成 0 条变红（P0），
+    而**从外面完全看不出来**：它照样打印、照样计数、照样「全部抓住」。
+    真的发生过：T4 打偏到后来新添的那处 refund 上，缓存退款反而没被改坏，
+    这条守卫就这么静默失效了一整轮。
+    """
+    ambiguous: list[str] = []
+    for name, fn, orig, _bad, _q in MUTATIONS:
+        path = ROOT / fn if fn == "README.md" else SRC / fn
+        if not path.exists():
+            continue  # 自变异那条（scripts/mutate.py）由它自己管
+        hits = path.read_text(encoding="utf-8").count(orig)
+        if hits != 1:
+            ambiguous.append(f"{name}（{fn}）：命中 {hits} 处")
+    return ambiguous
 
 
 def run_selftest() -> tuple[int, int, int]:
@@ -1022,7 +1153,34 @@ def run_selftest() -> tuple[int, int, int]:
 
 def main() -> int:
     quick = "--quick" in sys.argv
-    mutations = [m for m in MUTATIONS if m[4]] if quick else MUTATIONS
+    # --only=关键字：只跑名字里带这个关键字的变异。
+    # 改完引擎想确认「新加的几条有没有防护」时，不必把 131 条全跑一遍
+    # （全量约 12 分钟，中途被打断过两次）。
+    # 逗号分隔多个关键字，方便分批（一次全跑 131 条约 12 分钟，容易被打断）
+    only = next(
+        (a.split("=", 1)[1] for a in sys.argv if a.startswith("--only=")), None
+    )
+    if only:
+        keys = [k for k in only.split(",") if k]
+        mutations = [m for m in MUTATIONS if any(k in m[0] for k in keys)]
+        if not mutations:
+            print(f"没有名字里带「{only}」的变异。")
+            return 1
+    else:
+        mutations = [m for m in MUTATIONS if m[4]] if quick else MUTATIONS
+
+    recovered = _marker_recover()
+    if recovered:
+        print(f".. {recovered}\n")
+
+    ambiguous = _preflight()
+    if ambiguous:
+        # 不阻断：历史上有几条本来就命中多处，替换第一处仍然有效。
+        # 但必须**喊出来** —— 静默打偏正是 T4 失效那一轮的样子。
+        print(f".. 有 {len(ambiguous)} 条变异的原文不是唯一命中，替换会打在第一处：")
+        for item in ambiguous:
+            print(f"   - {item}")
+        print()
 
     baseline_pass, baseline_total, baseline_rc = run_selftest()
     if baseline_total <= 0:
@@ -1045,6 +1203,13 @@ def main() -> int:
             failures.append(name)
             continue
         _BACKUPS[path] = original
+        # 改坏之前先落标记（内含原文），被 SIGTERM 打断时下次启动能自动还原
+        _MARKER.parent.mkdir(parents=True, exist_ok=True)
+        _MARKER.write_text(
+            json.dumps({"name": name, "file": rel, "backup": original},
+                       ensure_ascii=False),
+            encoding="utf-8",
+        )
         try:
             path.write_text(
                 original.replace(old, new, 1), encoding="utf-8", newline="\n"
@@ -1052,6 +1217,7 @@ def main() -> int:
             passed, total, rc = run_selftest()
         finally:
             path.write_text(original, encoding="utf-8", newline="\n")
+            _MARKER.unlink(missing_ok=True)
             _BACKUPS.pop(path, None)
 
         if total <= 0:

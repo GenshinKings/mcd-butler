@@ -16,12 +16,21 @@
 求解策略
 --------
 因为目标函数是黑盒、且每次求值要走网络（限流 600 次/分钟），
-这里用「贪心构造 + 局部搜索（爬山）」而不是穷举：
+这里用「贪心构造 + 禁忌局部搜索 + 扰动重启」而不是穷举：
 
     1. 贪心：按「可挂商品数」升序安排券（最受约束的先占坑）
-    2. 爬山：交替执行 删除 / 新增 / 换券 / 挪动 / 对调 五种邻域动作，
-       每步都用真实算价接口验证，接受任何变便宜的改动
-    3. 预算耗尽或收敛即停
+    2. 局部搜索：六种邻域动作（删 / 加 / 换 / 挪 / 对调 / 抢占），
+       每一步都用真实算价接口验证。先一路下降；
+       卡在局部最优时允许横移一步（价格不变）换片盆地，
+       禁忌表负责不让它绕回原地
+    3. 扰动重启：从当前最优解随机踢掉几张券，再让邻域把坑填回去
+       （ruin & recreate）
+    4. 预算耗尽、或再也走不动时收工
+
+为什么不是纯爬山：纯爬山能证明的只是「一步走不到更好的」，
+而用户要的是「没有更好的」。实测把预算放大 12 倍（40 → 500 次调用），
+命中穷举最优只从 76.7% 走到 84.0% —— 多给的钱只买回 7 个点，
+说明剩下的失败全是「走不到」，该改的是走法，不是加钱。
 
 这样既能在有限调用次数内逼近最优，又不会依赖未在文档中承诺的字段。
 
@@ -36,7 +45,7 @@ import random
 import re
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
 
 def to_fen(value: Any) -> int:
@@ -192,6 +201,98 @@ class PriceResult:
         return f"{fen / 100:.2f}"
 
 
+def neighborhood_size(table: dict[int, list[int]], mapping: dict[int, int]) -> int:
+    """邻域候选总数 —— 与 `_neighborhood` 实际 yield 的个数**逐个对齐**。
+
+    这个数之所以要算得准，是因为它同时管两件事：
+
+    一、**还值不值得探索**。横移和扰动都要先扫一遍邻域，而邻域规模随
+    商品数、券数平方级上涨。6 件商品 7 张券时一遍要 70 多次求值，
+    40 次预算连一遍都扫不完 —— 这时还去横移，等于把本该用来下降的钱
+    扔进一场注定半途而废的探索。实测就是这么翻的车：命中率上去了，
+    平均差却从 ¥1.20 恶化到 ¥1.80。所以规矩是：剩下的钱不够再扫一遍就别开探索。
+
+    二、**该给用户推荐多大预算**（`suggest_budget`）。这一条直接决定
+    用户看到的那句「加 --budget N 再跑一次」里的 N 是不是可信。
+    早先这个数把「加券」邻域按「券数 × 商品数」粗算，而商品占满时
+    它实际一个候选都不产生 —— 高估近一倍，推荐值也就跟着离谱。
+
+    所以这里逐个邻域精确计数，与生成器一一对应。改动邻域时必须同步改这里，
+    `selftest` 里有一条断言专门钉住两者不许走散。
+    """
+    occupied = set(mapping)
+    used = set(mapping.values())
+    m = len(mapping)
+    return (
+        m  # 邻域 1：删 —— 每个已挂位置各一个
+        + sum(  # 邻域 2：加 —— 未用的券 × 还空着的商品
+            1
+            for ci, hits in table.items()
+            if ci not in used
+            for item_idx in hits
+            if item_idx not in occupied
+        )
+        + sum(  # 邻域 3：换 —— 已挂商品 × 适用于它且还没用的券
+            1
+            for item_idx, ci in mapping.items()
+            for cj, hits in table.items()
+            if cj != ci and cj not in used and item_idx in hits
+        )
+        + sum(  # 邻域 4：挪 —— 已挂的券 × 它还能挂的空闲商品
+            1
+            for item_idx, ci in mapping.items()
+            for target in table.get(ci, ())
+            if target != item_idx and target not in occupied
+        )
+        + sum(  # 邻域 5：对调 —— 还要两边都适用才成立
+            1
+            for (i1, c1), (i2, c2) in itertools.combinations(list(mapping.items()), 2)
+            if i1 in table.get(c2, ()) and i2 in table.get(c1, ())
+        )
+        + sum(  # 邻域 6：抢占 —— cj 得适用于 i
+            1
+            for (i, _ci), (j, cj) in itertools.permutations(list(mapping.items()), 2)
+            if i in table.get(cj, ())
+        )
+    )
+
+
+#: 一次局部搜索典型要迭代几轮。这个数是**扫出来的**，不是拍的：
+#: 拿 suggest_budget 自己推荐的预算去真跑，看命中率随它怎么变 ——
+#:   T=4  →  6 件 7 券推荐 150，只命中 57%
+#:   T=8  →  推荐 300，命中 86%      ← 拐点
+#:   T=12 →  推荐 450，仍是 86%      ← 再加钱没用，白等
+#:   T=20 →  推荐 750，仍是 86%
+#: 所以取 8：再往上只会让用户多等，换不来更准。它只用于估量级，
+#: 不参与任何正确性判断。
+TYPICAL_ITERATIONS = 8
+
+
+def suggest_budget(
+    table: dict[int, list[int]], n_items: int, n_tiers: int, current: int
+) -> int:
+    """按这一单的规模，估一个「够搜得像样」的 --budget 值。
+
+    为什么要估这个数：用户真正想知道的不是「调用了 40 次」，而是
+    「我这一单到底搜透了没、要搜透得给多少」。原来的提示只会机械地说
+    「加 --budget 80」（当前值的两倍），对 2 件商品是浪费、对 6 件商品
+    又远远不够 —— 那是个拍脑袋的数，不是算出来的。
+
+    模型：一次局部搜索 ≈ 迭代 `TYPICAL_ITERATIONS` 轮 × 每轮扫半遍邻域
+    （first-improvement 平均扫一半就找到改进），每个随单购档位各来一遍，
+    再加裸买那一次。向上取整到 50，免得报出一串看着像精确值的零头 ——
+    它估的是量级，报成 470 比报成 468 更诚实。
+    """
+    # 贪心解通常把 min(商品数, 券数) 个位置填满，用它当探针估算邻域规模
+    filled = min(n_items, len(table))
+    probe = {i: c for i, c in enumerate(sorted(table)[:filled])}
+    per_search = TYPICAL_ITERATIONS * max(neighborhood_size(table, probe) // 2, 1)
+    raw = 1 + n_tiers + n_tiers * per_search
+    rounded = -(-raw // 50) * 50
+    # 只往上建议，永不往下：预算给多了只是慢一点，给少了是给出个没搜完的价
+    return max(rounded, current)
+
+
 @dataclass(frozen=True)
 class WithOrderOption:
     """一个「随单购」档位。
@@ -304,26 +405,44 @@ class CouponOptimizer:
         oracle: PriceOracle,
         max_calls: int = 40,
         verbose: bool = False,
-        max_restarts: int = 2,
+        max_restarts: int = 3,
         restart_seed: int = 20261011,
         budget: Budget | None = None,
+        tabu_tenure: int = 6,
+        max_iterations: int = 64,
+        sideways_reserve: int = 6,
     ):
         """参数说明：
 
         `max_calls`  本求解器自己的上限
         `budget`     全局共享预算；不传就退化为「只受 max_calls 约束」
         `max_restarts`
-            爬山收敛后换起点重来的轮数。实测同样 400 组随机用例、预算 40 次：
-            不重启命中穷举最优 92.8%，重启 2 轮命中 94.0%，代价约多 2 次调用。
-            重启只在还有预算时才发生，收敛快的场景不会被拖慢。
+            局部搜索收敛后，从当前最优解**随机踢掉几张券**再重来的轮数
+            （ruin & recreate）。0 = 不做扰动。只在预算有富余时发生。
+        `tabu_tenure`
+            横移时「刚走过的解多久之内不许回去」。太小会原地打转，
+            太大会堵死通路。
+        `max_iterations`
+            单轮局部搜索的迭代上限。横移不降价，得有个闸，
+            否则预算全烧在价格不变的原地踏步上。
+        `sideways_reserve`
+            剩余预算低于这个数就不再尝试横移 —— 把钱留给别的随单购档位和扰动重启。
+        没有 `min_tier_quota` 了。原先给每个随单购档位设了 6 次的保底，
+        理由是「不让第一个档位把预算吃光」—— 听着对，但消融实测在
+        三种 oracle 形态 × 三档预算下**全是零贡献**，于是删掉，
+        只保留「按剩余档位数均分」这一层。留着一个没测出收益的旋钮，
+        比没有这个旋钮更糟：它会让人以为那里已经保护过了。
         """
         self.oracle = oracle
         self.max_calls = max(int(max_calls), 0)
         self.verbose = verbose
         self._budget = budget or Budget(self.max_calls)
-        # 爬山收敛后再换起点重来的轮数。0 = 不做重启。
+        # 收敛后做几轮「踢掉几张券再填回去」的扰动。0 = 不做。
         self.max_restarts = max(0, max_restarts)
         self.restart_seed = restart_seed
+        self.tabu_tenure = max(int(tabu_tenure), 0)
+        self.max_iterations = max(int(max_iterations), 1)
+        self.sideways_reserve = max(int(sideways_reserve), 0)
         self.calls = 0
         # 同一个方案会被不同的邻域动作重复生成（例如先删后加绕回原点），
         # 缓存命中就不消耗调用次数 —— 预算是按次计的，省一次是一次。
@@ -365,7 +484,16 @@ class CouponOptimizer:
 
         _stats = getattr(self.oracle, "calls", None)
         _before = _stats["calls"] if isinstance(_stats, dict) else None
-        result = self.oracle(list(cart), assignment)
+        try:
+            result = self.oracle(list(cart), assignment)
+        except Exception:
+            # 这一趟没拿到价格，预扣的次数必须还回去。
+            # 预算保护的是「真实发生的网络请求」，不是「evaluate 被调用了几次」。
+            # 不还的后果是双重的：额度白白少一次，且该方案因为没写进 _cache，
+            # 后面扰动重来时还会为同一个注定失败的方案再付一遍钱。
+            self._budget.refund()
+            self.calls -= 1
+            raise
         if isinstance(_stats, dict) and _before == _stats["calls"]:
             # 上游缓存命中：把刚才预扣的那一趟还回去。
             # 预算保护的是真实网络请求，不是 evaluate 的调用次数。
@@ -510,35 +638,68 @@ class CouponOptimizer:
             if best is None or start.price.price_fen < best.price.price_fen:
                 best = start
 
-        # ---- 第二步：按贪心价从低到高分配剩下的预算，好钢用在刀刃上
+        # ---- 第二步：按贪心价从低到高排，再决定「深搜几个档位」
+        #
+        # 这一步经历过一次矫枉过正，值得记下来。最早是「第一个档位一路爬到
+        # 收敛」，结果它把预算吃干，后面的档位连一次邻域都进不去，只能拿贪心
+        # 那个价交差 —— 于是改成「先筛一遍、再逐个深搜」。
+        # 但逐个深搜在预算紧张时是灾难：6 件商品 7 张券、40 次预算下，一遍
+        # 邻域就要 48 次调用，均成三份每份 12 次，**三份全是半途而废** ——
+        # 命中率从 40% 直接掉到 0%，平均差 ¥3.93 恶化到 ¥16.53。
+        #
+        # 所以规矩是：钱够给每个档位各扫一遍，才逐个深搜；不够就把全部预算
+        # 压在**筛出来最好的那一个**档位上。预算紧张时，「把一个档位搜透」
+        # 永远胜过「三个档位各摸一把」。
         screened.sort(key=lambda a: a.price.price_fen)
-        for start in screened:
+        if not screened:
+            targets = []
+        else:
+            probe = neighborhood_size(table, screened[0].mapping)
+            deep_all = self.remaining >= max(probe, 1) * len(screened)
+            targets = screened if deep_all else screened[:1]
+        n_tiers = len(targets)
+        for rank, start in enumerate(targets):
             if self.remaining <= 0:
                 break
-            climbed = self._hill_climb(cart, coupons, table, start)
+            left = n_tiers - rank
+            quota = self.remaining if left == 1 else max(1, self.remaining // left)
+            climbed = self._local_search(cart, table, start, quota)
             if climbed.price is not None and (
                 best is None or climbed.price.price_fen < best.price.price_fen
             ):
                 best = climbed
 
-            # 迭代局部搜索：收敛后换个贪心起点再来一轮。
-            # 爬山只能保证「邻域内没有更便宜的」，不保证全局最优。
-            # 只在预算还有富余时做，且每轮都先看一眼预算，绝不超支。
-            for restart in range(1, self.max_restarts + 1):
-                if self.remaining <= 0 or best is None or best.price is None:
+        # ---- 第三步：扰动重启（ruin & recreate）
+        #
+        # 原来的重启是「换个贪心起点再爬一遍」，这里有个洞：贪心按「可挂商品数」
+        # 分桶后只在桶内打乱，而各券可挂商品数常常互不相同 —— 桶里只有一张券时
+        # 顺序原封不动，重启出来的起点和首轮逐位相同，等于同一座山爬两遍，
+        # 白花预算还假装做了多样性。
+        #
+        # 改成从**当前最优解**出发，随机踢掉几张券（ruin），再让邻域把坑填回去
+        # （recreate）。起点既不同、又是从已知最好的地方出发 —— 这才是重启该有的样子。
+        rng = random.Random(self.restart_seed)
+        for _ in range(self.max_restarts):
+            if best is None or best.price is None:
+                break
+            # 一轮扰动 = 踢掉几张券 + 把坑重新填回去，至少要「再扫一遍邻域」的钱。
+            # 不够就别开：开到一半断了，等于把本可以下降的钱打了水漂。
+            if self.remaining <= self.sideways_reserve + self._sweep_cost(
+                table, best.mapping
+            ):
+                break
+            alt = self._ruin(best.mapping, rng)
+            alt.with_order = best.with_order
+            # 踢完跟原来一模一样（多半是没什么券可踢），这次扰动没意义
+            if alt.signature() == best.signature():
+                continue
+            if self.try_evaluate(cart, alt) is None:
+                if self.remaining <= 0:
                     break
-                alt = self.greedy(cart, coupons, shuffle=self.restart_seed + restart)
-                alt.with_order = start.with_order
-                # 起点跟当前最优一样的话，重启没有意义，省下这次调用
-                if alt.signature() == best.signature():
-                    continue
-                if self.try_evaluate(cart, alt) is None:
-                    if self.remaining <= 0:
-                        break
-                    continue
-                alt = self._hill_climb(cart, coupons, table, alt)
-                if alt.price is not None and alt.price.price_fen < best.price.price_fen:
-                    best = alt
+                continue
+            alt = self._local_search(cart, table, alt, self.remaining)
+            if alt.price is not None and alt.price.price_fen < best.price.price_fen:
+                best = alt
 
         if best is None or best.price is None:
             # 预算连一次贪心都没跑成。
@@ -566,150 +727,247 @@ class CouponOptimizer:
         self._stopped = True
         return current
 
-    def _hill_climb(
+    def _local_search(
         self,
         cart: Sequence[CartItem],
-        coupons: Sequence[Coupon],
         table: dict[int, list[int]],
         start: Assignment,
+        quota: int = 0,
     ) -> Assignment:
+        """局部搜索：先一路下降，卡住之后横移一步换片盆地，再卡住才收工。
+
+        和纯爬山的差别就在「卡住之后不立刻认输」这半句。
+        纯爬山宣布最优时说的那句话，真身是「从这儿出发，一步走不到更好的」；
+        而组合优化里大量的最优解需要先横移一步（价格暂时不变）才换得到盆地。
+
+        这不是纸上谈兵，是量出来的：把预算放大 12 倍（40 → 500 次调用），
+        命中穷举最优只从 76.7% 走到 84.0%。多给的钱只买回来 7 个点，
+        说明剩下那 16% 是「走不到」，不是「没走完」—— 该改的是走法，不是加钱。
+
+        `quota` 是本轮最多愿意花掉的求值次数（0 = 不限，只看全局预算）。
+        """
         current = start
         if current.price is None:
             if self.try_evaluate(cart, current) is None:
                 return current
         current_price = current.price.price_fen
 
-        improved = True
-        while improved and self.remaining > 0:
-            improved = False
+        tabu: dict[tuple, int] = {}
+        iteration = 0
+        # 开工前定一次：这一轮开不开「抢占」邻域。
+        # 判据是「剩下的钱够不够扫一遍完整邻域」—— 够，才付得起那份 O(m²)。
+        wide = self.remaining >= neighborhood_size(table, start.mapping)
+        # 本轮的花费用「还剩多少」当闸，而不是另起一个计数器：
+        # 缓存命中不扣预算，这个闸也就跟着不关，不用额外去对齐两套账。
+        floor = max(self.remaining - quota, 0) if quota else 0
 
-            # 邻域 1：删掉一张已挂的券
-            # 这不是多余的 —— 实测券会被随单购作废，挂着反而占坑。
-            for item_idx in list(current.mapping):
-                candidate = Assignment(
-                    mapping={k: v for k, v in current.mapping.items() if k != item_idx},
-                    with_order=current.with_order,
-                )
-                price, reason = self._try_evaluate(cart, candidate)
-                if reason == "budget":
-                    return self._stopped_early(current)
-                if price is None:
-                    continue  # 抖动/单次失败：跳过这个候选，继续试下一个
-                if price.price_fen < current_price:
-                    current, current_price = candidate, price.price_fen
-                    improved = True
-                    break
+        while self.remaining > floor and iteration < self.max_iterations:
+            iteration += 1
 
-            if improved:
+            # ---- 阶段一：严格下降。见好就收，一步都不浪费在平局上。
+            current, current_price, status = self._scan(
+                cart,
+                table,
+                current,
+                current_price,
+                accept_equal=False,
+                tabu=None,
+                iteration=iteration,
+                wide=wide,
+            )
+            if status == "exhausted":
+                return self._stopped_early(current)
+            if status == "moved":
                 continue
 
-            # 邻域 2：给空闲商品补一张未用的券
-            used_coupons = set(current.mapping.values())
-            for ci, hits in table.items():
-                if ci in used_coupons:
-                    continue
-                for item_idx in hits:
-                    if item_idx in current.mapping:
-                        continue
-                    candidate = Assignment(
-                        mapping={**current.mapping, item_idx: ci},
-                        with_order=current.with_order,
-                    )
-                    price, reason = self._try_evaluate(cart, candidate)
-                    if reason == "budget":
-                        return self._stopped_early(current)
-                    if price is None:
-                        continue  # 抖动/单次失败：跳过这个候选，继续试下一个
-                    if price.price_fen < current_price:
-                        current, current_price = candidate, price.price_fen
-                        improved = True
-                        break
-                if improved:
-                    break
-
-            if improved:
-                continue
-
-            # 邻域 3：把某个**已挂商品**上的券，换成另一张还没用、且也适用它的券
+            # ---- 阶段二：邻域扫完了才谈得上「卡住」。预算还够就横移换盆地。
             #
-            # 这是最容易被漏掉的一个邻域，也是实测里最值钱的一个。
-            # 贪心是「最受约束的券先占坑」，于是那张只能用在 1 个商品上的券
-            # 会第一个抢到位置 —— 但它未必是那件商品上最猛的一张。
-            # 此时「删」会让总价变贵（不通过）、「加」无处可加（商品已占），
-            # 两个邻域都动不了，就卡死在次优解上。
-            #
-            # 实测（400 组随机券表，预算 40 次调用，以穷举最优为基准）：
-            #   只有 删/加/挪/对调  →  命中 76.2%，平均差 ¥1.785
-            #   补上这个邻域        →  命中 92.8%，平均差 ¥0.315
-            # 这组对照就是 `selftest` 里的「引擎-对照穷举最优」一项，可复现。
-            used_coupons = set(current.mapping.values())
-            for item_idx, ci in list(current.mapping.items()):
-                for cj, hits in table.items():
-                    if cj == ci or cj in used_coupons:
-                        continue
-                    if item_idx not in hits:
-                        continue
-                    swapped = dict(current.mapping)
-                    swapped[item_idx] = cj
-                    candidate = Assignment(mapping=swapped, with_order=current.with_order)
-                    price, reason = self._try_evaluate(cart, candidate)
-                    if reason == "budget":
-                        return self._stopped_early(current)
-                    if price is None:
-                        continue  # 抖动/单次失败：跳过这个候选，继续试下一个
-                    if price.price_fen < current_price:
-                        current, current_price = candidate, price.price_fen
-                        improved = True
-                        break
-                if improved:
-                    break
-
-            if improved:
-                continue
-
-            # 邻域 4：把已挂的券挪到另一个它还适用的空闲商品上
-            # 只有「删」和「加」的话，单步都不一定变便宜，会卡在局部最优出不来。
-            for item_idx, ci in list(current.mapping.items()):
-                for target in table.get(ci, []):
-                    if target == item_idx or target in current.mapping:
-                        continue
-                    moved = dict(current.mapping)
-                    del moved[item_idx]
-                    moved[target] = ci
-                    candidate = Assignment(mapping=moved, with_order=current.with_order)
-                    price, reason = self._try_evaluate(cart, candidate)
-                    if reason == "budget":
-                        return self._stopped_early(current)
-                    if price is None:
-                        continue  # 抖动/单次失败：跳过这个候选，继续试下一个
-                    if price.price_fen < current_price:
-                        current, current_price = candidate, price.price_fen
-                        improved = True
-                        break
-                if improved:
-                    break
-
-            if improved:
-                continue
-
-            # 邻域 5：两张已挂的券对调
-            # 对调之后是「商品 i1 挂券 c2、商品 i2 挂券 c1」，
-            # 所以要校验的是 c2 适用于 i1、c1 适用于 i2。
-            # table 的 key 是券下标、value 是商品下标列表 —— 千万别把两者弄反。
-            for (i1, c1), (i2, c2) in itertools.combinations(list(current.mapping.items()), 2):
-                if i1 not in table.get(c2, []) or i2 not in table.get(c1, []):
-                    continue
-                swapped = dict(current.mapping)
-                swapped[i1], swapped[i2] = c2, c1
-                candidate = Assignment(mapping=swapped, with_order=current.with_order)
-                price, reason = self._try_evaluate(cart, candidate)
-                if reason == "budget":
-                    return self._stopped_early(current)
-                if price is None:
-                    continue  # 抖动/单次失败：跳过这个候选，继续试下一个
-                if price.price_fen < current_price:
-                    current, current_price = candidate, price.price_fen
-                    improved = True
-                    break
+            # 为什么只在卡住之后才横移：横移不降价，每一趟都是纯支出。
+            # 放到下降阶段去做，预算会全烧在价格不变的原地踏步上 ——
+            # 这正是「加了平局反而更差」最典型的翻车方式。
+            # 预算紧的时候不做横移：横移不降价，是纯投资，
+            # 投到一半断了就血本无归。至少得留出「再扫半遍邻域」的钱。
+            if self.remaining <= self.sideways_reserve + self._sweep_cost(
+                table, current.mapping
+            ) // 2:
+                break
+            # 把脚下这块地方钉进禁忌表：下一步不许原路走回来
+            tabu[current.signature()] = iteration
+            current, current_price, status = self._scan(
+                cart,
+                table,
+                current,
+                current_price,
+                accept_equal=True,
+                tabu=tabu,
+                iteration=iteration,
+                wide=wide,
+            )
+            if status == "exhausted":
+                return self._stopped_early(current)
+            if status != "moved":
+                break  # 连平局都走不动，这片盆地是真探完了
 
         return current
+
+    def _ruin(self, mapping: dict[int, int], rng: random.Random) -> Assignment:
+        """从一份方案里随机踢掉几张券，造一个「不同但接近」的新起点。
+
+        踢几张是随机的（至少一张、至多全踢）：只踢一张的话，邻域 2 多半会
+        原路把它加回去，等于没扰动；全踢光又退化成从零贪心，白丢已有成果。
+        """
+        if not mapping:
+            return Assignment(mapping={})
+        k = rng.randint(1, len(mapping))
+        victims = rng.sample(sorted(mapping), k)
+        return Assignment(mapping={i: c for i, c in mapping.items() if i not in victims})
+
+    def _sweep_cost(self, table: dict[int, list[int]], mapping: dict[int, int]) -> int:
+        """扫一遍完整邻域要花多少次求值（精确值，不是估算）。"""
+        return neighborhood_size(table, mapping)
+
+    def _scan(
+        self,
+        cart: Sequence[CartItem],
+        table: dict[int, list[int]],
+        current: Assignment,
+        current_price: int,
+        accept_equal: bool,
+        tabu: dict[tuple, int] | None,
+        iteration: int,
+        wide: bool = True,
+    ) -> tuple[Assignment, int, str]:
+        """扫邻域，遇到第一个能接受的候选就走过去。
+
+        返回 `(当前解, 当前价, 状态)`，状态三种：
+            "moved"      走了一步
+            "exhausted"  预算见底，必须收工
+            "stuck"      邻域**扫完了**，没有能接受的
+
+        这里曾经有个「本轮最多求几个新候选」的上限，想法是把一次大扫描切成
+        几批、靠缓存接力看完。听起来漂亮，实测却更差（命中掉 1.6 个点、
+        平均差恶化 ¥0.70）：把一次本可以一口气走通的下降切成几段，
+        每段都还没走到改进点就被掐断。删掉了。
+        """
+        for candidate in self._neighborhood(table, current, wide):
+            if tabu is not None:
+                left = tabu.get(candidate.signature())
+                if left is not None and iteration - left < self.tabu_tenure:
+                    continue  # 刚从那儿出来，不许马上回去
+            price, reason = self._try_evaluate(cart, candidate)
+            if reason == "budget":
+                return current, current_price, "exhausted"
+            if price is None:
+                continue  # 单次失败（抖动/接口报错）：跳过，继续试下一个候选
+            if price.price_fen < current_price:
+                return candidate, price.price_fen, "moved"
+            if accept_equal and price.price_fen == current_price:
+                # 平局也走：价格没变，但换了个站位，看到的邻域就不同了 ——
+                # 门就是这样一道道打开的。禁忌表负责不让我们绕回原地。
+                return candidate, price.price_fen, "moved"
+        return current, current_price, "stuck"
+
+    def _neighborhood(
+        self, table: dict[int, list[int]], current: Assignment, wide: bool = True
+    ) -> Iterator[Assignment]:
+        """枚举当前解「一步之遥」的所有候选（惰性生成，扫到就求值，不预先展开）。
+
+        六个邻域的顺序不是随手排的：
+            1 删   2 加               改变「挂了几张券」
+            3 换   4 挪   5 对调       重排「谁挂谁」
+            6 抢占                    挤掉别人，自己上位
+
+        `wide=False` 时关掉「抢占」。这不是可有可无的开关，是实测逼出来的：
+        抢占的候选数是 O(m²)，6 件商品时能让单次扫描贵一倍。预算宽裕时它
+        值那笔钱（三种 oracle 形态下都能换来 3~8 个点的命中率），
+        但预算紧张时，多出来的这一半候选是**拿「少走两步下降」换的** ——
+        分层数据说得清清楚楚，40 次预算下 5 件 6 券以上的平均差因此从
+        ¥2.46 恶化到 ¥6.65，命中率也从 54.5% 掉到 36.4%。
+
+        所以规矩是：**剩下的钱够扫一遍完整邻域，才开抢占。**
+        """
+        mapping = current.mapping
+        wo = current.with_order
+
+        # 邻域 1：删掉一张已挂的券
+        # 这不是多余的 —— 实测券会被随单购作废，挂着反而占坑。
+        for item_idx in list(mapping):
+            yield Assignment(
+                mapping={k: v for k, v in mapping.items() if k != item_idx},
+                with_order=wo,
+            )
+
+        # 邻域 2：给空闲商品补一张未用的券
+        used_coupons = set(mapping.values())
+        for ci, hits in table.items():
+            if ci in used_coupons:
+                continue
+            for item_idx in hits:
+                if item_idx in mapping:
+                    continue
+                yield Assignment(mapping={**mapping, item_idx: ci}, with_order=wo)
+
+        # 邻域 3：把某个**已挂商品**上的券，换成另一张还没用、且也适用它的券
+        #
+        # 这是最容易被漏掉的一个邻域，也是实测里最值钱的一个。
+        # 贪心是「最受约束的券先占坑」，于是那张只能用在 1 个商品上的券
+        # 会第一个抢到位置 —— 但它未必是那件商品上最猛的一张。
+        # 此时「删」会让总价变贵（不通过）、「加」无处可加（商品已占），
+        # 两个邻域都动不了，就卡死在次优解上。
+        used_coupons = set(mapping.values())
+        for item_idx, ci in list(mapping.items()):
+            for cj, hits in table.items():
+                if cj == ci or cj in used_coupons:
+                    continue
+                if item_idx not in hits:
+                    continue
+                swapped = dict(mapping)
+                swapped[item_idx] = cj
+                yield Assignment(mapping=swapped, with_order=wo)
+
+        # 邻域 4：把已挂的券挪到另一个它还适用的**空闲**商品上
+        for item_idx, ci in list(mapping.items()):
+            for target in table.get(ci, []):
+                if target == item_idx or target in mapping:
+                    continue
+                moved = dict(mapping)
+                del moved[item_idx]
+                moved[target] = ci
+                yield Assignment(mapping=moved, with_order=wo)
+
+        # 邻域 5：两张已挂的券对调
+        # 对调之后是「商品 i1 挂券 c2、商品 i2 挂券 c1」，
+        # 所以要校验的是 c2 适用于 i1、c1 适用于 i2。
+        # table 的 key 是券下标、value 是商品下标列表 —— 千万别把两者弄反。
+        for (i1, c1), (i2, c2) in itertools.combinations(list(mapping.items()), 2):
+            if i1 not in table.get(c2, []) or i2 not in table.get(c1, []):
+                continue
+            swapped = dict(mapping)
+            swapped[i1], swapped[i2] = c2, c1
+            yield Assignment(mapping=swapped, with_order=wo)
+
+        # 邻域 6：抢占 —— 把别人身上那张券抢过来，自己原来那张就此作废
+        #
+        # 这次改动补的第三个洞，也是最要紧的一个。
+        # 「换」只允许换成**没人用**的券，「挪」只允许挪到**空着**的商品，
+        # 于是下面这种解在只有前五个邻域时**根本不可达**：
+        #
+        #     当前 {A挂X, B挂Y}，最优 {A挂Y}
+        #       删掉 B  → 总价变贵，被拒绝
+        #       给 A 换券 → Y 正被 B 占用，被 `cj in used_coupons` 排除
+        #
+        # 每一步单看都不便宜，可它们的组合才是真最优。实测 2 件商品 2 张券
+        # 这种小到能穷举的场景（解空间才 21 个方案，40 次预算绰绰有余）
+        # 也只能命中 71.4% —— 缺的就是这一个动作。
+        #
+        # 用 permutations 而不是 combinations：抢占是有方向的
+        # （i 抢 j 的 与 j 抢 i 的 是两回事），两个方向都得给。
+        if not wide:
+            return
+        for (i, _ci), (j, cj) in itertools.permutations(list(mapping.items()), 2):
+            if i not in table.get(cj, []):
+                continue  # cj 压根不适用于 i，抢过来也挂不上
+            seized = dict(mapping)
+            del seized[j]  # cj 离开 j，j 就此空着
+            seized[i] = cj  # cj 占住 i，i 上原来那张被挤掉
+            yield Assignment(mapping=seized, with_order=wo)

@@ -31,6 +31,8 @@ from .coupon_engine import (
     PriceResult,
     WithOrderOption,
     as_fen,
+    neighborhood_size,
+    suggest_budget,
     to_fen,
     valid_until_end,
 )
@@ -3441,9 +3443,8 @@ def run() -> int:
         return PriceResult(price_fen=4000 - 100 * len(a.mapping), original_fen=4000)
 
     _sopt = CouponOptimizer(_strict_oracle, max_calls=40)
-    _climbed = _sopt._hill_climb(
+    _climbed = _sopt._local_search(
         [_sx, _sy],
-        _scps,
         _sopt._eligibility([_sx, _sy], _scps),
         Assignment(mapping={0: 1, 1: 0}),
     )
@@ -3456,6 +3457,214 @@ def run() -> int:
         "引擎-对调邻域必须校验「对调后的券适用于对调后的商品」（table 的 key/value 别弄反）",
         not _sbad,
         f"对调出了不合规的挂法 {_sbad}",
+    )
+
+    # ── N21：抢占邻域 —— 有一类最优解只有它走得到
+    #
+    # 场景：A 挂 X、B 挂 Y，最优其实是「A 挂 Y」。
+    # 逐个邻域看过去，前五个**一个都动不了**：
+    #   删 A 上的 X → X 是正收益，删了变贵        拒绝
+    #   删 B 上的 Y → 同样变贵                    拒绝
+    #   给 A 换券   → Y 正被 B 占着，换不到        无候选
+    #   把 Y 挪到 A → A 被 X 占着，挪不过去        无候选
+    #   对调        → X 不适用于 B                 无候选
+    # 只有「抢占」能一步到位：把 Y 从 B 抢过来，X 就此作废。
+    #
+    # 这条断言钉的是那个洞本身 —— 补上它之前，2 件商品 2 张券这种
+    # 小到能穷举的场景（解空间才 21 个方案）也只能命中 71.4%。
+    _pa = CartItem("A", "A", 1, 2000)
+    _pb = CartItem("B", "B", 1, 2000)
+    _pgain = {("X", "A"): 200, ("Y", "A"): 800, ("Y", "B"): 100}
+    _pcps = [
+        Coupon("X", "x", "X券", frozenset({"A"})),
+        Coupon("Y", "y", "Y券", frozenset({"A", "B"})),
+    ]
+
+    def _pair_oracle(items, a):
+        _sub = sum(i.unit_price_fen * i.quantity for i in items)
+        _d = sum(
+            _pgain.get((_pcps[ci].coupon_id, items[idx].product_code), 0)
+            for idx, ci in a.mapping.items()
+        )
+        return PriceResult(price_fen=_sub - _d, original_fen=_sub, discount_fen=_d)
+
+    _popt = CouponOptimizer(_pair_oracle, max_calls=40)
+    _ptable = _popt._eligibility([_pa, _pb], _pcps)
+    _got = _popt._local_search(
+        [_pa, _pb], _ptable, Assignment(mapping={0: 0, 1: 1})
+    )  # A 挂 X、B 挂 Y，价 ¥37.00
+    check(
+        "引擎-抢占邻域必须存在（最优解只能靠「抢走别人身上的券」才走得到）",
+        _got.price is not None and _got.price.price_fen == 3200,
+        f"停在 ¥{(_got.price.price_fen if _got.price else -1) / 100:.2f}（最优 ¥32.00）",
+    )
+
+    # ── N22：横移 —— 卡在局部最优时要肯走「价格不变」的那一步
+    # 纯下降在「邻域里没有更便宜的」时就宣布到顶了，可它证明的只是
+    # 「一步走不到更好」。平局步不降价，但换个站位就能换一片盆地。
+    _ha = CartItem("A", "A", 1, 1000)
+    _hb = CartItem("B", "B", 1, 1000)
+    _hcps = [Coupon("X", "x", "X券", frozenset({"A", "B"}))]
+
+    def _flat_oracle(items, a):
+        _sub = sum(i.unit_price_fen * i.quantity for i in items)
+        # 挂哪儿都省 5 元 —— 于是「把 X 从 A 挪到 B」是一步平局
+        return PriceResult(
+            price_fen=_sub - 500 * len(a.mapping), original_fen=_sub
+        )
+
+    _hopt = CouponOptimizer(_flat_oracle, max_calls=40)
+    _htable = _hopt._eligibility([_ha, _hb], _hcps)
+    _hcur = Assignment(mapping={0: 0})  # A 挂 X
+    _hopt.evaluate([_ha, _hb], _hcur)
+    _hprice = _hcur.price.price_fen
+    _loose, _, _lt = _hopt._scan(
+        [_ha, _hb], _htable, _hcur, _hprice, accept_equal=True, tabu=None, iteration=1
+    )
+    _strict, _, _st = _hopt._scan(
+        [_ha, _hb], _htable, _hcur, _hprice, accept_equal=False, tabu=None, iteration=1
+    )
+    check(
+        "引擎-卡住时要肯走平局步（只肯下降会原地认输，横移才换得到盆地）",
+        _st == "stuck" and _lt == "moved" and _loose.mapping == {1: 0},
+        f"严格={_st}（应 stuck） 平局={_lt}（应 moved） 落点={_loose.mapping}",
+    )
+
+    # ── N23：邻域计数必须与生成器逐个对齐
+    # suggest_budget 报给用户的「--budget N」就靠这个数。
+    # 它要是比实际多算一倍，推荐值就跟着翻倍，用户会白等一场。
+    _nopt = CouponOptimizer(lambda items, a: PriceResult(price_fen=0), max_calls=1)
+    _ncart = [CartItem(f"P{i}", f"P{i}") for i in range(4)]
+    _ncps = [
+        Coupon("c0", "0", "0", frozenset({"P0", "P1", "P2"})),
+        Coupon("c1", "1", "1", frozenset({"P1", "P2", "P3"})),
+        Coupon("c2", "2", "2", frozenset({"P0", "P3"})),
+        Coupon("c3", "3", "3", frozenset({"P1"})),
+    ]
+    _ntab = _nopt._eligibility(_ncart, _ncps)
+    _mism: list[str] = []
+    for _raw in (
+        {}, {0: 0}, {1: 1}, {0: 0, 1: 1}, {0: 0, 2: 2},
+        {0: 0, 1: 1, 2: 2}, {1: 3, 3: 1}, {0: 0, 3: 1},
+    ):
+        _m = {i: c for i, c in _raw.items() if i in _ntab.get(c, ())}
+        _actual = sum(1 for _ in _nopt._neighborhood(_ntab, Assignment(mapping=_m)))
+        _est = neighborhood_size(_ntab, _m)
+        if _actual != _est:
+            _mism.append(f"{_m}: 生成器 {_actual} ≠ 计数 {_est}")
+    check(
+        "引擎-邻域计数必须与生成器逐个对齐（预算建议靠它，错了就给用户报假数）",
+        not _mism,
+        "; ".join(_mism[:3]),
+    )
+
+    # ── N24：预算建议只往上抬，且档位越多要得越多
+    _s1 = suggest_budget(_ntab, 4, 1, 40)
+    _s3 = suggest_budget(_ntab, 4, 3, 40)
+    check(
+        "引擎-预算建议只往上不往下，且随单购档位越多要得越多",
+        _s1 >= 40 and _s3 > _s1 and _s1 % 50 == 0,
+        f"1 档建议 {_s1}、3 档建议 {_s3}",
+    )
+
+    # ── N25：预算不够扫一遍邻域时，只深搜筛出来最好的那一个档位
+    #
+    # 6 件商品 7 张券、40 次预算下，一遍邻域就要 57 次调用。均成三份每份 12 次，
+    # 三份全是半途而废 —— 实测命中率从 40% 掉到 0%，平均差 ¥3.93 恶化到 ¥16.53。
+    # 所以这时必须把钱全压在最好的那一个档位上。
+    #
+    # 断言钉的是**行为**（深搜了几个档位），不是那句算术 ——
+    # 只验证「40 < 57×3」这种常量关系，守的是运气，不是代码。
+    _fcart = [CartItem(f"F{i}", f"F{i}", 1, 2000) for i in range(6)]
+    _fcps = [
+        Coupon(f"K{c}", f"k{c}", f"K{c}", frozenset(f"F{i}" for i in range(6)))
+        for c in range(7)
+    ]
+    _foptions: list = [
+        None,
+        WithOrderOption(payload={"membershipCode": "1"}, label="卡1"),
+        WithOrderOption(payload={"membershipCode": "2"}, label="卡2"),
+    ]
+
+    def _f_oracle(items, a):
+        _sub = sum(i.unit_price_fen * i.quantity for i in items)
+        return PriceResult(
+            price_fen=_sub - 100 * len(a.mapping), original_fen=_sub
+        )
+
+    _deep: list[int] = []
+    _orig_ls = CouponOptimizer._local_search
+
+    def _spy_ls(self, cart, table, start, quota=0):  # noqa: ANN001
+        _deep.append(1)
+        return _orig_ls(self, cart, table, start, quota)
+
+    CouponOptimizer._local_search = _spy_ls  # type: ignore[method-assign]
+    try:
+        CouponOptimizer(_f_oracle, max_calls=40, budget=Budget(40)).optimize(
+            _fcart, _fcps, _foptions
+        )
+    finally:
+        CouponOptimizer._local_search = _orig_ls  # type: ignore[method-assign]
+    check(
+        "引擎-预算不够扫一遍邻域时只深搜一个档位（逐个档位均分会全成半途而废）",
+        len(_deep) == 1,
+        f"深搜了 {len(_deep)} 个档位（预算 40 只够搜透一个）",
+    )
+
+    # ── N26：卡住之后必须真的去试平局步（不是只在注释里写了）
+    _eqs: list[bool] = []
+    _orig_scan = CouponOptimizer._scan
+
+    def _spy_scan(self, *a, **kw):  # noqa: ANN001
+        _eqs.append(bool(kw.get("accept_equal")))
+        return _orig_scan(self, *a, **kw)
+
+    CouponOptimizer._scan = _spy_scan  # type: ignore[method-assign]
+    try:
+        CouponOptimizer(_flat_oracle, max_calls=40)._local_search(
+            [_ha, _hb], _htable, Assignment(mapping={0: 0})
+        )
+    finally:
+        CouponOptimizer._scan = _orig_scan  # type: ignore[method-assign]
+    check(
+        "引擎-局部搜索卡住后必须真的去试平局步（只肯下降会原地认输）",
+        any(_eqs),
+        f"扫描时的 accept_equal 序列 {_eqs}",
+    )
+
+    # ── N27：算价失败必须把预扣的次数还回去
+    # 预算保护的是**真实网络请求**，不是「evaluate 被调用了几次」。
+    # 不还的后果是双重的：额度白白少一次，且这个方案因为没写进 _cache，
+    # 后面扰动重来时还会为同一个注定失败的方案再付一遍钱。
+    _flaky_budget = Budget(10)
+
+    def _flaky_oracle(items, assignment):
+        raise TimeoutError("模拟一次网络抖动")
+
+    _fk = [CartItem("F", "F", 1, 1000)]
+    _fkopt = CouponOptimizer(_flaky_oracle, max_calls=10, budget=_flaky_budget)
+    for _ in range(5):
+        try:
+            _fkopt.evaluate(_fk, Assignment(mapping={0: 0}))
+        except Exception:  # noqa: BLE001, S110
+            pass  # 失败本身就是这次要验的场景
+    check(
+        "引擎-算价失败必须退还预扣（一次抖动不该吃掉额度）",
+        _flaky_budget.used == 0,
+        f"5 次全失败后预算却用掉了 {_flaky_budget.used} 次",
+    )
+
+    # ── N28：没搜完时给的预算建议必须是**按规模算出来的**，不是当前值的两倍
+    # 「加 --budget 80」这种机械翻倍，对 2 件商品是浪费（本来就搜透了）、
+    # 对 6 件商品又远远不够（要几百次才搜得动）。得给一个算出来的数。
+    _b28 = _io15.StringIO()
+    with _ctx15.redirect_stdout(_b28):
+        _note28 = _print_search_note(False, 40, suggested=300)
+    check(
+        "收敛-没算完时给的是按规模算出来的预算数（不是机械翻倍）",
+        any("300" in ln for ln in _note28) and not any("80" in ln for ln in _note28),
+        repr(_b28.getvalue()[:120]),
     )
 
     # ── N19：贪心必须最受约束的券先占坑
