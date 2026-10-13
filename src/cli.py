@@ -533,6 +533,75 @@ def _condition_warning(cart) -> list[str]:
     ]
 
 
+def _menu_total_fen(cart) -> int:
+    """按菜单**标价**把这一单加一遍 —— 就是用户自己在 App 里加出来的那个数。
+
+    为什么要单独算这个数：它是用户手里唯一的对照基准。
+    他不会去看什么「裸买价」，他只会按菜单上的价自己加一遍，
+    然后拿那个数跟我们报的数比。两者不一致却不说清楚，
+    他得出的结论只会是「这工具算错了」。
+    """
+    return sum(it.effective_price_fen() * max(1, int(it.quantity or 1)) for it in cart)
+
+
+def _reconcile_lines(menu_total_fen: int, actual_fen: int) -> list[str]:
+    """菜单标价合计 vs 接口实收：差多少、为什么差。
+
+    2026-10-13 真实账号实测，同一件「全明星双人分享餐八件套」：
+        菜单标价 ¥49.90 ／ 不带随单购接口实收 ¥114.50 ／ 带随单购 ¥59.80
+    三个数两两不等，而且**菜单上那个标价你根本付不出来**。
+    这不是本项目算错，是接口的口径就是这样；
+    但不摊开说，用户永远对不上账 —— 而这项目卖的就是「把账算明白」。
+    """
+    if menu_total_fen <= 0 or menu_total_fen == actual_fen:
+        return []
+    gap = actual_fen - menu_total_fen
+    if gap > 0:
+        return [
+            f"（你自己按菜单标价加是 ¥{FEN(menu_total_fen)}，接口实收 ¥{FEN(actual_fen)}，"
+            f"多 ¥{FEN(gap)} —— 菜单上不少标价是「条件价」，"
+            "不随单购就按原价收。上面 ⚠️ 那段点名的就是这几件。）"
+        ]
+    return [
+        f"（你自己按菜单标价加是 ¥{FEN(menu_total_fen)}，接口实收 ¥{FEN(actual_fen)}，"
+        f"少 ¥{FEN(-gap)} —— 接口这边的结算价低于菜单标价。）"
+    ]
+
+
+def _advertised_total_fen(cart) -> int:
+    """菜单上**印着**的那个价合计（就是条件价商品那个诱人的标价）。
+
+    和 `_menu_total_fen` 的区别：那个是「你真去结账会按多少钱收」的口径
+    （条件价商品取原价），这个是 App 里商品卡片上写的数。
+    两个数都留着，是因为用户拿它们各自对账的场合不一样。
+    """
+    return sum(it.unit_price_fen * max(1, int(it.quantity or 1)) for it in cart)
+
+
+def _card_cost_lines(advertised_fen: int, best_fen: int, saved_fen: int) -> list[str]:
+    """随单购之后实收仍高于菜单标价时，把中间那截指出来。
+
+    2026-10-13 实测（门店 1450713，「全明星双人分享餐八件套」）：
+        菜单上印 ¥49.90 ／ 不带随单购接口实收 ¥114.50 ／ 随单购后 ¥59.80
+    也就是说：**菜单上那个标价你根本付不出来**。随单购之后也还是要 ¥59.80，
+    比标价多 ¥9.90。
+
+    这截差额是什么，接口不会告诉我们（它不单独给卡费字段），所以这里
+    只陈述**实测到的差额**，并说清它多半是那张卡的钱 —— 不编、不含糊。
+    更要紧的是：上面那句「真实省下 ¥54.70」里就含着这笔要先花出去的钱，
+    不说破就是拿别人的钱给自己脸上贴金。
+    """
+    if advertised_fen <= 0 or best_fen <= advertised_fen or saved_fen <= 0:
+        return []
+    gap = best_fen - advertised_fen
+    net = saved_fen - gap
+    return [
+        f"（菜单上印的是 ¥{FEN(advertised_fen)}，随单购后接口实收 ¥{FEN(best_fen)} —— "
+        f"中间 ¥{FEN(gap)} 多半就是那张卡的钱，接口不会单独告诉你卡费。）",
+        f"（把这笔扣掉，「真实省下」更接近 ¥{FEN(net)} —— 划不划算您自己掂量。）",
+    ]
+
+
 def _count_working_coupons(oracle, cart, best) -> int:
     """最优解里有几张券**真的**减了钱。
 
@@ -893,27 +962,69 @@ def _closed_warning(store: dict) -> list[str]:
     ]
 
 
-def _explain_coupon_scope(n: int) -> None:
-    """解释「我卡包里明明有券，为什么这里没用上」。
+def _coupon_scope_lines(wallet_total: int | None, usable: int) -> list[str]:
+    """「我卡包里有 N 张券，这次只用了 M 张」—— 如实对账，别让人以为算漏了。
 
-    这是实测出来的接口事实，不是猜测：
-    - `query-my-coupons`（卡包）返回的是**纯 Markdown**，里面**没有 couponId/couponCode**
-    - 而 `calculate-price` 挂券必须靠券码，只有 `query-store-coupons` 会给
-    所以卡包里的券不是"算漏了"，是程序上拿不到券码、挂不上去；
-    还有一部分是时段限制（比如早餐券只在 05:00-10:29 可用）。
+    抽成纯函数是为了能离线断言：这种"解释"写死在某个命令的收尾里时，
+    删掉了也不会有任何一条自检变红，而它恰恰是用户最容易误解的地方。
 
-    不点破这一句，用户会以为引擎算错了 —— 这跟项目「把账算明白」的初衷相悖。
+    为什么必须显式对账（2026-10-13 真实账号实测）：
+        卡包 `query-my-coupons`  3 张（9.9元中杯冰美式 + 2 张早餐套餐券）
+        门店券池 `query-store-coupons`  1 张
+    也就是说**入口处就少了 2 张**，再好的搜索也只能在 1 张里挑 ——
+    用户问「是不是最优」，第一道缺口在这里，不在算法里。
+
+    差额的两个来源都是接口事实，不是猜测：
+      - `query-my-coupons` 返回**纯 Markdown**，没有 couponId/couponCode，
+        而 `calculate-price` 挂券必须靠券码 —— 拿不到码就挂不上去；
+      - 时段券（实测那 2 张是「周六/周日 05:00-10:29」早餐券）不在当前时段时，
+        门店券池里根本不出现。
+
+    `wallet_total` 为 None 表示**没查到**：这时必须闭嘴。
+    把「没查到」说成「你没有券」，正是这个项目立过的规矩里最忌讳的一条。
     """
-    if n > 1:
-        return
-    if n == 0:
-        print("提示：这家门店当前没有可挂载的券。")
+    if usable == 0:
+        lines = ["提示：这家门店当前没有能挂上去的券。"]
     else:
-        print("提示：本次只用到 1 张券，不代表你卡包里只有 1 张。")
-    print(
-        "      早餐券这类限时的券这里用不上。想看全部券和到期日：\n"
-        "        python -m src.cli assets"
+        lines = []
+    if wallet_total is None or wallet_total <= usable:
+        # 查不到、或者卡包里的券全都参与了 —— 没什么需要解释的
+        return lines + ([] if usable else [
+            "      早餐券这类限时的券这里用不上。想看全部券和到期日：\n"
+            "        python -m src.cli assets"
+        ])
+
+    gap = wallet_total - usable
+    lines.append(
+        f"提示：您卡包里有 {wallet_total} 张券，这次只算进去 {usable} 张，"
+        f"差 {gap} 张 —— 不是算漏了。"
     )
+    lines.append(
+        "      原因只有两种：一是这些券（早餐券很常见）当前时段不可用，"
+        "门店券池里就不返回；"
+    )
+    lines.append(
+        "      二是卡包接口只给券名不给券码，挂不上去就算不了价。"
+        "想逐张看到期日：python -m src.cli assets"
+    )
+    return lines
+
+
+def _explain_coupon_scope(usable: int, wallet_total: int | None = None) -> None:
+    for line in _coupon_scope_lines(wallet_total, usable):
+        print(line)
+
+
+def _wallet_coupon_count(client) -> int | None:
+    """卡包里有几张券；**查不到返回 None**，绝不返回 0 冒充「没有」。"""
+    try:
+        from .assets import fetch_my_coupons
+
+        return len(fetch_my_coupons(client))
+    except Exception:  # noqa: BLE001
+        # 卡包接口只是锦上添花的对账信息，它挂了不该连累整条算价链路；
+        # 但也不能把它当成 0 —— 那是在说「你没有券」，而这话我们并不知道。
+        return None
 
 
 def run_advise(
@@ -975,7 +1086,9 @@ def run_advise(
         return 1
     store, store_code, menu, coupons = ctx
     print(f"门店：{store.get('storeName', '未知门店')}　可用券 {len(coupons)} 张")
-    _explain_coupon_scope(len(coupons))
+    # 卡包张数在前面已经取过（查失败时 mine 是空的、lookup_error 有值）——
+    # 这时必须传 None 表示「不知道」，不能拿 0 去冒充「你没有券」。
+    _explain_coupon_scope(len(coupons), len(mine) if lookup_error is None else None)
 
     if not coupons:
         print("\n当前时段这张门店没有可用券。")
@@ -1276,7 +1389,7 @@ def run_optimize(
     print(f"菜单载入 {len(menu)} 个品类")
 
     print(f"门店可用券 {len(coupons)} 张")
-    _explain_coupon_scope(len(coupons))
+    _explain_coupon_scope(len(coupons), _wallet_coupon_count(client))
 
     oracle = make_price_oracle(client, store_code, coupons)
 
@@ -1334,12 +1447,30 @@ def run_optimize(
     for line in _how_to_order(cart, coupons, best, best.converged, now=server_now(client)):
         print(line)
     # 真实节省必须以「裸买价」为基准。
-    # 不能用接口返回的 discount：随单购会把卡费计入 originalPrice
-    # （实测 97.50 → 107.40，多出的 9.90 就是卡费），导致 discount 虚高。
+    # 不能用接口返回的 discount —— 2026-10-13 真实账号实测：
+    #   购物车「麦咖啡美式 + 麦辣鸡腿汉堡三件套」，一件券都没挂，
+    #   接口 discount 就报了 ¥7.10（那只是菜单自身条件价相对原价的差）；
+    #   挂上「9.9元中杯冰美式」后报 ¥9.10，而真实只省 ¥2.00。
+    # 也就是说 discount = 原价 − 到手，里面既有菜单条件价、也有卡费，
+    # 唯独不是「券给你省了多少」。拿它当省额会凭空多报一大截。
     saved = baseline.price_fen - best.price.price_fen
     print(f"\n裸买价 ¥{FEN(baseline.price_fen)}  →  到手 ¥{FEN(best.price.price_fen)}")
     print(f"真实省下 ¥{FEN(saved)}")
-    _dev_note(f"接口 discount 报 ¥{FEN(best.price.discount_fen)}（含卡费口径，仅作对照）")
+    _dev_note(
+        f"接口 discount 报 ¥{FEN(best.price.discount_fen)}"
+        "（= 原价 − 到手，含菜单条件价与卡费，不是券的优惠，仅作对照）"
+    )
+    # 让用户能自己核账：他按菜单加出来的数，和接口实收的数，差在哪。
+    # 实测这一差非常大 —— 同一件「全明星双人分享餐八件套」：
+    #   菜单标价 ¥49.90 ／ 不带卡接口实收 ¥114.50 ／ 带随单购 ¥59.80。
+    # 不给这条对账，用户拿菜单价格自己加一遍，只会得出「这工具算错了」。
+    for line in _reconcile_lines(_menu_total_fen(cart), baseline.price_fen):
+        print(line)
+
+    # 菜单上印的价 vs 随单购后实收：中间那截就是卡的钱，必须挑明。
+    # 不挑明的话，「真实省下 ¥54.70」里其实有 ¥9.90 是您得先花出去的。
+    for line in _card_cost_lines(_advertised_total_fen(cart), best.price.price_fen, saved):
+        print(line)
 
     # 拆开「券省了多少 / 卡省了多少」。挤在一行总数里，用户按菜单价自己算
     # 加不出这个数，只会以为工具在编 —— 而且办卡是要花钱的，这笔必须单独看见。
@@ -1885,7 +2016,7 @@ def run_replay(store_code: str | None, list_only: bool, budget: int = 40) -> int
         client.data("query-store-coupons", {"storeCode": target_store, "orderType": 1, "beType": 1})
     )
     print(f"\n今日可用券 {len(coupons)} 张")
-    _explain_coupon_scope(len(coupons))
+    _explain_coupon_scope(len(coupons), _wallet_coupon_count(client))
 
     oracle = make_price_oracle(client, target_store, coupons)
 

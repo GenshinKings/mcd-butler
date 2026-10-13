@@ -959,36 +959,145 @@ def run() -> int:
 
     # 19. 券范围解释：卡包接口只有 Markdown、没有券码，必须向用户说清楚
     # 「我明明有 4 张券为什么只用 1 张」，否则用户会以为引擎算漏了。
-    from .cli import _explain_coupon_scope
+    from .cli import _coupon_scope_lines, _explain_coupon_scope
 
     try:
-        for n in (0, 1, 2):
-            _explain_coupon_scope(n)
-        # 不能写 check(..., True) —— 那是字面量，跟被测代码零耦合。
-        # 真要断言的是：三档数给出的解释互不相同（都说了同一句等于没说）。
-        import io as _io
-        import contextlib as _ctx
-        outs = []
-        for n in (0, 1, 2):
-            buf = _io.StringIO()
-            with _ctx.redirect_stdout(buf):
-                _explain_coupon_scope(n)
-            outs.append(buf.getvalue())
-        # 0 张和 1 张必须解释「为什么没用上」并且给下一步；
-        # 2 张以上时券已经在用了，多说一句是噪音，故意不说。
-        #
         # 判据是**语义**不是措辞 —— 早先这里钉的是「券码」这个词，
         # 结果把面向用户的文案锁死在技术黑话上：想改成「限时券这儿用不上」
         # 就得先改测试，本末倒置。真正要保证的是「解释+去处+该闭嘴时闭嘴」。
+        #
+        # 2026-10-13 真实账号实测把这条从"够用就别说"改成了"必须如实对账"：
+        #   卡包 3 张、门店券池 1 张 —— 入口就少了 2 张，再好的搜索也只能在
+        #   1 张里挑。用户问「是不是最优」，第一道缺口在这里。所以现在
+        #   不管用上几张，只要卡包比用上去的多，就必须报出来。
+        unknown = _coupon_scope_lines(None, 1)
         check(
-            "券范围-券没用上时要解释清楚，够用时不要啰嗦",
-            outs[0] != outs[1]
-            and all("assets" in o and len(o.strip()) > 20 for o in outs[:2])
-            and outs[2] == "",
-            f"{outs!r}"[:160],
+            "券范围-卡包张数查不到时必须闭嘴（不把「没查到」说成「你没有券」）",
+            unknown == [] and not any("0" in s for s in unknown),
+            f"{unknown!r}"[:160],
+        )
+
+        matched = _coupon_scope_lines(1, 1)
+        check(
+            "券范围-卡包与用上的张数一致时不啰嗦",
+            matched == [],
+            f"{matched!r}"[:160],
+        )
+
+        gap = _coupon_scope_lines(3, 1)
+        joined = "".join(gap)
+        check(
+            "券范围-卡包比用上的多时必须报出张数差额与原因（实测 3 张只算了 1 张）",
+            "3" in joined and "1" in joined and "不是算漏了" in joined and "assets" in joined,
+            f"{joined!r}"[:160],
+        )
+
+        none_usable = _coupon_scope_lines(None, 0)
+        check(
+            "券范围-一张券都挂不上时必须解释并给去处",
+            len(none_usable) > 0 and "assets" in "".join(none_usable),
+            f"{none_usable!r}"[:160],
         )
     except Exception as exc:  # noqa:BLE001
-        check("券范围-解释函数不崩（0/1/2 张）", False, repr(exc))
+        check("券范围-解释函数不崩", False, repr(exc))
+
+    # 19b. 菜单标价 vs 接口实收 的对账
+    # 实测同一件「全明星双人分享餐八件套」：菜单标价 ¥49.90、
+    # 不带随单购接口实收 ¥114.50。用户按菜单自己加一遍必然对不上，
+    # 不给这条对账他只会认为工具算错了。
+    try:
+        # CartItem 在模块顶层已经导入 —— 这里再 import 一次会让它变成
+        # 本函数的局部变量，而上面第 353 行早就用过它了，直接 UnboundLocalError。
+        from .cli import _menu_total_fen, _reconcile_lines
+
+        _rc = [
+            CartItem("P1", "甲", quantity=2, unit_price_fen=1000, list_price_fen=1000),
+            CartItem("P2", "乙", quantity=1, unit_price_fen=2500, list_price_fen=2500),
+        ]
+        check(
+            "对账-菜单标价合计要按数量×标价算（用户自己就是这么加的）",
+            _menu_total_fen(_rc) == 4500,
+            f"{_menu_total_fen(_rc)}",
+        )
+        check(
+            "对账-标价与实收一致时不啰嗦",
+            _reconcile_lines(4500, 4500) == [],
+            f"{_reconcile_lines(4500, 4500)!r}"[:160],
+        )
+        _more = _reconcile_lines(4500, 11450)
+        check(
+            "对账-实收高于标价时必须报出差额并说明是条件价（实测 49.90 → 114.50）",
+            len(_more) == 1 and "6950".join([]) == "" and "69.50" in _more[0]
+            and "114.50" in _more[0] and "条件价" in _more[0],
+            f"{_more!r}"[:200],
+        )
+        _less = _reconcile_lines(4500, 3800)
+        check(
+            "对账-实收低于标价时也要说（不挑好听的说）",
+            len(_less) == 1 and "7.00" in _less[0],
+            f"{_less!r}"[:160],
+        )
+        check(
+            "对账-菜单合计为 0 时不硬凑对账（没数据就不编）",
+            _reconcile_lines(0, 3800) == [],
+            f"{_reconcile_lines(0, 3800)!r}"[:160],
+        )
+    except Exception as exc:  # noqa:BLE001
+        check("对账-函数不崩", False, repr(exc))
+
+    # 19c. 菜单上印的价 vs 随单购后实收：中间那截（卡的钱）必须挑明
+    # 实测：菜单印 ¥49.90 / 不带卡 ¥114.50 / 带卡 ¥59.80 —— 标价根本付不出来。
+    # 不挑明，「真实省下 ¥54.70」里就藏着 ¥9.90 得先花出去的钱。
+    try:
+        from .cli import _advertised_total_fen, _card_cost_lines
+
+        # 这里**必须**放一件条件价商品（标价 4990 / 原价 11450）：
+        # 全用「标价=原价」的普通商品时，「菜单上印的价」和「结账口径的价」
+        # 两个实现算出来一样，断言就退化成守运气 —— 实测正是这样漏掉的。
+        _ac = [
+            CartItem(
+                "P1",
+                "甲",
+                quantity=1,
+                unit_price_fen=4990,
+                list_price_fen=11450,
+                needs_with_order=True,  # 不设这个，effective_price 就退回标价，两种口径又等价了
+                discount_type="随单购麦金卡优惠",
+            ),
+            CartItem("P2", "乙", quantity=2, unit_price_fen=1000, list_price_fen=1000),
+        ]
+        check(
+            "对账-菜单印着的价合计按标价×数量算（不管它是不是条件价）",
+            _advertised_total_fen(_ac) == 6990,
+            f"{_advertised_total_fen(_ac)}",
+        )
+        check(
+            "对账-「菜单印的价」与「结账口径的价」必须真的是两个数（条件价商品上分岔）",
+            _advertised_total_fen(_ac) != _menu_total_fen(_ac)
+            and _menu_total_fen(_ac) == 13450,
+            f"印着 {_advertised_total_fen(_ac)} / 结账 {_menu_total_fen(_ac)}",
+        )
+        _cc = _card_cost_lines(4990, 5980, 5470)
+        joined_cc = "".join(_cc)
+        check(
+            "对账-随单购后实收高于菜单标价时必须挑明差额（实测 49.90 → 59.80）",
+            len(_cc) == 2 and "9.90" in joined_cc and "9.90" in joined_cc
+            and "44.80" in joined_cc,
+            f"{joined_cc!r}"[:200],
+        )
+        check(
+            "对账-实收不高于标价时不提卡费（没这回事就别吓唬人）",
+            _card_cost_lines(4990, 4990, 100) == []
+            and _card_cost_lines(4990, 3980, 100) == [],
+            f"{_card_cost_lines(4990, 4990, 100)!r}"[:160],
+        )
+        check(
+            "对账-没省到钱时不提卡费",
+            _card_cost_lines(4990, 5980, 0) == [],
+            f"{_card_cost_lines(4990, 5980, 0)!r}"[:160],
+        )
+    except Exception as exc:  # noqa:BLE001
+        check("对账-卡费函数不崩", False, repr(exc))
 
     # 券池是主链路：接口把 products[] 换成字符串、或条目本身不是对象时，
     # 一个 AttributeError 就能让整单算不出来，必须优雅跳过。

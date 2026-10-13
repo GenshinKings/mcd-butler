@@ -1050,6 +1050,36 @@ MUTATIONS: list[tuple[str, str, str, str, bool]] = [
         "            raise",
         True,
     ),
+    (
+        # 2026-10-13 真实账号实测：卡包 3 张、门店券池 1 张。
+        # 入口就少了 2 张，再好的搜索也只能在 1 张里挑。
+        # 这条「不是算漏了」的对账要是被删了，用户会以为引擎算错了。
+        "W1-卡包比用上的券多时不报差额（用户会以为算漏了）",
+        "cli.py",
+        "    if wallet_total is None or wallet_total <= usable:",
+        "    if True:",
+        True,
+    ),
+    # 这里本来还有一条「W2-卡包查不到时返回 0」，实测是**等价变异**：
+    # 返回 0 和返回 None 在 `_coupon_scope_lines` 里走的都是「不报差额」这条分支，
+    # 输出完全一致，改坏了自检也不会红 —— 保留它只会制造一条永远 PASS 的假守卫。
+    # 和「档位保底」「扫描上限」一样，没有价值的守卫就该删掉，别凑数。
+    (
+        # 实测：菜单印 ¥49.90、随单购后实收 ¥59.80。
+        # 不挑明这 ¥9.90，「真实省下 ¥54.70」里就藏着得先花出去的钱。
+        "W3-随单购后实收高于菜单标价时不挑明（省额里藏着卡费）",
+        "cli.py",
+        "    if advertised_fen <= 0 or best_fen <= advertised_fen or saved_fen <= 0:",
+        "    if True:",
+        True,
+    ),
+    (
+        "W4-「菜单上印的价」用了结账口径（条件价商品会被换成原价，对不上账）",
+        "cli.py",
+        "    return sum(it.unit_price_fen * max(1, int(it.quantity or 1)) for it in cart)",
+        "    return sum(it.effective_price_fen() * max(1, int(it.quantity or 1)) for it in cart)",
+        True,
+    ),
 ]
 
 
